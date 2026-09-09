@@ -55,7 +55,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
-use sylva_core::model::{FenceLayout, FenceStyle, SidebarPosition};
+use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
 
 /// 窗口类名（全局唯一，单实例）。
 const CLASS_NAME: &str = "SylvaOverlay";
@@ -177,6 +177,10 @@ pub enum ConsoleZone {
     RemoveFence,
     /// 栅栏管理页：更改选中栅栏的存储位置（打开文件夹选择器）。
     ChangeStoragePath,
+    /// 栅栏管理页：设置选中栅栏的分类规则（预设模板；None = 无规则）。
+    FenceRulePreset(Option<CategoryPreset>),
+    /// 栅栏管理页：「一键整理」按钮（按各栅栏规则自动收纳桌面图标）。
+    AutoOrganize,
 }
 
 /// 控制台（插件面板）的命中数据：整体矩形（窗口区域 + 命中判定范围）、

@@ -125,6 +125,12 @@ $env:SYLVA_AUTOSTOP_MS="2000"; .\target\debug\sylva.exe
 
 ---
 
+## 实施计划（Plan）编写规范与审查标准
+
+凡涉及跨模块重构、交互逻辑调整、状态机变更或非平凡功能实施，必须严格遵循 [`docs/engineering-plan-guidelines.md`](file:///g:/Codes/sylva/docs/engineering-plan-guidelines.md) 的编制规范与「隐性动力学自查六律」（常驻后台冲突、0% 空闲 CPU、孤儿清理、语义精准定位、状态全集校验、旁路数据对齐）。实施完成后必须派发独立干净上下文的子代理执行对抗性代码审查。
+
+---
+
 ## 环境前置条件
 
 - **操作系统**：Windows 10 / Windows 11（x86_64，MSVC 工具链）。
@@ -158,6 +164,7 @@ $env:SYLVA_AUTOSTOP_MS="2000"; .\target\debug\sylva.exe
 
 - 项目详细背景、功能特性清单与视觉效果图：见 [`README.md`](file:///g:/Codes/sylva/README.md)
 - 完整依赖项清单与第三方库具体版本：见 [`Cargo.toml`](file:///g:/Codes/sylva/Cargo.toml)
+- 软件工程实施计划编写规范与自查六律：见 [`docs/engineering-plan-guidelines.md`](file:///g:/Codes/sylva/docs/engineering-plan-guidelines.md)
 - 架构设计演进历史与废弃技术方案（如 egui 移除记录）：见 [`docs/design/2026-08-14-desktop-fence-organizer-design.md`](file:///g:/Codes/sylva/docs/design/2026-08-14-desktop-fence-organizer-design.md)
 - 完整 CI 自动化流水线配置：见 [`.github/workflows/ci.yml`](file:///g:/Codes/sylva/.github/workflows/ci.yml)
 - 安装器实现细节与打包细节：见 [`scripts/installer/`](file:///g:/Codes/sylva/scripts/installer/) 与 [`scripts/package-msix.ps1`](file:///g:/Codes/sylva/scripts/package-msix.ps1)

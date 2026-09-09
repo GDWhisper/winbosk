@@ -131,6 +131,7 @@ mod tests {
             scroll: 0.0,
             storage_path: None,
             sidebar_collapsed: false,
+            rule: None,
         });
         store.save(&desk).unwrap();
 

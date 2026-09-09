@@ -25,7 +25,7 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
-use sylva_core::model::{FenceLayout, FenceStyle, SidebarPosition};
+use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
 use sylva_shell::icons::IconData;
 
 use crate::overlay::{ConsoleZone, RectF};
@@ -352,6 +352,18 @@ fn draw_fences_page(
         formats,
         accent,
     );
+    // 「一键整理」按钮
+    let organize_hover = matches!(c.hover_zone, Some(ConsoleZone::AutoOrganize));
+    draw_segmented_button(
+        target,
+        theme,
+        c.organize_btn,
+        "⚡ 一键整理桌面",
+        false,
+        organize_hover,
+        formats,
+        accent,
+    );
     // 「删除栅栏」按钮（添加按钮下方；hover 变红）
     let remove_hover = matches!(c.hover_zone, Some(ConsoleZone::RemoveFence));
     draw_segmented_button(
@@ -627,6 +639,34 @@ fn draw_fence_detail(
         ] {
             let active = d.sidebar_pos == pos && d.layout == FenceLayout::Sidebar;
             let hover = matches!(c.hover_zone, Some(ConsoleZone::FenceSidebarPos(p)) if p == pos);
+            draw_segmented_button(target, theme, rect, label, active, hover, formats, accent);
+        }
+    }
+
+    // 分类规则（无 / 应用 / 文档 / 媒体 / 压缩 / 目录）
+    if d.rule_none.h > 0.0 {
+        let lr_r = D2D_RECT_F {
+            left: label_x,
+            top: d.rule_none.y + 2.0 * s,
+            right: label_x + label_w,
+            bottom: d.rule_none.y + 24.0 * s,
+        };
+        let rule_label_brush =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.45 * full_t]), None)? };
+        draw_text(target, "规则", &formats.detail, lr_r, &rule_label_brush);
+
+        let presets = [
+            (d.rule_none, None, "无"),
+            (d.rule_apps, Some(CategoryPreset::Apps), "应用"),
+            (d.rule_docs, Some(CategoryPreset::Documents), "文档"),
+            (d.rule_media, Some(CategoryPreset::Media), "媒体"),
+            (d.rule_archives, Some(CategoryPreset::Archives), "压缩"),
+            (d.rule_folders, Some(CategoryPreset::Folders), "目录"),
+        ];
+        for (rect, preset, label) in presets {
+            let active = d.current_preset == preset;
+            let hover =
+                matches!(c.hover_zone, Some(ConsoleZone::FenceRulePreset(p)) if p == preset);
             draw_segmented_button(target, theme, rect, label, active, hover, formats, accent);
         }
     }

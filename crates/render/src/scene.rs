@@ -2,7 +2,7 @@
 //!
 //! 坐标全部为**物理像素**（虚拟屏幕坐标），与 overlay 窗口客户端坐标一致。
 
-use sylva_core::model::{FenceLayout, FenceStyle, SidebarPosition};
+use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
 
 use crate::overlay::{ConsoleZone, RectF};
 
@@ -172,6 +172,15 @@ pub struct SceneFenceDetail {
     pub sidebar_left: RectF,
     pub sidebar_top: RectF,
     pub sidebar_right: RectF,
+    /// 当前分类规则预设（绘制高亮用）
+    pub current_preset: Option<CategoryPreset>,
+    /// 规则按钮：无 / 应用 / 文档 / 媒体 / 压缩 / 目录
+    pub rule_none: RectF,
+    pub rule_apps: RectF,
+    pub rule_docs: RectF,
+    pub rule_media: RectF,
+    pub rule_archives: RectF,
+    pub rule_folders: RectF,
 }
 
 /// 控制台面板（控制中心：栅栏管理）。
@@ -198,6 +207,8 @@ pub struct SceneConsole {
     pub fence_detail: Option<SceneFenceDetail>,
     /// 栅栏管理页：「添加栅栏」按钮。
     pub add_fence: RectF,
+    /// 栅栏管理页：「一键整理」按钮。
+    pub organize_btn: RectF,
     /// 栅栏管理页：「删除栅栏」按钮（添加按钮下方）。
     pub remove_btn: RectF,
     pub fill_color: [f32; 4],

@@ -69,58 +69,88 @@ pub(crate) fn add_paths_to_fence(rt: &mut Runtime, fence: usize, paths: &[String
 /// 分配位图槽、追加成员、提取图标（进 `pending_uploads`）。已在本栅栏则幂等跳过。
 /// 拖入/粘贴（`add_paths_to_fence`）与链接文件夹镜像（`mirror_linked_fence`）共用。
 pub(crate) fn register_fence_item(rt: &mut Runtime, fence: usize, path: &str) -> bool {
-    let item = match sylva_shell::items::item_from_path(path) {
-        Ok(it) => it,
-        Err(e) => {
-            tracing::warn!(path, "无法创建图标项: {e}");
-            return false;
-        }
+    let lower_path = path.to_ascii_lowercase();
+
+    // 优先复用已有的 DesktopItem 与位图，防止每周期重复 push 导致 items 数组泄露膨胀
+    let existing_id = if rt.desk.icons.contains_key(&lower_path) {
+        Some(lower_path.clone())
+    } else {
+        rt.item_index
+            .get(&lower_path)
+            .and_then(|&idx| rt.items.get(idx).map(|it| it.id.clone()))
     };
-    let id = item.id.clone();
-    // 已在本栅栏则跳过（防止同栅栏内重复）；在其它栅栏/自由区允许再添加——
-    // 「复制→粘贴到另一个栅栏」就是让同一项出现在两个栅栏里（跨栅栏粘贴失效根因）。
-    // 除同 id 外再按「同路径（小写）」判重：旧版「更改位置」迁移后 id 可能未随路径
-    // 重建（陈旧 id），避免文件夹镜像把同一文件重复加进来。
-    let already = rt
+
+    let id = if let Some(id) = existing_id {
+        id
+    } else {
+        let item = match sylva_shell::items::item_from_path(path) {
+            Ok(it) => it,
+            Err(e) => {
+                tracing::warn!(path, "无法创建图标项: {e}");
+                return false;
+            }
+        };
+        let item_id = item.id.clone();
+        let new_bitmap = rt.items.len() as u64;
+        let mut ic = Icon::new(item_id.clone(), item.display_name.clone(), item.kind);
+        ic.path = Some(path.to_string());
+        ic.added = true;
+        sylva_core::details::enrich(&mut ic, path);
+        rt.desk.icons.insert(item_id.clone(), ic);
+
+        let idx = rt.items.len();
+        rt.items.push(item);
+        rt.item_index.insert(item_id.clone(), idx);
+        rt.bitmap_ids.insert(item_id.clone(), new_bitmap);
+
+        match sylva_shell::icons::extract_icon(&rt.items[idx], ICON_EXTRACT_SIZE) {
+            Ok(data) => rt.pending_uploads.push((new_bitmap, data)),
+            Err(e) => tracing::warn!(path, "图标提取失败: {e}"),
+        }
+        item_id
+    };
+
+    // 自动捕获：仅当源栅栏是桌面栅栏时，才允许分流到开启了 auto_capture 的其它栅栏中
+    let desktop_dir = shell_desktop_path();
+    let is_desktop_fence = rt
         .desk
         .fences
         .get(fence)
-        .map(|f| {
-            f.icon_ids.iter().any(|existing_id| {
-                if *existing_id == id {
-                    return true;
-                }
-                rt.desk
-                    .icons
-                    .get(existing_id)
-                    .and_then(|ic| ic.path.clone())
-                    .map(|p| p.eq_ignore_ascii_case(path))
-                    .unwrap_or(false)
-            })
-        })
+        .map(|f| desktop_dir.is_some() && f.storage_path.as_deref() == desktop_dir.as_deref())
         .unwrap_or(false);
-    if already {
+
+    let target_fence = if !is_desktop_fence
+        || rt
+            .desk
+            .fences
+            .get(fence)
+            .and_then(|f| f.rule.as_ref())
+            .map(|r| r.matches_icon(&rt.desk.icons[&id]))
+            .unwrap_or(false)
+    {
+        fence
+    } else {
+        rt.desk
+            .fences
+            .iter()
+            .enumerate()
+            .position(|(idx, f)| {
+                idx != fence
+                    && f.rule
+                        .as_ref()
+                        .map(|r| r.enabled && r.auto_capture && r.matches_icon(&rt.desk.icons[&id]))
+                        .unwrap_or(false)
+            })
+            .unwrap_or(fence)
+    };
+
+    let Some(f) = rt.desk.fences.get_mut(target_fence) else {
+        return false;
+    };
+    if f.icon_ids.contains(&id) {
         return false;
     }
-    // 录入元数据：持久化目标目录内路径（重启恢复图标/打开）；added=true 表示受 Sylva 管理
-    let mut ic = Icon::new(id.clone(), item.display_name.clone(), item.kind);
-    ic.path = Some(path.to_string());
-    ic.added = true;
-    sylva_core::details::enrich(&mut ic, path);
-    rt.desk.icons.insert(id.clone(), ic);
-    let new_bitmap = rt.items.len() as u64;
-    rt.items.push(item);
-    rt.item_index.insert(id.clone(), rt.items.len() - 1);
-    rt.bitmap_ids.insert(id.clone(), new_bitmap);
-    if let Some(f) = rt.desk.fences.get_mut(fence) {
-        f.icon_ids.push(id.clone());
-    }
-    // 提取图标（阻塞但命中系统图标缓存，通常很快）；失败不阻断添加
-    let idx = rt.item_index[&id];
-    match sylva_shell::icons::extract_icon(&rt.items[idx], ICON_EXTRACT_SIZE) {
-        Ok(data) => rt.pending_uploads.push((new_bitmap, data)),
-        Err(e) => tracing::warn!(path, "图标提取失败: {e}"),
-    }
+    f.icon_ids.push(id);
     true
 }
 
@@ -355,20 +385,37 @@ fn mirror_linked_fence(rt: &mut Runtime, idx: usize) -> bool {
     // 文件夹），之后栅栏才真正镜像该文件夹。一次性迁移，完成后路径都在文件夹内，
     // 之后不再触发。文件已不存在的不迁（交给移除分支处理）。
     let mut changed = rehome_linked_library_items(rt, idx, &dir);
+
+    let is_desktop = shell_desktop_path()
+        .map(|d| Path::new(&d) == dir.as_path())
+        .unwrap_or(false);
+
     // 栅栏内「路径在该目录下」的图标路径集合（小写，与磁盘大小写无关）
-    let existing: HashSet<String> = rt
-        .desk
-        .fences
-        .get(idx)
-        .map(|f| {
-            f.icon_ids
-                .iter()
-                .filter_map(|id| rt.desk.icons.get(id).and_then(|ic| ic.path.clone()))
-                .filter(|p| path_within(&dir, Path::new(p)))
-                .map(|p| p.to_ascii_lowercase())
-                .collect()
-        })
-        .unwrap_or_default();
+    let existing: HashSet<String> = if is_desktop {
+        // 桌面源栅栏：只要全局任一栅栏或未分组区已持有此桌面文件，就视为已存在，杜绝循环重复注册
+        rt.desk
+            .icons
+            .values()
+            .filter_map(|ic| ic.path.as_ref())
+            .filter(|p| path_within(&dir, Path::new(p)))
+            .map(|p| p.to_ascii_lowercase())
+            .collect()
+    } else {
+        // 普通目录镜像栅栏（Folder Portal）：严格维持当前栅栏成员
+        rt.desk
+            .fences
+            .get(idx)
+            .map(|f| {
+                f.icon_ids
+                    .iter()
+                    .filter_map(|id| rt.desk.icons.get(id).and_then(|ic| ic.path.clone()))
+                    .filter(|p| path_within(&dir, Path::new(p)))
+                    .map(|p| p.to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
     // 枚举目录（跳过隐藏/系统文件，与资源管理器默认一致）；读取失败视为空 → 走删除分支
     let entries: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map(|rd| {
@@ -384,6 +431,7 @@ fn mirror_linked_fence(rt: &mut Runtime, idx: usize) -> bool {
     if entry_set == existing {
         return changed; // 目录内容与栅栏一致 → 无事可做（可能刚迁移过库内项）
     }
+
     // 文件夹 → 栅栏：新出现的文件/子文件夹注册进栅栏（含改名产生的新路径）
     for p in &entries {
         let lower = p.to_string_lossy().to_ascii_lowercase();
@@ -391,23 +439,39 @@ fn mirror_linked_fence(rt: &mut Runtime, idx: usize) -> bool {
             changed = true;
         }
     }
+
     // 栅栏 → 文件夹：路径在该目录下但文件已不存在 → 移除（外部删除/改名）
-    let ids: Vec<String> = rt
-        .desk
-        .fences
-        .get(idx)
-        .map(|f| f.icon_ids.clone())
-        .unwrap_or_default();
-    for id in ids {
-        let Some(p) = rt.desk.icons.get(&id).and_then(|ic| ic.path.clone()) else {
-            continue;
-        };
-        if !path_within(&dir, Path::new(&p)) {
-            continue;
+    if is_desktop {
+        // 桌面源：若桌面上的物理文件被删，清理所有持有该桌面路径的图标（即使它已被分类整理到其他收纳栅栏中）
+        let all_ids: Vec<String> = rt.desk.icons.keys().cloned().collect();
+        for id in all_ids {
+            let Some(p) = rt.desk.icons.get(&id).and_then(|ic| ic.path.clone()) else {
+                continue;
+            };
+            if path_within(&dir, Path::new(&p)) && !Path::new(&p).exists() {
+                remove_icon_entirely(rt, &id);
+                changed = true;
+            }
         }
-        if !Path::new(&p).exists() {
-            remove_icon_entirely(rt, &id);
-            changed = true;
+    } else {
+        // 普通目录镜像栅栏：仅清理该栅栏内的成员
+        let ids: Vec<String> = rt
+            .desk
+            .fences
+            .get(idx)
+            .map(|f| f.icon_ids.clone())
+            .unwrap_or_default();
+        for id in ids {
+            let Some(p) = rt.desk.icons.get(&id).and_then(|ic| ic.path.clone()) else {
+                continue;
+            };
+            if !path_within(&dir, Path::new(&p)) {
+                continue;
+            }
+            if !Path::new(&p).exists() {
+                remove_icon_entirely(rt, &id);
+                changed = true;
+            }
         }
     }
     changed

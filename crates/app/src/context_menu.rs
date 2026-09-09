@@ -4,9 +4,11 @@ use crate::*;
 pub(crate) const MENU_ICON_OPEN: usize = 1;
 pub(crate) const MENU_ICON_REMOVE: usize = 2;
 pub(crate) const MENU_PASTE: usize = 2500;
+pub(crate) const MENU_ORGANIZE: usize = 3500;
 pub(crate) const MENU_DELETE_FENCE: usize = 5000;
 pub(crate) const MENU_RENAME_FENCE: usize = 6000;
 pub(crate) fn handle_tray_menu(rt: &mut Runtime) {
+    const MENU_TRAY_ORGANIZE: usize = 8199;
     const MENU_TRAY_CONSOLE: usize = 8200;
     const MENU_TRAY_QUIT: usize = 8201;
     let menu = popup_menu();
@@ -14,6 +16,9 @@ pub(crate) fn handle_tray_menu(rt: &mut Runtime) {
         return;
     }
     unsafe {
+        let s = wide("⚡ 一键整理桌面");
+        let _ = AppendMenuW(menu, MF_STRING, MENU_TRAY_ORGANIZE, PCWSTR(s.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let s = wide("显示 Sylva 控制中心");
         let _ = AppendMenuW(menu, MF_STRING, MENU_TRAY_CONSOLE, PCWSTR(s.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -37,6 +42,9 @@ pub(crate) fn handle_tray_menu(rt: &mut Runtime) {
         let _ = DestroyMenu(menu);
     }
     match cmd {
+        MENU_TRAY_ORGANIZE => {
+            execute_auto_organize(rt);
+        }
         MENU_TRAY_CONSOLE => {
             let open = !rt.desk.console_open;
             rt.desk.console_open = open;
@@ -56,10 +64,11 @@ pub(crate) enum IconMenuAction {
     Remove,
 }
 
-/// 栅栏右键菜单动作（精简版：粘贴 / 重命名 / 删除）。
+/// 栅栏右键菜单动作（精简版：粘贴 / 重命名 / 整理 / 删除）。
 pub(crate) enum FenceMenuAction {
     Paste,
     Rename,
+    Organize,
     Delete,
 }
 
@@ -166,6 +175,9 @@ pub(crate) fn handle_context_menu(
             }
             FenceMenuAction::Rename => {
                 start_inplace_rename(rt, EditTarget::FenceTitle { fence });
+            }
+            FenceMenuAction::Organize => {
+                execute_auto_organize(rt);
             }
             FenceMenuAction::Delete => {
                 // 删除栅栏，不删除链接的文件夹（用户数据不受影响）
@@ -366,6 +378,7 @@ pub(crate) fn pick_paths(owner: HWND) -> Option<Vec<String>> {
 }
 
 /// 选择单个文件夹（新建栅栏时用）：弹出系统文件夹选择对话框，返回选中路径。
+#[allow(dead_code)]
 pub(crate) fn pick_folder(owner: HWND) -> Option<String> {
     unsafe {
         let dialog: IFileOpenDialog =
@@ -400,6 +413,8 @@ pub(crate) fn fence_context_menu(
         let _ = AppendMenuW(main, MF_STRING, MENU_PASTE, PCWSTR(s.as_ptr()));
         let s = wide("重命名栅栏");
         let _ = AppendMenuW(main, MF_STRING, MENU_RENAME_FENCE, PCWSTR(s.as_ptr()));
+        let s = wide("⚡ 一键整理桌面");
+        let _ = AppendMenuW(main, MF_STRING, MENU_ORGANIZE, PCWSTR(s.as_ptr()));
         let _ = AppendMenuW(main, MF_SEPARATOR, 0, PCWSTR::null());
         let s = wide("删除栅栏");
         let _ = AppendMenuW(main, MF_STRING, MENU_DELETE_FENCE, PCWSTR(s.as_ptr()));
@@ -422,6 +437,7 @@ pub(crate) fn fence_context_menu(
     match cmd {
         MENU_PASTE => Some(FenceMenuAction::Paste),
         MENU_RENAME_FENCE => Some(FenceMenuAction::Rename),
+        MENU_ORGANIZE => Some(FenceMenuAction::Organize),
         MENU_DELETE_FENCE => Some(FenceMenuAction::Delete),
         _ => None,
     }

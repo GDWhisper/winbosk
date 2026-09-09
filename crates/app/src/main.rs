@@ -124,9 +124,9 @@ pub(crate) const CONSOLE_FENCE_ROW_H: f32 = 36.0;
 /// 栅栏管理页：最多同时显示的行数（超出滚动）。
 pub(crate) const CONSOLE_FENCE_MAX_ROWS: usize = 5;
 /// 栅栏管理页：选中栅栏详情区高度。
-pub(crate) const CONSOLE_FENCE_DETAIL_H: f32 = 218.0;
+pub(crate) const CONSOLE_FENCE_DETAIL_H: f32 = 248.0;
 /// 控制台展开面板最大高度（DIP；内容再多也滚动）。
-pub(crate) const CONSOLE_MAX_H: f32 = 640.0;
+pub(crate) const CONSOLE_MAX_H: f32 = 720.0;
 
 /// 背景色调预设（标签, RGB 0..1）：菜单项顺序即此处顺序（+1 起）。
 pub(crate) const TINT_PRESETS: &[(&str, [f32; 3])] = &[
@@ -683,6 +683,34 @@ fn work_area_rect(ox: f32, oy: f32, vw: f32, vh: f32) -> Rect {
     )
 }
 
+/// 执行一键全自动分类整理（控制中心、托盘菜单、栅栏右键菜单共用同一套逻辑）。
+pub(crate) fn execute_auto_organize(rt: &mut Runtime) {
+    let desktop_dir = shell_desktop_path();
+    let default_source = rt
+        .desk
+        .fences
+        .iter()
+        .find(|f| {
+            f.title.as_deref() == Some("桌面")
+                || (desktop_dir.is_some() && f.storage_path.as_deref() == desktop_dir.as_deref())
+        })
+        .or_else(|| rt.desk.fences.first())
+        .map(|f| f.id);
+    let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
+    let report = rt
+        .desk
+        .auto_organize_all(default_source, wa, rt.theme.scale);
+    if report.created_fences > 0 || report.moved_icons > 0 {
+        tracing::info!(
+            created = report.created_fences,
+            moved = report.moved_icons,
+            "一键全自动分类整理已完成"
+        );
+        rt.last_layout_h.resize(rt.desk.fences.len(), 0.0);
+        let _ = rt.store.save(&rt.desk);
+    }
+}
+
 /// 该事件是否代表「用户真正点/拖了某处」（内联编辑打开时据此提交/失焦）。
 /// 悬停、滚轮、定时器、注入重绘等非交互事件不在此列——它们不该关掉刚打开的编辑框。
 fn is_popup_dismiss_event(ev: &OverlayEvent) -> bool {
@@ -1013,44 +1041,73 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 }
                 let _ = rt.store.save(&rt.desk);
             }
-            ConsoleZone::AddFence => {
-                // 新建栅栏：弹出文件夹选择器让用户选链接目录
-                if let Some(dir) = pick_folder(rt.hwnd) {
-                    // 用文件夹名作为栅栏标题
-                    let title = std::path::Path::new(&dir)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| format!("栅栏 {}", rt.desk.next_fence_id()));
-                    let id = rt.desk.next_fence_id();
-                    let s = rt.theme.scale;
-                    let w = 360.0 * s;
-                    let h = 220.0 * s;
-                    let start = Rect::new(80.0 * s, 120.0 * s, w, h);
-                    let others = (0..rt.desk.fences.len())
-                        .map(|j| fence_collision_rect(rt, j))
-                        .collect::<Vec<_>>();
-                    let screen = screen_rect(rt);
-                    let out = settle_move(&start, &others, &screen, FENCE_GAP);
-                    let bounds = Rect::new(out.x.round(), out.y.round(), w.round(), h.round());
-                    rt.desk.fences.push(Fence {
-                        id,
-                        title: Some(title),
-                        monitor_id: 0,
-                        bounds,
-                        state: FenceState::Expanded,
-                        icon_ids: Vec::new(),
-                        appearance: FenceAppearance::default(),
-                        scroll: 0.0,
-                        storage_path: Some(dir),
-                        sidebar_collapsed: false,
-                    });
-                    rt.selected_fence = rt.desk.fences.len() - 1;
-                    // 立即同步链接文件夹内容
-                    if reconcile_fences(rt) {
-                        tracing::info!("新栅栏已链接文件夹并同步内容");
+            ConsoleZone::FenceRulePreset(preset) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    if let Some(p) = preset {
+                        let mut rule = f.rule.clone().unwrap_or_default();
+                        rule.enabled = true;
+                        rule.preset = Some(p);
+                        f.rule = Some(rule);
+                    } else {
+                        f.rule = None;
                     }
-                    let _ = rt.store.save(&rt.desk);
                 }
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::AutoOrganize => {
+                execute_auto_organize(rt);
+            }
+            ConsoleZone::AddFence => {
+                // 新建空白栅栏：直接生成，无需弹窗选择文件夹（纯收纳属性）
+                let title = {
+                    let mut idx = 1;
+                    loop {
+                        let name = format!("新栅栏 {}", idx);
+                        if !rt
+                            .desk
+                            .fences
+                            .iter()
+                            .any(|f| f.title.as_deref() == Some(&name))
+                        {
+                            break name;
+                        }
+                        idx += 1;
+                    }
+                };
+                let id = rt.desk.next_fence_id();
+                let s = rt.theme.scale;
+                let w = 360.0 * s;
+                let h = 220.0 * s;
+                let count = rt.desk.fences.len();
+                let offset_x = (count % 6) as f32 * 30.0 * s;
+                let offset_y = (count % 6) as f32 * 30.0 * s;
+                let start = Rect::new(80.0 * s + offset_x, 120.0 * s + offset_y, w, h);
+                let others = (0..rt.desk.fences.len())
+                    .map(|j| fence_collision_rect(rt, j))
+                    .collect::<Vec<_>>();
+                let screen = screen_rect(rt);
+                let out = settle_move(&start, &others, &screen, FENCE_GAP * s);
+                let bounds = Rect::new(out.x.round(), out.y.round(), w.round(), h.round());
+                rt.desk.fences.push(Fence {
+                    id,
+                    title: Some(title),
+                    monitor_id: 0,
+                    bounds,
+                    state: FenceState::Expanded,
+                    icon_ids: Vec::new(),
+                    appearance: FenceAppearance::default(),
+                    scroll: 0.0,
+                    storage_path: None,
+                    sidebar_collapsed: false,
+                    rule: None,
+                });
+                rt.last_layout_h.push(0.0);
+                rt.selected_fence = rt.desk.fences.len() - 1;
+                let _ = rt.store.save(&rt.desk);
+                tracing::info!(id, "已快速创建空白收纳栅栏");
             }
             ConsoleZone::RemoveFence => {
                 // 移出当前选中的栅栏：成员退回未分组区，栅栏删除。

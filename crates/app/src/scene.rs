@@ -51,7 +51,7 @@ pub(crate) fn label_width(text: &str, font_size: f32) -> f32 {
 /// 已有布局时不作任何改动（栅栏是用户显式成员列表）。
 /// 用 Shell API 获取用户桌面文件夹的真实路径。
 /// 支持用户自定义桌面位置（如移到 D 盘），比 `USERPROFILE\Desktop` 可靠。
-fn shell_desktop_path() -> Option<String> {
+pub(crate) fn shell_desktop_path() -> Option<String> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG};
     unsafe {
@@ -99,6 +99,7 @@ pub(crate) fn seed_fences(desk: &mut Desk, _items: &[DesktopItem], _theme: &Them
         scroll: 0.0,
         storage_path: storage,
         sidebar_collapsed: false,
+        rule: None,
     };
     desk.fences.push(f);
 }
@@ -259,9 +260,9 @@ pub(crate) fn console_full_height(desk: &Desk, s: f32) -> f32 {
         + 8.0 * s
         + detail_rows
         + 8.0 * s
-        // 添加 / 删除栅栏 / 切换桌面 三个等宽按钮 + 两处间隙
-        + CONSOLE_ADD_BTN_H * s * 3.0
-        + 8.0 * s * 2.0
+        // 添加 / 一键整理 / 删除栅栏 / 切换桌面 四个等宽按钮 + 三处间隙
+        + CONSOLE_ADD_BTN_H * s * 4.0
+        + 8.0 * s * 3.0
         + 12.0 * s.clamp(CONSOLE_MIN_H * s, CONSOLE_MAX_H * s)
 }
 
@@ -286,6 +287,7 @@ fn detail_visible_rows(desk: &Desk, s: f32) -> f32 {
     if layout == FenceLayout::Sidebar {
         n += 1; // 侧边栏位置（仅侧边栏）
     }
+    n += 1; // 分类规则（始终显示）
     24.0 * s + n as f32 * 30.0 * s
 }
 
@@ -518,6 +520,53 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         } else {
             (RectF::default(), RectF::default(), RectF::default())
         };
+        if show_sidebar_pos {
+            row += 1;
+        }
+        // 分类规则按钮（始终显示）：无 / 应用 / 文档 / 媒体 / 压缩 / 目录
+        let rule_btn_w = 38.0 * s;
+        let rule_gap = 4.0 * s;
+        let rule_y = row_y(row);
+        let rule_none = RectF {
+            x: d.x + label_w,
+            y: rule_y,
+            w: 34.0 * s,
+            h: btn_h,
+        };
+        let rule_apps = RectF {
+            x: rule_none.x + rule_none.w + rule_gap,
+            y: rule_y,
+            w: rule_btn_w,
+            h: btn_h,
+        };
+        let rule_docs = RectF {
+            x: rule_apps.x + rule_apps.w + rule_gap,
+            y: rule_y,
+            w: rule_btn_w,
+            h: btn_h,
+        };
+        let rule_media = RectF {
+            x: rule_docs.x + rule_docs.w + rule_gap,
+            y: rule_y,
+            w: rule_btn_w,
+            h: btn_h,
+        };
+        let rule_archives = RectF {
+            x: rule_media.x + rule_media.w + rule_gap,
+            y: rule_y,
+            w: rule_btn_w,
+            h: btn_h,
+        };
+        let rule_folders = RectF {
+            x: rule_archives.x + rule_archives.w + rule_gap,
+            y: rule_y,
+            w: rule_btn_w,
+            h: btn_h,
+        };
+        #[allow(unused_assignments)]
+        {
+            row += 1;
+        }
         Some(SceneFenceDetail {
             rect: d,
             title: desk.fences[sel]
@@ -545,11 +594,18 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
             sidebar_left,
             sidebar_top,
             sidebar_right,
+            current_preset: desk.fences[sel].rule.as_ref().and_then(|r| r.preset),
+            rule_none,
+            rule_apps,
+            rule_docs,
+            rule_media,
+            rule_archives,
+            rule_folders,
         })
     } else {
         None
     };
-    // —— 底部操作按钮：添加栅栏 / 删除栅栏 / 切换桌面（自下而上，等宽等高） ——
+    // —— 底部操作按钮：添加栅栏 / 一键整理 / 删除栅栏 / 切换桌面（自上而下，等宽等高） ——
     let btn_w = panel.w - 2.0 * CONSOLE_PAD * s;
     let btn_h = CONSOLE_ADD_BTN_H * s;
     let btn_gap = 8.0 * s;
@@ -561,10 +617,17 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         w: btn_w,
         h: btn_h,
     };
-    // 「删除栅栏」按钮：放在「添加栅栏」正下方，等宽等高。
-    let remove_btn = RectF {
+    // 「一键整理」按钮：放在「添加栅栏」正下方，等宽等高。
+    let organize_btn = RectF {
         x: add_fence.x,
         y: add_fence.y + btn_h + btn_gap,
+        w: btn_w,
+        h: btn_h,
+    };
+    // 「删除栅栏」按钮：放在「一键整理」正下方，等宽等高。
+    let remove_btn = RectF {
+        x: add_fence.x,
+        y: organize_btn.y + btn_h + btn_gap,
         w: btn_w,
         h: btn_h,
     };
@@ -588,6 +651,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         fence_list_view,
         fence_detail,
         add_fence,
+        organize_btn,
         remove_btn,
         fill_color: [0.062, 0.086, 0.133, 0.92],
         border_color: [1.0, 1.0, 1.0, 0.18],
@@ -1351,6 +1415,7 @@ pub(crate) fn hit_model_from(theme: &Theme, scene: &Scene, _desk: &Desk) -> HitM
         if c.panel >= 0.5 {
             zones.push((ConsoleZone::Close, c.close));
             zones.push((ConsoleZone::AddFence, c.add_fence));
+            zones.push((ConsoleZone::AutoOrganize, c.organize_btn));
             zones.push((ConsoleZone::RemoveFence, c.remove_btn));
             zones.push((ConsoleZone::DesktopToggle, c.desktop_toggle));
             for (i, r) in c.fence_rows.iter().enumerate() {
@@ -1398,6 +1463,29 @@ pub(crate) fn hit_model_from(theme: &Theme, scene: &Scene, _desk: &Desk) -> HitM
                         zones.push((ConsoleZone::FenceTint(Some(*c)), *r));
                     }
                 }
+                zones.push((ConsoleZone::FenceRulePreset(None), d.rule_none));
+                zones.push((
+                    ConsoleZone::FenceRulePreset(Some(sylva_core::model::CategoryPreset::Apps)),
+                    d.rule_apps,
+                ));
+                zones.push((
+                    ConsoleZone::FenceRulePreset(Some(
+                        sylva_core::model::CategoryPreset::Documents,
+                    )),
+                    d.rule_docs,
+                ));
+                zones.push((
+                    ConsoleZone::FenceRulePreset(Some(sylva_core::model::CategoryPreset::Media)),
+                    d.rule_media,
+                ));
+                zones.push((
+                    ConsoleZone::FenceRulePreset(Some(sylva_core::model::CategoryPreset::Archives)),
+                    d.rule_archives,
+                ));
+                zones.push((
+                    ConsoleZone::FenceRulePreset(Some(sylva_core::model::CategoryPreset::Folders)),
+                    d.rule_folders,
+                ));
             }
         }
         console = Some(ConsoleHit {
@@ -1441,6 +1529,7 @@ mod tests {
             scroll: 0.0,
             storage_path: None,
             sidebar_collapsed: false,
+            rule: None,
         }
     }
 
