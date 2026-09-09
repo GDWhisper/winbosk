@@ -39,13 +39,13 @@ pub(crate) use windows::Win32::System::Console::SetConsoleCtrlHandler;
 pub(crate) use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-pub(crate) use windows::Win32::System::Ole::OleInitialize;
 pub(crate) use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
+pub(crate) use windows::Win32::System::Ole::OleInitialize;
 pub(crate) use windows::Win32::System::Threading::CreateMutexW;
 pub(crate) use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 pub(crate) use windows::Win32::UI::Input::Ime::{
     ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow, CFS_POINT, COMPOSITIONFORM,
@@ -59,10 +59,9 @@ pub(crate) use windows::Win32::UI::Shell::{
 };
 pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, PostMessageW,
-    SetProcessDPIAware, SystemParametersInfoW, TrackPopupMenu, HMENU,
-    MF_SEPARATOR, MF_STRING, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY,
-    TPM_RETURNCMD,
+    SetProcessDPIAware, SystemParametersInfoW, TrackPopupMenu, HMENU, MF_SEPARATOR, MF_STRING,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY, TPM_RETURNCMD,
 };
 
 pub(crate) use sylva_core::config::ConfigStore;
@@ -93,9 +92,9 @@ pub(crate) const MIN_FENCE_W: f32 = 200.0;
 /// 栅栏最小高度（缩放下限，物理像素）。
 pub(crate) const MIN_FENCE_H: f32 = 60.0;
 
-/// 图标提取边长（物理像素）。取高于所有渲染尺寸的值（最大图标 64、列表 20），
-/// 渲染时向下采样才清晰；若按渲染尺寸 32 提取再放大到 48，高 DPI 下发糊。
-pub(crate) const ICON_EXTRACT_SIZE: u32 = 64;
+/// 图标提取边长（物理像素）。取高于常用渲染尺寸的值（高 DPI 下标准 72px、大图标 96px、Dock 悬停 108px），
+/// 保证 GPU 始终向下采样，避免小图插值放大发糊。
+pub(crate) const ICON_EXTRACT_SIZE: u32 = 128;
 
 // 右键菜单项 ID（分段避免冲突）。
 
@@ -310,7 +309,11 @@ fn main() {
                         let _ = std::fs::remove_file(&src);
                     }
                 }
-                tracing::info!("已从 {} 迁移数据到 {}", old_dir.display(), data_dir.display());
+                tracing::info!(
+                    "已从 {} 迁移数据到 {}",
+                    old_dir.display(),
+                    data_dir.display()
+                );
             }
         }
     }
@@ -1262,7 +1265,12 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 tracing::info!(vx, vy, vw, vh, "显示拓扑变化：overlay 已重设并夹回栅栏");
             }
         }
-        OverlayEvent::SidebarReorderDrag { fence, icon, mx, my } => {
+        OverlayEvent::SidebarReorderDrag {
+            fence,
+            icon,
+            mx,
+            my,
+        } => {
             // 侧边栏图标拖动中：记录拖动状态，触发重绘
             // 排序计算在 build_scene 中基于实际图标位置完成
             rt.sidebar_reorder = Some((fence, icon, mx, my));

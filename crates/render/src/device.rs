@@ -109,9 +109,8 @@ impl RenderDevice {
                 Err(e) => last_err = Some(e),
             }
         }
-        let d3d = d3d.ok_or_else(|| {
-            last_err.expect("至少尝试过一次 D3D11CreateDevice，必有错误可上报")
-        })?;
+        let d3d =
+            d3d.ok_or_else(|| last_err.expect("至少尝试过一次 D3D11CreateDevice，必有错误可上报"))?;
 
         let dxgi: IDXGIDevice = d3d.cast()?;
         let d2d: ID2D1Factory =

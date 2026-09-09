@@ -4,9 +4,9 @@
 //! 顶层 BGRA（premultiplied）像素数据，供渲染层直接 `CopyFromMemory` 上传
 //! 到 D2D 位图。`IconCache` 提供按 `ItemId` 的 LRU 缓存。
 //!
-//! 注意：`GetImage` 返回的位图是 premultiplied alpha，渲染层需用
-//! `DXGI_FORMAT_B8G8R8A8_UNORM_PREMULTIPLIED` 对应模式上传，避免半透明
-//! 图标出现黑边（若发现暗边则改为直通 alpha + 显式预乘）。
+//! 注意：`GetImage` 返回的标准 32bpp DIB section 是直通 alpha（straight alpha），
+//! 解码时通过 `premultiply_bgra` 显式预乘后传给渲染层（`D2D1_ALPHA_MODE_PREMULTIPLIED`），
+//! 彻底杜绝边缘半透明像素叠加产生的白边毛刺。
 
 use std::collections::{HashMap, VecDeque};
 
@@ -132,6 +132,7 @@ fn hbitmap_to_icon_data(hbm: HBITMAP) -> windows::core::Result<IconData> {
         bm.bmHeight > 0,
         &mut pixels,
     );
+    premultiply_bgra(&mut pixels);
     Ok(IconData {
         width,
         height,
@@ -167,6 +168,43 @@ fn copy_rows(
                 out.as_mut_ptr().add(dst_off),
                 row_bytes,
             );
+        }
+    }
+}
+
+/// 将直通 BGRA 像素切片就地转换为预乘 Alpha（Premultiplied BGRA）。
+///
+/// Shell 的 `GetImage` 返回标准 32bpp DIB section，其像素为直通（straight）alpha。
+/// 渲染层采用 Direct2D 预乘管线（`D2D1_ALPHA_MODE_PREMULTIPLIED`），若直接上传直通
+/// 像素，会导致边缘半透明区域（低 alpha）的 RGB 被直接叠加到底色上，产生刺眼的亮白/彩色锯齿毛刺。
+///
+/// 防御措施：若发现整张图所有像素 alpha 均为 0（少数老旧 Win32 图标未写 alpha 通道），
+/// 则将 alpha 整体置为 255（完全不透明），避免整张图变透明。
+pub fn premultiply_bgra(pixels: &mut [u8]) {
+    debug_assert_eq!(pixels.len() % 4, 0);
+
+    let has_alpha = pixels.chunks_exact(4).any(|c| c[3] > 0);
+    if !has_alpha {
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk[3] = 255;
+        }
+        return;
+    }
+
+    for chunk in pixels.chunks_exact_mut(4) {
+        let a = chunk[3] as u32;
+        if a == 255 {
+            continue;
+        }
+        if a == 0 {
+            chunk[0] = 0;
+            chunk[1] = 0;
+            chunk[2] = 0;
+        } else {
+            // 四舍五入预乘：(c * a + 127) / 255
+            chunk[0] = ((chunk[0] as u32 * a + 127) / 255) as u8;
+            chunk[1] = ((chunk[1] as u32 * a + 127) / 255) as u8;
+            chunk[2] = ((chunk[2] as u32 * a + 127) / 255) as u8;
         }
     }
 }
@@ -313,23 +351,57 @@ mod tests {
     }
 
     #[test]
+    fn premultiply_scales_channels_correctly() {
+        // [B, G, R, A]
+        // 像素 1: [255, 128, 0, 128] -> 预乘半透明:
+        //   B = (255 * 128 + 127) / 255 = 128
+        //   G = (128 * 128 + 127) / 255 = 64
+        //   R = 0
+        // 像素 2: [255, 255, 255, 255] -> 完全不透明，原样保留
+        // 像素 3: [255, 200, 100, 0] -> 完全透明，RGB 清零
+        let mut pixels = vec![255, 128, 0, 128, 255, 255, 255, 255, 255, 200, 100, 0];
+        premultiply_bgra(&mut pixels);
+        assert_eq!(
+            pixels,
+            vec![128, 64, 0, 128, 255, 255, 255, 255, 0, 0, 0, 0,]
+        );
+    }
+
+    #[test]
+    fn premultiply_fixes_all_zero_alpha() {
+        // 模拟 GDI 未写入 alpha 通道的 32bpp 老式位图（alpha 全为 0）
+        let mut pixels = vec![100, 150, 200, 0, 50, 75, 120, 0];
+        premultiply_bgra(&mut pixels);
+        // alpha 应当被修正为 255，RGB 保持不变
+        assert_eq!(pixels, vec![100, 150, 200, 255, 50, 75, 120, 255,]);
+    }
+
+    #[test]
     fn live_extract_icons_from_real_desktop() {
-        // 真实桌面冒烟：对前 5 个图标提取 32px 图标，验证尺寸与像素有效。
+        // 真实桌面冒烟：对前 10 个图标提取 128px 图标，验证尺寸与预乘有效性。
         if crate::com::init().is_err() {
             return;
         }
         let items = crate::items::enumerate_desktop_items().expect("枚举桌面图标不应失败");
         let mut checked = 0;
-        for item in items.iter().take(5) {
-            match extract_icon(item, 32) {
+        for item in items.iter().take(10) {
+            match extract_icon(item, 128) {
                 Ok(icon) => {
-                    eprintln!(
-                        "  icon {:?}: {}x{}",
-                        item.display_name, icon.width, icon.height
-                    );
-                    assert_eq!(icon.width, 32);
-                    assert_eq!(icon.height, 32);
-                    assert_eq!(icon.pixels.len(), 32 * 32 * 4);
+                    assert_eq!(icon.width, 128);
+                    assert_eq!(icon.height, 128);
+                    assert_eq!(icon.pixels.len(), 128 * 128 * 4);
+                    // 验证所有像素必须满足严格预乘约束（B <= A, G <= A, R <= A）
+                    for chunk in icon.pixels.chunks_exact(4) {
+                        let b = chunk[0];
+                        let g = chunk[1];
+                        let r = chunk[2];
+                        let a = chunk[3];
+                        assert!(
+                            b <= a && g <= a && r <= a,
+                            "像素未预乘：B={b}, G={g}, R={r}, A={a} (项: {:?})",
+                            item.display_name
+                        );
+                    }
                     checked += 1;
                 }
                 Err(e) => eprintln!("  FAIL {:?}: {e:?}", item.display_name),

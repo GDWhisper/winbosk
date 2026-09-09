@@ -18,7 +18,7 @@
 use std::sync::OnceLock;
 
 use windows::core::{Result, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM, TRUE};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, EqualRgn, SetBkColor, SetTextColor,
     SetWindowRgn, HBRUSH, HDC, HRGN, RGN_OR,
@@ -46,13 +46,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, TranslateMessage, CS_DBLCLKS, GWLP_USERDATA, HCURSOR, HICON, HTCLIENT,
     HTTRANSPARENT, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
     IDC_SIZENWSE, IDC_SIZEWE, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOREDRAW, SWP_NOOWNERZORDER, SWP_NOZORDER, SW_SHOWNA,
-    SW_SHOWNOACTIVATE, WM_CHAR, WM_CLOSE, WM_CTLCOLOREDIT, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY,
-    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_TIMER,
-    WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOZORDER, SW_SHOWNA,
+    SW_SHOWNOACTIVATE, WM_CHAR, WM_CLOSE, WM_CTLCOLOREDIT, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use sylva_core::model::{FenceLayout, FenceStyle, SidebarPosition};
@@ -324,9 +324,18 @@ pub enum OverlayEvent {
     DisplayChange,
     /// 侧边栏图标拖动中（重排序）：`icon` 是被拖动的图标在 `icon_ids` 中的下标，
     /// `(mx, my)` 为当前光标位置（虚拟屏幕物理像素）。
-    SidebarReorderDrag { fence: usize, icon: usize, mx: f32, my: f32 },
+    SidebarReorderDrag {
+        fence: usize,
+        icon: usize,
+        mx: f32,
+        my: f32,
+    },
     /// 侧边栏图标拖动结束：`from` 是原始下标，`to` 是目标插入位置。
-    SidebarReorderEnd { fence: usize, from: usize, to: usize },
+    SidebarReorderEnd {
+        fence: usize,
+        from: usize,
+        to: usize,
+    },
 }
 
 /// 拖拽会话（按下到松开之间持续有效）。
@@ -1739,13 +1748,15 @@ fn on_button_up(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
 
 /// 根据光标位置计算侧边栏图标重排的目标插入位置。
 /// 返回值为插入下标（0..=图标总数）：图标将被插入到该下标之前。
-fn compute_reorder_target(model: &HitModel, fence_id: usize, _from: usize, mx: f32, my: f32) -> usize {
+fn compute_reorder_target(
+    model: &HitModel,
+    fence_id: usize,
+    _from: usize,
+    mx: f32,
+    my: f32,
+) -> usize {
     // 收集该栅栏的所有图标，按 x 坐标排序（横向侧边栏）或 y 坐标排序（纵向）
-    let mut icons: Vec<_> = model
-        .icons
-        .iter()
-        .filter(|i| i.fence == fence_id)
-        .collect();
+    let mut icons: Vec<_> = model.icons.iter().filter(|i| i.fence == fence_id).collect();
     if icons.is_empty() {
         return 0;
     }

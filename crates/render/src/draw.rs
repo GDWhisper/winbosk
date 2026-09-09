@@ -30,7 +30,7 @@ use sylva_shell::icons::IconData;
 
 use crate::overlay::{ConsoleZone, RectF};
 use crate::scene::{ListColumns, Scene, SceneConsole, SceneEdit, SceneFence, SceneFenceDetail};
-use crate::theme::{GRID_CAPTION_H_MULT, TextStyle, Theme};
+use crate::theme::{TextStyle, Theme, GRID_CAPTION_H_MULT};
 
 /// 图标位图缓存：`bitmap_id` → 设备上的 D2D 位图。
 ///
@@ -579,7 +579,8 @@ fn draw_fence_detail(
             if let Some(rgb) = TINT_COLORS.get(i) {
                 let rgb = *rgb;
                 let active = d.tint == Some(rgb);
-                let hover = matches!(c.hover_zone, Some(ConsoleZone::FenceTint(Some(t))) if t == rgb);
+                let hover =
+                    matches!(c.hover_zone, Some(ConsoleZone::FenceTint(Some(t))) if t == rgb);
                 draw_tint_swatch(target, theme, *rect, rgb, active, hover, accent)?;
             }
         }
@@ -616,9 +617,8 @@ fn draw_fence_detail(
             right: label_x + label_w,
             bottom: d.sidebar_left.y + 24.0 * s,
         };
-        let pos_label_brush = unsafe {
-            target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.45 * full_t]), None)?
-        };
+        let pos_label_brush =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.45 * full_t]), None)? };
         draw_text(target, "位置", &formats.detail, lr6, &pos_label_brush);
         for (rect, pos, label) in [
             (d.sidebar_left, SidebarPosition::Left, "左"),

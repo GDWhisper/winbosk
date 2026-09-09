@@ -220,9 +220,7 @@ pub(crate) fn edit_key(rt: &mut Runtime, vk: u32, ctrl: bool) {
             }
         }
         v if v == VK_ESCAPE.0 as u32 => {
-            if rt.edit.is_some() {
-                rt.edit = None;
-            }
+            rt.edit = None;
         }
         v if v == VK_BACK.0 as u32 => {
             if let Some(e) = rt.edit.as_mut() {

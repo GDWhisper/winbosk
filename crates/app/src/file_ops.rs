@@ -236,7 +236,10 @@ pub(crate) fn change_fence_storage(rt: &mut Runtime, fence_idx: usize, new_dir: 
         let old_path = std::path::Path::new(old);
         if old_path.is_dir()
             && old_path.starts_with(&rt.library)
-            && old_path.read_dir().map(|mut d| d.next().is_none()).unwrap_or(false)
+            && old_path
+                .read_dir()
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false)
         {
             let _ = std::fs::remove_dir(old_path);
             tracing::info!("已清理空的旧库子文件夹: {}", old);
@@ -332,7 +335,6 @@ pub(crate) fn reconcile_fences(rt: &mut Runtime) -> bool {
     }
     changed
 }
-
 
 /// 镜像一个链接栅栏的存储文件夹（文件夹 → 栅栏方向）：资源管理器里对文件夹的
 /// 新增/删除/改名 ≤ 后台 `SyncLibrary` 周期（4s）反映到栅栏。栅栏即文件夹——

@@ -175,7 +175,10 @@ impl Compositor {
             // 内容撑住表面，肉眼即见快速闪烁（打开控制中心就不闪，正是因为面板
             // 让表面变大、工具提示变化不再越界）。这里探测到 Dock 存在就禁止收缩：
             // 表面第一次覆盖到工具提示范围后保持不再缩小，之后工具提示增删不再触发重建。
-            let has_dock = scene.fences.iter().any(|f| f.layout == FenceLayout::Sidebar);
+            let has_dock = scene
+                .fences
+                .iter()
+                .any(|f| f.layout == FenceLayout::Sidebar);
             self.ensure_covering(bbox, has_dock);
         }
         let frame = self.surface.begin_frame()?;
