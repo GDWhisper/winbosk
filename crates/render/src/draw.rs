@@ -834,14 +834,34 @@ fn draw_fence_inner(
         unsafe { target.DrawRoundedRectangle(&rr, &brush, fence.border_width, None) };
     }
 
+    let title_right = if let Some(btn) = fence.collapse_btn {
+        btn.x.min(fence.x + fence.width - theme.fence_padding)
+    } else {
+        fence.x + fence.width - theme.fence_padding
+    };
     if !fence.title.is_empty() {
         let tr = D2D_RECT_F {
             left: fence.x + theme.fence_padding,
             top: fence.y + theme.fence_padding,
-            right: fence.x + fence.width - theme.fence_padding,
+            right: title_right,
             bottom: fence.y + theme.fence_padding + theme.title.size * 1.6,
         };
         draw_text_centered(target, &fence.title, &formats.title, tr, &brushes.title);
+    }
+
+    if let Some(btn) = fence.collapse_btn {
+        let arrow = if fence.collapsed { "▸" } else { "▾" };
+        let btn_rect = D2D_RECT_F {
+            left: btn.x,
+            top: btn.y,
+            right: btn.x + btn.w,
+            bottom: btn.y + btn.h,
+        };
+        draw_text_centered(target, arrow, &formats.title, btn_rect, &brushes.title);
+    }
+
+    if fence.collapsed {
+        return Ok(());
     }
 
     // 内容区：悬停高亮 + 图标行 + 列表列头，全部裁剪在内容区内（滚动后顶部可裁掉）。

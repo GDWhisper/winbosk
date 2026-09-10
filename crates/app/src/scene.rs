@@ -100,6 +100,7 @@ pub(crate) fn seed_fences(desk: &mut Desk, _items: &[DesktopItem], _theme: &Them
         storage_path: storage,
         sidebar_collapsed: false,
         rule: None,
+        collapsed: false,
     };
     desk.fences.push(f);
 }
@@ -197,6 +198,8 @@ pub(crate) fn build_scene(rt: &mut Runtime, now: Instant) -> Scene {
                 _ => {}
             }
         }
+        let full_height = sf.height;
+
         // 侧边栏布局：不显示标题（Dock 无标题）；固定为完整 dock，无折叠状态。
         if f.appearance.layout == FenceLayout::Sidebar {
             sf.title.clear();
@@ -213,13 +216,35 @@ pub(crate) fn build_scene(rt: &mut Runtime, now: Instant) -> Scene {
                     }
                 }
             }
+
+            let scale = rt.theme.scale;
+            let pad = f.appearance.padding * scale;
+            let btn_size = (rt.theme.title.size * 1.4).round().max(16.0);
+            let btn_rect = RectF {
+                x: sf.x + sf.width - pad - btn_size,
+                y: sf.y + pad + (rt.theme.title.size * 1.6 - btn_size) / 2.0,
+                w: btn_size,
+                h: btn_size,
+            };
+            sf.collapse_btn = Some(btn_rect);
+
+            if f.collapsed {
+                let title_h =
+                    (rt.theme.title.size * 1.6 + rt.theme.title_padding_bottom + 2.0 * pad).round();
+                sf.collapsed = true;
+                sf.height = title_h;
+                sf.icons.clear();
+                sf.scroll_max = 0.0;
+                sf.scroll_view = 0.0;
+            }
         }
         // 回写钳制后的滚动偏移（滚轮事件在 layout 内被限制在 [0, max_scroll]）
         rt.desk.fences[i].scroll = sf.scroll;
-        // 回写实际渲染高度：自动高度栅栏（bounds.h==0）的碰撞检测/夹屏按真实高度算。
+        // 回写实际展开高度：自动高度栅栏（bounds.h<=0）的碰撞检测/夹屏按真实展开高度算。
         // 只在有对应下标时回写（AddFence 后同一帧 scene 已重建，长度必对齐）。
+        // 无论当前是否折叠，last_layout_h 均记录展开时的真实物理高度（保证冷启动重叠消解不失效）。
         if i < rt.last_layout_h.len() {
-            rt.last_layout_h[i] = sf.height;
+            rt.last_layout_h[i] = full_height;
         }
         // 模糊风格无需任何截图/CPU 处理：`sf.blur` 已由 layout_fence 置位，
         // 合成器据此建/删该栅栏的 BackdropBrush + GaussianBlurEffect 视觉（GPU 实时）。
@@ -320,6 +345,57 @@ pub(crate) fn console_geometry(desk: &Desk, theme: &Theme, vw: f32, vh: f32, pan
         None => ((vw - w - margin).max(8.0 * s), margin.max(8.0 * s)),
     };
     RectF { x, y, w, h }
+}
+
+/// 计算确保选中的栅栏在控制中心列表中完全可见所需的新滚动偏移
+pub(crate) fn compute_fence_scroll_for_selection(
+    curr_scroll: f32,
+    selected_fence: usize,
+    fence_n: usize,
+    scale: f32,
+) -> f32 {
+    let row_h_f = CONSOLE_FENCE_ROW_H * scale;
+    let fence_shown = fence_n.min(CONSOLE_FENCE_MAX_ROWS);
+    if fence_n <= fence_shown {
+        return 0.0;
+    }
+    let fence_scroll_max = (fence_n - fence_shown) as f32 * row_h_f;
+    let sel = selected_fence.min(fence_n.saturating_sub(1));
+    let row_top = sel as f32 * row_h_f;
+    let row_bottom = (sel + 1) as f32 * row_h_f;
+    let view_top = curr_scroll;
+    let view_bottom = curr_scroll + fence_shown as f32 * row_h_f;
+
+    let mut new_scroll = curr_scroll;
+    if row_top < view_top {
+        new_scroll = row_top;
+    } else if row_bottom > view_bottom {
+        new_scroll = row_bottom - fence_shown as f32 * row_h_f;
+    }
+    new_scroll.clamp(0.0, fence_scroll_max)
+}
+
+/// 确保当前选中的栅栏在控制中心列表中完全可见
+pub(crate) fn ensure_selected_fence_visible(rt: &mut Runtime) {
+    rt.fence_scroll = compute_fence_scroll_for_selection(
+        rt.fence_scroll,
+        rt.selected_fence,
+        rt.desk.fences.len(),
+        rt.theme.scale,
+    );
+}
+
+/// 删除栅栏时规范化修正选中的栅栏下标
+pub(crate) fn adjust_selected_fence_on_delete(
+    selected_fence: usize,
+    deleted_idx: usize,
+    total_after_delete: usize,
+) -> usize {
+    let mut res = selected_fence;
+    if deleted_idx < res {
+        res = res.saturating_sub(1);
+    }
+    res.min(total_after_delete.saturating_sub(1))
 }
 
 /// 构建控制中心面板场景（栅栏管理单页）。关闭后完全隐藏（无胶囊），
@@ -960,6 +1036,8 @@ pub(crate) fn layout_fence(
         // 侧边栏工具提示矩形由 build_dock_magnify 在第二遍计算后填入
         tooltip_rect: None,
         reorder_drag: None,
+        collapsed: false,
+        collapse_btn: None,
     }
 }
 
@@ -1367,6 +1445,8 @@ pub(crate) fn hit_model_from(theme: &Theme, scene: &Scene, _desk: &Desk) -> HitM
             id: fi,
             tooltip: f.tooltip_rect,
             is_sidebar: f.layout == FenceLayout::Sidebar,
+            collapse_btn: f.collapse_btn,
+            collapsed: f.collapsed,
         });
         // 可视区（列头之下）：滚出可视区的图标不参与命中，避免误点。
         let view_top = f.content_top + f.list_cols.map(|c| c.header_h).unwrap_or(0.0);
@@ -1530,6 +1610,7 @@ mod tests {
             storage_path: None,
             sidebar_collapsed: false,
             rule: None,
+            collapsed: false,
         }
     }
 
@@ -1708,5 +1789,76 @@ mod tests {
         assert!(s_at_center[0] > s_mid[0]);
         // 靠近中点时第二个图标开始被带起来
         assert!(s_mid[1] > 1.0);
+    }
+
+    #[test]
+    fn compute_fence_scroll_for_selection_bounds() {
+        let scale = 1.0;
+        let row_h = CONSOLE_FENCE_ROW_H * scale; // 36.0
+        let max_rows = CONSOLE_FENCE_MAX_ROWS; // 5
+        let n = 10;
+        let max_scroll = (n - max_rows) as f32 * row_h; // 5 * 36 = 180.0
+
+        // 栅栏数不足 5 行时，滚动恒为 0
+        assert_eq!(compute_fence_scroll_for_selection(50.0, 2, 4, scale), 0.0);
+
+        // 选中第一行 (index 0)，若原本在底部 (180.0)，应向上滚动到 0.0
+        assert_eq!(compute_fence_scroll_for_selection(180.0, 0, n, scale), 0.0);
+
+        // 选中第 2 行 (index 1)，在当前视口 [0, 180] 内，应保持原滚动位置不变
+        assert_eq!(compute_fence_scroll_for_selection(0.0, 1, n, scale), 0.0);
+
+        // 选中最后一行 (index 9)，若原本在顶部 (0.0)，应向下滚动到 180.0
+        assert_eq!(
+            compute_fence_scroll_for_selection(0.0, 9, n, scale),
+            max_scroll
+        );
+
+        // 选中第 7 行 (index 6)，若原本在顶部 (0.0)，行底为 7*36=252，视口高 5*36=180，应滚动至 252 - 180 = 72.0
+        assert_eq!(compute_fence_scroll_for_selection(0.0, 6, n, scale), 72.0);
+    }
+
+    #[test]
+    fn resolve_desktop_fence_semantics() {
+        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let mut f_work = test_fence(FenceLayout::Grid);
+        f_work.id = 1;
+        f_work.title = Some("工作".into());
+
+        let mut f_desktop = test_fence(FenceLayout::Grid);
+        f_desktop.id = 2;
+        f_desktop.title = Some("桌面".into());
+
+        desk.fences = vec![f_work.clone(), f_desktop.clone()];
+
+        // 1. 优先解析名为「桌面」的栅栏
+        assert_eq!(resolve_desktop_fence(&desk, None), Some(2));
+
+        // 2. 当「桌面」栅栏被排除（如正在删除它）时，回退到普通栅栏
+        assert_eq!(resolve_desktop_fence(&desk, Some(2)), Some(1));
+
+        // 3. 当全部栅栏均被排除时，返回 None
+        assert_eq!(resolve_desktop_fence(&desk, Some(1)), Some(2));
+        desk.fences = vec![f_work];
+        assert_eq!(resolve_desktop_fence(&desk, Some(1)), None);
+    }
+
+    #[test]
+    fn adjust_selected_fence_on_delete_behavior() {
+        // 场景：共 5 个栅栏 [0, 1, 2, 3, 4]
+        // 1. 当前选中 index 3，删除 index 1（在前）：选中变为 2
+        assert_eq!(adjust_selected_fence_on_delete(3, 1, 4), 2);
+
+        // 2. 当前选中 index 1，删除 index 3（在后）：选中保持 1
+        assert_eq!(adjust_selected_fence_on_delete(1, 3, 4), 1);
+
+        // 3. 当前选中 index 4（最后一项），删除 index 4：选中变为 3
+        assert_eq!(adjust_selected_fence_on_delete(4, 4, 4), 3);
+
+        // 4. 当前选中 index 0，删除 index 0，剩余 4 个：选中保持 0
+        assert_eq!(adjust_selected_fence_on_delete(0, 0, 4), 0);
+
+        // 5. 边界：只剩 1 个栅栏并被删除，剩余 0 个：钳制为 0
+        assert_eq!(adjust_selected_fence_on_delete(0, 0, 0), 0);
     }
 }

@@ -83,6 +83,10 @@ pub struct SceneFence {
     pub tooltip_rect: Option<RectF>,
     /// 侧边栏图标拖动排序状态：Some 时绘制拖动中的图标位置。
     pub reorder_drag: Option<ReorderDrag>,
+    /// 栅栏是否收起（折叠仅留标题栏）。
+    pub collapsed: bool,
+    /// 标题栏折叠/展开切换按钮矩形（物理像素）。
+    pub collapse_btn: Option<RectF>,
 }
 
 /// 侧边栏图标拖动排序的渲染状态。
@@ -331,6 +335,8 @@ mod tests {
             alpha: 1.0,
             tooltip_rect: None,
             reorder_drag: None,
+            collapsed: false,
+            collapse_btn: None,
         }
     }
 

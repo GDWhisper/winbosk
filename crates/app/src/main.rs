@@ -725,6 +725,8 @@ fn is_popup_dismiss_event(ev: &OverlayEvent) -> bool {
             | OverlayEvent::ContextMenu { .. }
             | OverlayEvent::FilesDropped { .. }
             | OverlayEvent::FenceScroll { .. }
+            | OverlayEvent::FenceCollapseToggle { .. }
+            | OverlayEvent::FenceTitleDoubleClicked { .. }
             // 控制台交互（点按钮/滚待办/拖动面板/热键开关）都是真实交互，编辑期间应提交。
             | OverlayEvent::ConsoleClick { .. }
             | OverlayEvent::ConsoleScroll { .. }
@@ -755,9 +757,32 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
     if rt.edit.is_some() && is_popup_dismiss_event(&ev) {
         dismiss_edit(rt);
     }
+    // 控制中心联动门控：在控制中心开启时，若用户与桌面栅栏发生交互，自动跟随高亮并滚动到可视区
+    let active_fence = match &ev {
+        OverlayEvent::FenceMove { fence, .. }
+        | OverlayEvent::FenceResize { fence, .. }
+        | OverlayEvent::IconDoubleClicked { fence, .. }
+        | OverlayEvent::IconClicked { fence, .. }
+        | OverlayEvent::SelectDrag { fence, .. }
+        | OverlayEvent::ContextMenu { fence, .. }
+        | OverlayEvent::FenceScroll { fence, .. }
+        | OverlayEvent::FenceDragEnd { fence }
+        | OverlayEvent::SidebarReorderDrag { fence, .. }
+        | OverlayEvent::SidebarReorderEnd { fence, .. }
+        | OverlayEvent::FenceCollapseToggle { fence }
+        | OverlayEvent::FenceTitleDoubleClicked { fence } => Some(*fence),
+        _ => None,
+    };
     // 重绘门控：默认 true（一切改变可见状态的事件照常重绘），
     // 仅对「可能无事可画」的事件显式置 false。
     let mut redraw = true;
+    if let Some(fence) = active_fence {
+        if rt.desk.console_open && fence < rt.desk.fences.len() && rt.selected_fence != fence {
+            rt.selected_fence = fence;
+            ensure_selected_fence_visible(rt);
+            redraw = true;
+        }
+    }
     match ev {
         OverlayEvent::FenceMove { fence, pos } => {
             // 拖动标题栏：不交叉（无重叠推挤）+ 磁吸吸附 + 限制在虚拟屏幕内。
@@ -783,6 +808,10 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             }
         }
         OverlayEvent::FenceResize { fence, zone, rect } => {
+            // 折叠状态栅栏严禁缩放，防止破坏自适应高度或展开时的真实几何尺寸
+            if fence < rt.desk.fences.len() && rt.desk.fences[fence].collapsed {
+                return None;
+            }
             // 拖边缘/角标：只动可动边，被其它栅栏挡住时停在交界边（不侵入），
             // 边接近时吸附对齐；锚定边不动，最小尺寸/屏幕边界约束在算法内完成。
             // 直接落到目标（无补间），视觉 = 模型 = 鼠标，即时跟手。
@@ -948,6 +977,17 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 tracing::warn!("布局持久化失败: {e}");
             }
         }
+        OverlayEvent::FenceCollapseToggle { fence }
+        | OverlayEvent::FenceTitleDoubleClicked { fence } => {
+            if let Some(f) = rt.desk.fences.get_mut(fence) {
+                if f.appearance.layout != FenceLayout::Sidebar {
+                    f.collapsed = !f.collapsed;
+                    if let Err(e) = rt.store.save(&rt.desk) {
+                        tracing::warn!("折叠状态持久化失败: {e}");
+                    }
+                }
+            }
+        }
         OverlayEvent::ConsoleClick { zone } => match zone {
             ConsoleZone::Close => {
                 // 折叠为胶囊（面板始终可见，不再「消失」）；保存开关状态供重启恢复
@@ -1104,6 +1144,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     storage_path: None,
                     sidebar_collapsed: false,
                     rule: None,
+                    collapsed: false,
                 });
                 rt.last_layout_h.push(0.0);
                 rt.selected_fence = rt.desk.fences.len() - 1;
@@ -1111,30 +1152,10 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 tracing::info!(id, "已快速创建空白收纳栅栏");
             }
             ConsoleZone::RemoveFence => {
-                // 移出当前选中的栅栏：成员退回未分组区，栅栏删除。
-                // 不删除链接的文件夹（用户数据不受影响）。
                 let i = rt
                     .selected_fence
                     .min(rt.desk.fences.len().saturating_sub(1));
-                let ids: Vec<String> = rt
-                    .desk
-                    .fences
-                    .get(i)
-                    .map(|f| f.icon_ids.clone())
-                    .unwrap_or_default();
-                for id in ids {
-                    rt.desk.move_icon(&id, None);
-                }
-                if i < rt.desk.fences.len() {
-                    rt.desk.fences.remove(i);
-                }
-                rt.selected_fence = rt
-                    .selected_fence
-                    .saturating_sub(1)
-                    .min(rt.desk.fences.len());
-                if let Err(e) = rt.store.save(&rt.desk) {
-                    tracing::warn!("移出栅栏持久化失败: {e}");
-                }
+                delete_fence_and_reclaim_icons(rt, i);
             }
             ConsoleZone::ChangeStoragePath => {
                 // 更改选中栅栏的存储位置：打开文件夹选择器，移动已有库内项到新路径

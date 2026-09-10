@@ -992,6 +992,7 @@ impl Desk {
                     custom_extensions: Vec::new(),
                     auto_capture: true,
                 }),
+                collapsed: false,
             });
             created_fences += 1;
         }
@@ -1086,6 +1087,7 @@ mod tests {
             storage_path: None,
             sidebar_collapsed: false,
             rule: None,
+            collapsed: false,
         });
 
         // 移到栅栏
@@ -1125,6 +1127,7 @@ mod tests {
             storage_path: None,
             sidebar_collapsed: false,
             rule: None,
+            collapsed: false,
         });
         d.free_icons = vec!["ghost2".into()];
         d.validate();
@@ -1168,6 +1171,7 @@ mod tests {
                 custom_extensions: Vec::new(),
                 auto_capture: true,
             }),
+            collapsed: false,
         });
 
         // 栅栏 2：媒体
@@ -1188,6 +1192,7 @@ mod tests {
                 custom_extensions: Vec::new(),
                 auto_capture: true,
             }),
+            collapsed: false,
         });
 
         // 执行整理
@@ -1345,6 +1350,7 @@ mod tests {
                 custom_extensions: Vec::new(),
                 auto_capture: true,
             }),
+            collapsed: false,
         });
 
         let wa = Rect::new(0.0, 0.0, 1920.0, 1080.0);
@@ -1450,5 +1456,37 @@ mod tests {
         assert_eq!(t.name, "旧事项");
         assert_eq!(t.detail, "");
         assert!(t.done);
+    }
+
+    #[test]
+    fn fence_collapsed_serde_backward_compatible() {
+        // 旧版 JSON（不含 collapsed 字段）
+        let old_json = r#"{
+            "id": 1,
+            "title": "测试栅栏",
+            "monitor_id": 0,
+            "bounds": {"x": 10.0, "y": 20.0, "w": 300.0, "h": 200.0},
+            "state": "Expanded",
+            "icon_ids": [],
+            "appearance": {}
+        }"#;
+        let fence: Fence =
+            serde_json::from_str(old_json).expect("旧版未包含 collapsed 应可成功反序列化");
+        assert!(!fence.collapsed, "旧版缺少 collapsed 时应默认为 false");
+
+        // 新版 JSON（显式包含 collapsed: true）
+        let new_json = r#"{
+            "id": 2,
+            "title": "折叠栅栏",
+            "monitor_id": 0,
+            "bounds": {"x": 10.0, "y": 20.0, "w": 300.0, "h": 200.0},
+            "state": "Expanded",
+            "icon_ids": [],
+            "appearance": {},
+            "collapsed": true
+        }"#;
+        let fence2: Fence =
+            serde_json::from_str(new_json).expect("包含 collapsed: true 应可成功反序列化");
+        assert!(fence2.collapsed);
     }
 }

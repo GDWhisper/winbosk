@@ -158,6 +158,10 @@ pub struct FenceHit {
     pub tooltip: Option<RectF>,
     /// 是否为侧边栏布局（用于拖动排序判定）。
     pub is_sidebar: bool,
+    /// 标题栏折叠/展开切换按钮矩形（物理像素）。
+    pub collapse_btn: Option<RectF>,
+    /// 是否处于折叠状态（折叠时禁止缩放）。
+    pub collapsed: bool,
 }
 
 /// 一个图标的命中数据。`fence` / `icon` 分别是 App 层 `desk.fences` 下标
@@ -297,9 +301,13 @@ pub enum OverlayEvent {
     FilesDropped { fence: usize, paths: Vec<String> },
     /// 鼠标滚轮滚动某栅栏：`delta` 是滚轮原始刻度（正=向上/远离，负=向下）。
     FenceScroll { fence: usize, delta: i32 },
+    /// 点击栅栏折叠切换按钮。
+    FenceCollapseToggle { fence: usize },
+    /// 双击栅栏标题栏空白区。
+    FenceTitleDoubleClicked { fence: usize },
     /// 托盘图标：右键（显示控制中心/退出菜单）。
     TrayMenu,
-    /// 托盘图标：双击（切换控制中心开合）。
+    /// 托盘图标：左键单击（切换控制中心开合）。
     TrayToggle,
     /// 控制台控件悬停变化（None = 移出所有控件；仅展开面板内上报）。
     ConsoleHover { zone: Option<ConsoleZone> },
@@ -1343,6 +1351,19 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
             return; // 面板空白：吞掉点击
         }
     }
+    // 栅栏标题栏折叠/展开按钮优先于缩放与移动
+    for f in &state.model.fences {
+        if let Some(btn) = f.collapse_btn {
+            if btn.contains(mx, my) {
+                emit_event(
+                    hwnd,
+                    state,
+                    OverlayEvent::FenceCollapseToggle { fence: f.id },
+                );
+                return;
+            }
+        }
+    }
     // 优先级：缩放区域 > 标题栏 > 空白。
     for f in &state.model.fences {
         if f.body.contains(mx, my) {
@@ -1465,7 +1486,11 @@ fn band_selection(model: &HitModel, fence: usize, band: RectF) -> Vec<(usize, us
 }
 
 /// 点所在栅栏的缩放区域（角优先、边其次）。不在任何缩放区返回 None。
+/// 折叠栅栏仅保留标题栏，禁止任何边或角缩放，防止破坏自适应高度或原始高度。
 fn resize_zone_at(f: &FenceHit, mx: f32, my: f32) -> Option<ResizeZone> {
+    if f.collapsed {
+        return None;
+    }
     let left = f.body.x;
     let right = f.body.x + f.body.w;
     let bottom = f.body.y + f.body.h;
@@ -1845,6 +1870,12 @@ fn compute_reorder_target(
 
 /// 双击图标：把下标交给 App 打开对应项。
 fn on_double_click(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
+    // 控制台面板展开时阻断双击穿透底层桌面栅栏
+    if let Some(c) = &state.model.console {
+        if c.rect.contains(mx, my) {
+            return;
+        }
+    }
     // 编辑框内双击同样不穿透（WM_LBUTTONDBLCLK 独立到达，需单独守卫）
     if let Some(er) = state.model.edit_rect {
         if er.contains(mx, my) {
@@ -1860,6 +1891,22 @@ fn on_double_click(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                     fence: icon.fence,
                     icon: icon.icon,
                 },
+            );
+            return;
+        }
+    }
+    // 未命中图标：检测是否双击栅栏标题栏空白处以收起/展开
+    for f in &state.model.fences {
+        if let Some(btn) = f.collapse_btn {
+            if btn.contains(mx, my) {
+                return;
+            }
+        }
+        if f.title.contains(mx, my) {
+            emit_event(
+                hwnd,
+                state,
+                OverlayEvent::FenceTitleDoubleClicked { fence: f.id },
             );
             return;
         }
@@ -1997,6 +2044,8 @@ mod tests {
                     id: 0,
                     tooltip: None,
                     is_sidebar: false,
+                    collapse_btn: None,
+                    collapsed: false,
                 },
                 FenceHit {
                     body: RectF {
@@ -2020,6 +2069,8 @@ mod tests {
                     id: 1,
                     tooltip: None,
                     is_sidebar: false,
+                    collapse_btn: None,
+                    collapsed: false,
                 },
             ],
             icons: vec![],
@@ -2030,5 +2081,44 @@ mod tests {
         unsafe {
             let _ = DeleteObject(rgn.into());
         }
+    }
+
+    #[test]
+    fn collapsed_fence_disallows_resize() {
+        let f = FenceHit {
+            body: RectF {
+                x: 100.0,
+                y: 100.0,
+                w: 200.0,
+                h: 36.0,
+            },
+            title: RectF {
+                x: 100.0,
+                y: 100.0,
+                w: 200.0,
+                h: 36.0,
+            },
+            grip: RectF {
+                x: 274.0,
+                y: 110.0,
+                w: 26.0,
+                h: 26.0,
+            },
+            id: 0,
+            tooltip: None,
+            is_sidebar: false,
+            collapse_btn: Some(RectF {
+                x: 270.0,
+                y: 105.0,
+                w: 20.0,
+                h: 20.0,
+            }),
+            collapsed: true,
+        };
+
+        // 折叠栅栏无论在右下角、底部还是右边缘，均禁止判定为缩放区域
+        assert_eq!(resize_zone_at(&f, 298.0, 134.0), None);
+        assert_eq!(resize_zone_at(&f, 200.0, 135.0), None);
+        assert_eq!(resize_zone_at(&f, 298.0, 115.0), None);
     }
 }
