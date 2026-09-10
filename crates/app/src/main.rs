@@ -58,10 +58,11 @@ pub(crate) use windows::Win32::UI::Shell::{
     FOS_ALLOWMULTISELECT, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, HDROP, SIGDN_FILESYSPATH,
 };
 pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics, PostMessageW,
-    SetProcessDPIAware, SystemParametersInfoW, TrackPopupMenu, HMENU, MF_SEPARATOR, MF_STRING,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY, TPM_RETURNCMD,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
+    PostMessageW, SetForegroundWindow, SetProcessDPIAware, SystemParametersInfoW, TrackPopupMenu,
+    HMENU, MF_SEPARATOR, MF_STRING, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY,
+    TPM_RETURNCMD, WM_NULL,
 };
 
 pub(crate) use sylva_core::config::ConfigStore;
@@ -1244,7 +1245,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             }
         }
         OverlayEvent::TrayToggle => {
-            // 托盘图标双击：切换控制中心开合（与 Ctrl+Alt+T 相同）
+            // 托盘图标左键单击：切换控制中心开合（与 Ctrl+Alt+T 相同）
             let open = !rt.desk.console_open;
             rt.desk.console_open = open;
             let _ = rt.store.save(&rt.desk);
@@ -1567,6 +1568,98 @@ fn delete_selected(rt: &mut Runtime) {
         }
     }
     let _ = rt.store.save(&rt.desk);
+}
+
+/// 在桌面上寻找用于受纳回流图标的目标「桌面」栅栏
+pub(crate) fn resolve_desktop_fence(desk: &Desk, exclude_id: Option<u64>) -> Option<u64> {
+    // 1. 语义优先：标题为「桌面」且非排除项
+    if let Some(f) = desk
+        .fences
+        .iter()
+        .find(|f| exclude_id != Some(f.id) && f.title.as_deref() == Some("桌面"))
+    {
+        return Some(f.id);
+    }
+    // 2. 规则优先：未配置分类规则且未绑定外部目录的通用栅栏
+    if let Some(f) = desk
+        .fences
+        .iter()
+        .find(|f| exclude_id != Some(f.id) && f.rule.is_none() && f.storage_path.is_none())
+    {
+        return Some(f.id);
+    }
+    // 3. 兜底：任意其他存活的栅栏
+    desk.fences
+        .iter()
+        .find(|f| exclude_id != Some(f.id))
+        .map(|f| f.id)
+}
+
+/// 安全删除指定索引的栅栏，并将其中的图标完整归流至「桌面」栅栏
+pub(crate) fn delete_fence_and_reclaim_icons(rt: &mut Runtime, fence_idx: usize) {
+    let Some(fence) = rt.desk.fences.get(fence_idx) else {
+        return;
+    };
+    let deleting_id = fence.id;
+    let icon_ids = fence.icon_ids.clone();
+
+    // 1. 寻找或兜底创建受纳栅栏
+    let target_fid = match resolve_desktop_fence(&rt.desk, Some(deleting_id)) {
+        Some(fid) => fid,
+        None => {
+            // 桌面上所有栅栏均被删除，自动重置出一个标准默认「桌面」栅栏
+            let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
+            let fallback_id = rt.desk.next_fence_id();
+            let fallback = Fence {
+                id: fallback_id,
+                title: Some("桌面".to_string()),
+                monitor_id: 0,
+                bounds: Rect::new(wa.x + 40.0, wa.y + 40.0, 320.0 * rt.theme.scale, 0.0),
+                state: FenceState::Expanded,
+                icon_ids: Vec::new(),
+                appearance: FenceAppearance::default(),
+                scroll: 0.0,
+                storage_path: None,
+                sidebar_collapsed: false,
+                collapsed: false,
+                rule: None,
+            };
+            rt.desk.fences.push(fallback);
+            rt.last_layout_h.push(0.0);
+            fallback_id
+        }
+    };
+
+    // 2. 将被删除栅栏内的图标无损移入目标栅栏
+    for id in icon_ids {
+        rt.desk.move_icon(&id, Some(target_fid));
+    }
+
+    // 3. 物理移除被删栅栏
+    if fence_idx < rt.desk.fences.len() {
+        rt.desk.fences.remove(fence_idx);
+    }
+
+    // 4. 旁路缓存对齐（Sidecar Invariant）
+    if fence_idx < rt.last_layout_h.len() {
+        rt.last_layout_h.remove(fence_idx);
+    }
+
+    // 5. 选中状态与滚动修正
+    rt.selected_fence =
+        adjust_selected_fence_on_delete(rt.selected_fence, fence_idx, rt.desk.fences.len());
+    ensure_selected_fence_visible(rt);
+
+    // 清空包含 (fence_idx, icon_idx) 的瞬态索引缓存，杜绝越界或指向错误图标
+    rt.selected.clear();
+    rt.hover = None;
+    rt.icon_hover = None;
+    rt.select_band = None;
+
+    // 6. 立即持久化
+    if let Err(e) = rt.store.save(&rt.desk) {
+        tracing::warn!("删除栅栏持久化失败: {e}");
+    }
 }
 
 /// 开始就地重命名（D2D 内联编辑，Explorer 风格）：Enter/失焦提交，Esc 取消。

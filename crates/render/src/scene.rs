@@ -197,7 +197,7 @@ pub struct SceneConsole {
     pub title_h: f32,
     /// 关闭按钮矩形（标题栏右上）。
     pub close: RectF,
-    /// 「切换桌面」按钮矩形（标题栏，关闭按钮左侧）。
+    /// 「恢复桌面」按钮矩形（标题栏，关闭按钮左侧）。
     pub desktop_toggle: RectF,
     /// 栅栏管理页：可点选栅栏行（与 `desk.fences` 平行）。
     pub fence_rows: Vec<SceneFenceRow>,

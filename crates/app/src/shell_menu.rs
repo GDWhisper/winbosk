@@ -11,14 +11,20 @@
 //! `WM_MEASUREITEM`/`WM_DRAWITEM`/`WM_INITMENUPOPUP`/`WM_MENUCHAR` 绘制。
 //! 只用 `IContextMenu`(v1) + 裸 `TrackPopupMenu` 时，这些消息落到 owner 窗口的
 //! `DefWindowProcW` 上被丢弃，所有者绘制项渲染成空白——看起来就是
-//! 「没有 Windows 右键列表」。修复：把菜单 owner 设为一个**消息窗口**，
+//! 「没有 Windows 右键列表」。修复：把菜单 owner 设为一个**专用宿主窗口**，
 //! 其窗口过程把上述消息转发给 `IContextMenu2::HandleMenuMsg` /
 //! `IContextMenu3::HandleMenuMsg2`，Shell 扩展据此绘制完整菜单。
+//!
+//! 宿主窗口必须是**真实（可激活）的顶层窗口**，不能用 `HWND_MESSAGE` 消息窗口：
+//! `TrackPopupMenu` 要求 owner 在弹出前已是前台窗口，否则点击菜单外区域菜单不会
+//! 消失；而消息窗口永远无法被激活（见 `run_menu` 里的前台前置）。因此宿主建在
+//! 离屏 1×1、`WS_EX_TOOLWINDOW`（不进任务栏/Alt+Tab），弹出前用
+//! `OverlayWindow::with_foreground_lock` 提到前台，菜单收起后还原原前台窗口。
 //!
 //! 前提：调用方已完成 COM 初始化（`CoInitializeEx`，App 启动早期完成）。
 //! `InvokeCommand` 必须在其 COM 对象存活期间调用（本函数内保持引用即可）。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::{Mutex, OnceLock};
@@ -32,13 +38,16 @@ use windows::Win32::UI::Shell::{
     SHCreateItemFromParsingName, CMF_NORMAL, CMINVOKECOMMANDINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GetMessageW, InsertMenuW, PostMessageW, PostQuitMessage, RegisterClassW, TrackPopupMenu,
-    TranslateMessage, HWND_MESSAGE, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNORMAL,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM,
-    WM_MENUCHAR, WM_MENUCOMMAND, WM_MENUDRAG, WM_MENURBUTTONUP, WM_NULL, WNDCLASSW,
-    WNDCLASS_STYLES, WS_POPUP,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
+    GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowThreadProcessId, InsertMenuW,
+    IsWindow, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, ShowWindow,
+    TrackPopupMenu, TranslateMessage, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG,
+    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DRAWITEM,
+    WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUCOMMAND, WM_MENUDRAG, WM_MENURBUTTONUP,
+    WM_NULL, WNDCLASSW, WNDCLASS_STYLES, WS_EX_TOOLWINDOW, WS_POPUP,
 };
+
+use crate::Runtime;
 
 /// Shell 项命令 ID 区间（`QueryContextMenu` 的 idCmdFirst..=idCmdLast）。
 const SHELL_CMD_FIRST: u32 = 0x7000;
@@ -64,7 +73,8 @@ pub enum ShellMenuResult {
     Failed,
 }
 
-/// 菜单消息宿主窗口类名（消息窗口，仅用于接收菜单 owner-draw 消息）。
+/// 菜单宿主窗口类名（真实可激活的离屏顶层窗口，用于接收菜单 owner-draw 消息并作为
+/// `TrackPopupMenu` 的 owner；常驻复用，见 `MENU_HOST` / `acquire_menu_host`）。
 const MENU_HOST_CLASS: &str = "SylvaMenuHost";
 
 // 菜单期间持有 Shell 菜单接口，供宿主窗口过程转发 owner-draw 消息。
@@ -76,6 +86,14 @@ thread_local! {
 
 /// 菜单宿主窗口类只注册一次。
 static MENU_CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
+
+// 菜单宿主窗口（常驻）：第一次需要时在**主线程**创建，之后复用，不再每次右键
+// 建/销窗口。窗口过程 `menu_host_proc` 只转发 IContextMenu 消息、自身不持有状态，
+// 多轮菜单复用安全。`run_menu` 始终在主线程串行（TrackPopupMenu 模态阻塞），且
+// 宿主窗口只在该线程创建/使用，故用 thread_local 存储（HWND 非 Sync，不能进 static）。
+thread_local! {
+    static MENU_HOST: Cell<Option<HWND>> = const { Cell::new(None) };
+}
 
 /// 已预热（加载并初始化过 Shell 扩展）的文件类型键集合。
 static PRIMED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -101,10 +119,10 @@ fn primed_set() -> std::sync::MutexGuard<'static, HashSet<String>> {
 /// 「首次右键软件崩溃」。解决：右键前先在**后台线程**把该文件类型的 Shell 扩展
 /// 加载并初始化好（`prime_*`），再走主线程菜单。扩展慢初始化只发生一次（这就
 /// 是「重开软件就正常」的原因），预热后右键即为「第二次」速度。
-pub fn show(path: &str, hwnd: HWND, sx: i32, sy: i32, managed: bool) -> ShellMenuResult {
+pub fn show(rt: &Runtime, path: &str, sx: i32, sy: i32, managed: bool) -> ShellMenuResult {
     // 类型未预热则后台预热；等待期间泵送消息，窗口保持可响应（不触发 AppHang）
-    ensure_primed(path, hwnd);
-    run_menu(path, hwnd, sx, sy, managed)
+    ensure_primed(path, rt.hwnd);
+    run_menu(rt, path, sx, sy, managed)
 }
 
 /// 启动时预热：把栅栏里已有文件类型的 Shell 扩展在后台加载并初始化。
@@ -273,7 +291,13 @@ fn pump_until<T>(rx: std::sync::mpsc::Receiver<T>) -> Option<T> {
 
 /// 在**主线程**上弹出 Shell 右键菜单并执行选中命令（模态，阻塞到菜单关闭）。
 /// 由 `show` 调用（见 `show`）；COM 必须在调用线程上已初始化。
-fn run_menu(path: &str, hwnd: HWND, sx: i32, sy: i32, managed: bool) -> ShellMenuResult {
+///
+/// 菜单宿主窗口的前置/还原需要 overlay 的焦点代理（`with_foreground_lock`），
+/// 因此这里收的是整个 `Runtime`：overlay 句柄用于 Shell 动词的父窗口，overlay
+/// 指针用于绕过前台锁。
+fn run_menu(rt: &Runtime, path: &str, sx: i32, sy: i32, managed: bool) -> ShellMenuResult {
+    let hwnd = rt.hwnd;
+    let overlay = rt.overlay_ptr;
     let wide_path = wide(path);
     // 路径 → IShellItem → 默认上下文菜单
     let item: IShellItem = match unsafe {
@@ -349,8 +373,12 @@ fn run_menu(path: &str, hwnd: HWND, sx: i32, sy: i32, managed: bool) -> ShellMen
         let _ = ctx2.QueryContextMenu(menu, pos + 2, SHELL_CMD_FIRST, SHELL_CMD_LAST, CMF_NORMAL);
     }
 
-    // 菜单 owner 用消息窗口：它负责把 owner-draw 消息转发给 IContextMenu2/3，
+    // 菜单 owner 用专用宿主窗口：它负责把 owner-draw 消息转发给 IContextMenu2/3，
     // 使 Shell 扩展能绘制出完整的「桌面右键菜单」。
+    //
+    // 必须是可激活的真实顶层窗口（不是 HWND_MESSAGE）：`TrackPopupMenu` 要求 owner
+    // 在弹出前已是前台窗口，否则点击菜单外区域菜单不会消失。这里建在离屏 1×1 并以
+    // `SW_SHOWNOACTIVATE` 显示——不可见的窗口无法被激活，显示是前置的前提。
     let hinst = match unsafe { GetModuleHandleW(None) } {
         Ok(m) => HINSTANCE(m.0),
         Err(e) => {
@@ -361,31 +389,10 @@ fn run_menu(path: &str, hwnd: HWND, sx: i32, sy: i32, managed: bool) -> ShellMen
             return ShellMenuResult::Failed;
         }
     };
-    if !ensure_menu_host_class(hinst) {
-        unsafe {
-            let _ = DestroyMenu(menu);
-        }
-        return ShellMenuResult::Failed;
-    }
-    let host = match unsafe {
-        CreateWindowExW(
-            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-            PCWSTR(wide(MENU_HOST_CLASS).as_ptr()),
-            PCWSTR::null(),
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            Some(HWND_MESSAGE),
-            None,
-            Some(hinst),
-            None,
-        )
-    } {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(path, "创建菜单宿主窗口失败: {e}");
+    // 宿主窗口常驻：第一次创建，之后复用（见 `acquire_menu_host`）。
+    let host = match acquire_menu_host(hinst) {
+        Some(h) => h,
+        None => {
             unsafe {
                 let _ = DestroyMenu(menu);
             }
@@ -398,6 +405,14 @@ fn run_menu(path: &str, hwnd: HWND, sx: i32, sy: i32, managed: bool) -> ShellMen
     MENU_CTX2.with(|c| *c.borrow_mut() = Some(ctx2.clone()));
     MENU_CTX3.with(|c| *c.borrow_mut() = ctx3);
 
+    // 前置：菜单要求 owner 在弹出前已是前台窗口（否则点击菜单外区域不关闭）。
+    // 记下「应收回的前台窗口」，菜单收起后还回去，避免用户当前窗口一直失焦。
+    let prev_fg = foreground_to_restore();
+    unsafe {
+        (*overlay).with_foreground_lock(|| {
+            let _ = SetForegroundWindow(host);
+        });
+    }
     let cmd = unsafe {
         TrackPopupMenu(
             menu,
@@ -410,15 +425,21 @@ fn run_menu(path: &str, hwnd: HWND, sx: i32, sy: i32, managed: bool) -> ShellMen
         )
         .0 as usize
     };
+    unsafe {
+        // 收尾空消息：确保菜单的模态状态彻底退出（宿主对 WM_NULL 走默认处理）。
+        let _ = PostMessageW(Some(host), WM_NULL, WPARAM(0), LPARAM(0));
+    }
 
     MENU_CTX2.with(|c| *c.borrow_mut() = None);
     MENU_CTX3.with(|c| *c.borrow_mut() = None);
     unsafe {
         let _ = DestroyMenu(menu);
-        let _ = DestroyWindow(host);
     }
 
-    match cmd {
+    // 命令（含 Shell 动词）必须在本进程**仍是前台进程**时执行：属性 / 删除确认 /
+    // 重命名这类对话框由 Shell 扩展在进程内创建，非前台进程弹窗会被前台锁挡住，
+    // 只在任务栏闪烁。所以宿主窗口的存活与前台状态都保持到命令跑完再收尾。
+    let result = match cmd {
         CMD_REMOVE => ShellMenuResult::Remove,
         CMD_RENAME => ShellMenuResult::Rename,
         c if (SHELL_CMD_FIRST as usize..=SHELL_CMD_LAST as usize).contains(&c) => {
@@ -442,7 +463,17 @@ fn run_menu(path: &str, hwnd: HWND, sx: i32, sy: i32, managed: bool) -> ShellMen
             ShellMenuResult::Invoked
         }
         _ => ShellMenuResult::Canceled,
+    };
+
+    unsafe {
+        // 只有前台仍停在宿主（用户选了某项或按 Esc）才还原；用户点到别的窗口
+        // （例如 Shell 动词打开的新窗口已经抢到前台）时不要抢焦点回来。
+        // 宿主窗口常驻（见 `MENU_HOST`），这里不再销毁。
+        if !prev_fg.is_invalid() && GetForegroundWindow() == host {
+            let _ = SetForegroundWindow(prev_fg);
+        }
     }
+    result
 }
 
 /// 注册菜单宿主窗口类（幂等）。
@@ -470,6 +501,71 @@ fn ensure_menu_host_class(hinst: HINSTANCE) -> bool {
     }
     let _ = MENU_CLASS_REGISTERED.set(());
     true
+}
+
+/// 取得（首次则创建）菜单宿主窗口。窗口离屏 1×1、`WS_EX_TOOLWINDOW`（不进任务栏 /
+/// Alt+Tab），以 `SW_SHOWNOACTIVATE` 显示——可见是 `SetForegroundWindow` 的前提，但
+/// 不抢用户当前窗口焦点（真正的激活在 `run_menu` 的前景锁里做）。创建后即常驻，
+/// 后续右键直接复用同一窗口（线程局部，仅主线程访问）。
+fn acquire_menu_host(hinst: HINSTANCE) -> Option<HWND> {
+    if let Some(h) = MENU_HOST.with(|c| c.get()) {
+        return Some(h);
+    }
+    if !ensure_menu_host_class(hinst) {
+        return None;
+    }
+    let host = match unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            PCWSTR(wide(MENU_HOST_CLASS).as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP,
+            -32000,
+            -32000,
+            1,
+            1,
+            None,
+            None,
+            Some(hinst),
+            None,
+        )
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("创建菜单宿主窗口失败: {e}");
+            return None;
+        }
+    };
+    // 只显示一次：常驻窗口保持可见即可被后续菜单反复激活（不再销毁）。
+    unsafe {
+        let _ = ShowWindow(host, SW_SHOWNOACTIVATE);
+    }
+    MENU_HOST.with(|c| c.set(Some(host)));
+    Some(host)
+}
+
+/// 选出「菜单收起后应当还原回去」的前台窗口：
+/// - 跳过无效窗口（`IsWindow` 失败，可能已被销毁）；
+/// - 跳过本进程自己的隐藏窗口（如离屏焦点代理 / overlay），否则焦点会困在不可见窗口上；
+/// - 若原前台本就是本进程窗口，回退到 Shell 桌面窗口（`GetShellWindow`，属 explorer、
+///   安全可激活），避免焦点困死也算有合理落点。
+fn foreground_to_restore() -> HWND {
+    let cur_pid = std::process::id();
+    let pick = |w: HWND| -> Option<HWND> {
+        if w.is_invalid() || !unsafe { IsWindow(Some(w)) }.as_bool() {
+            return None;
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(w, Some(&mut pid)) };
+        if pid == cur_pid {
+            return None;
+        }
+        Some(w)
+    };
+    match pick(unsafe { GetForegroundWindow() }) {
+        Some(w) => w,
+        None => pick(unsafe { GetShellWindow() }).unwrap_or_default(),
+    }
 }
 
 /// 菜单宿主窗口过程：把菜单 owner-draw 消息转发给 IContextMenu2/3。

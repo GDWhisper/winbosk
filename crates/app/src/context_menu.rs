@@ -7,6 +7,7 @@ pub(crate) const MENU_PASTE: usize = 2500;
 pub(crate) const MENU_ORGANIZE: usize = 3500;
 pub(crate) const MENU_DELETE_FENCE: usize = 5000;
 pub(crate) const MENU_RENAME_FENCE: usize = 6000;
+pub(crate) const MENU_TOGGLE_COLLAPSE: usize = 7000;
 pub(crate) fn handle_tray_menu(rt: &mut Runtime) {
     const MENU_TRAY_ORGANIZE: usize = 8199;
     const MENU_TRAY_CONSOLE: usize = 8200;
@@ -26,18 +27,7 @@ pub(crate) fn handle_tray_menu(rt: &mut Runtime) {
         let _ = AppendMenuW(menu, MF_STRING, MENU_TRAY_QUIT, PCWSTR(s.as_ptr()));
     }
     let (sx, sy) = cursor_screen();
-    let cmd = unsafe {
-        TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_NONOTIFY,
-            sx,
-            sy,
-            Some(0),
-            rt.hwnd,
-            None,
-        )
-        .0 as usize
-    };
+    let cmd = track_popup_menu(rt, menu, sx, sy);
     unsafe {
         let _ = DestroyMenu(menu);
     }
@@ -64,8 +54,9 @@ pub(crate) enum IconMenuAction {
     Remove,
 }
 
-/// 栅栏右键菜单动作（精简版：粘贴 / 重命名 / 整理 / 删除）。
+/// 栅栏右键菜单动作（精简版：收起/展开 / 粘贴 / 重命名 / 整理 / 删除）。
 pub(crate) enum FenceMenuAction {
+    ToggleCollapse,
     Paste,
     Rename,
     Organize,
@@ -106,7 +97,10 @@ pub(crate) fn handle_context_menu(
         let key = (fence, ii);
         let multi = rt.selected.len() > 1 && rt.selected.contains(&key);
         if multi {
-            match multi_icon_context_menu(rt.hwnd, sx, sy, managed) {
+            // 先取值再分发：菜单函数只借 `&Runtime`，若写在 match 表达式里，
+            // 借用会持续到整个 match，arm 内再拿 `&mut` 就会冲突。
+            let action = multi_icon_context_menu(rt, sx, sy, managed);
+            match action {
                 Some(MultiMenuAction::Open) => open_selected(rt),
                 Some(MultiMenuAction::Copy) => copy_selected(rt),
                 Some(MultiMenuAction::Remove) => remove_selected(rt),
@@ -122,49 +116,66 @@ pub(crate) fn handle_context_menu(
         // 退回简版「打开」菜单。Shell 菜单在主线程模态弹出，与 Windows 右键
         // 行为一致；慢扩展已由后台预热（见 shell_menu::show），首次右键不卡死。
         match path {
-            Some(p) => match shell_menu::show(&p, rt.hwnd, sx, sy, managed) {
-                shell_menu::ShellMenuResult::Remove => remove_fence_icon(rt, fence, ii),
-                shell_menu::ShellMenuResult::Rename => {
-                    start_inplace_rename(rt, EditTarget::Item { fence, icon: ii })
-                }
-                shell_menu::ShellMenuResult::Invoked => {
-                    // 原生动词执行后（如「删除」）：文件若已被移走/删除，立即清掉
-                    // 栅栏里的死图标，等价于资源管理器删除后刷新视图。
-                    if !std::path::Path::new(&p).exists() {
-                        if let Some(id) = rt
-                            .desk
-                            .fences
-                            .get(fence)
-                            .and_then(|f| f.icon_ids.get(ii))
-                            .cloned()
-                        {
-                            remove_icon_entirely(rt, &id);
+            // 先取值再分发：菜单函数只借 `&Runtime`，写在 match 表达式里会让借用
+            // 持续到整个 match，arm 内再拿 `&mut` 就会冲突。
+            Some(p) => {
+                let result = shell_menu::show(rt, &p, sx, sy, managed);
+                match result {
+                    shell_menu::ShellMenuResult::Remove => remove_fence_icon(rt, fence, ii),
+                    shell_menu::ShellMenuResult::Rename => {
+                        start_inplace_rename(rt, EditTarget::Item { fence, icon: ii })
+                    }
+                    shell_menu::ShellMenuResult::Invoked => {
+                        // 原生动词执行后（如「删除」）：文件若已被移走/删除，立即清掉
+                        // 栅栏里的死图标，等价于资源管理器删除后刷新视图。
+                        if !std::path::Path::new(&p).exists() {
+                            if let Some(id) = rt
+                                .desk
+                                .fences
+                                .get(fence)
+                                .and_then(|f| f.icon_ids.get(ii))
+                                .cloned()
+                            {
+                                remove_icon_entirely(rt, &id);
+                            }
+                            let _ = rt.store.save(&rt.desk);
                         }
-                        let _ = rt.store.save(&rt.desk);
                     }
-                }
-                // 真实 Shell 菜单没弹出来（路径无效 / COM 异常 / 工作线程失败等）：
-                // 退回简版菜单，保证右键必有反馈，不让「Windows 右击列表」静默消失。
-                shell_menu::ShellMenuResult::Failed => {
-                    tracing::warn!(path = %p, "Shell 右键菜单创建失败，退回简版菜单");
-                    match icon_context_menu(rt.hwnd, sx, sy, managed) {
-                        Some(IconMenuAction::Open) => launch_fence_icon(rt, fence, ii),
-                        Some(IconMenuAction::Remove) => remove_fence_icon(rt, fence, ii),
-                        None => {}
+                    // 真实 Shell 菜单没弹出来（路径无效 / COM 异常 / 工作线程失败等）：
+                    // 退回简版菜单，保证右键必有反馈，不让「Windows 右击列表」静默消失。
+                    shell_menu::ShellMenuResult::Failed => {
+                        tracing::warn!(path = %p, "Shell 右键菜单创建失败，退回简版菜单");
+                        let action = icon_context_menu(rt, sx, sy, managed);
+                        match action {
+                            Some(IconMenuAction::Open) => launch_fence_icon(rt, fence, ii),
+                            Some(IconMenuAction::Remove) => remove_fence_icon(rt, fence, ii),
+                            None => {}
+                        }
                     }
+                    // 用户取消菜单（Esc / 点击别处）：什么都不做。
+                    // 旧实现把「取消」误当成「创建失败」，取消了还会再弹一次简版菜单。
+                    shell_menu::ShellMenuResult::Canceled => {}
                 }
-                // 用户取消菜单（Esc / 点击别处）：什么都不做。
-                // 旧实现把「取消」误当成「创建失败」，取消了还会再弹一次简版菜单。
-                shell_menu::ShellMenuResult::Canceled => {}
-            },
-            None => match icon_context_menu(rt.hwnd, sx, sy, managed) {
-                Some(IconMenuAction::Open) => launch_fence_icon(rt, fence, ii),
-                Some(IconMenuAction::Remove) => remove_fence_icon(rt, fence, ii),
-                None => {}
-            },
+            }
+            None => {
+                let action = icon_context_menu(rt, sx, sy, managed);
+                match action {
+                    Some(IconMenuAction::Open) => launch_fence_icon(rt, fence, ii),
+                    Some(IconMenuAction::Remove) => remove_fence_icon(rt, fence, ii),
+                    None => {}
+                }
+            }
         }
     } else if let Some(action) = fence_context_menu(rt, fence, sx, sy) {
         match action {
+            FenceMenuAction::ToggleCollapse => {
+                if let Some(f) = rt.desk.fences.get_mut(fence) {
+                    if f.appearance.layout != FenceLayout::Sidebar {
+                        f.collapsed = !f.collapsed;
+                        let _ = rt.store.save(&rt.desk);
+                    }
+                }
+            }
             FenceMenuAction::Paste => {
                 let paths = clipboard_file_paths();
                 if !paths.is_empty() {
@@ -180,20 +191,7 @@ pub(crate) fn handle_context_menu(
                 execute_auto_organize(rt);
             }
             FenceMenuAction::Delete => {
-                // 删除栅栏，不删除链接的文件夹（用户数据不受影响）
-                let ids: Vec<String> = rt
-                    .desk
-                    .fences
-                    .get(fence)
-                    .map(|f| f.icon_ids.clone())
-                    .unwrap_or_default();
-                for id in ids {
-                    rt.desk.move_icon(&id, None);
-                }
-                if fence < rt.desk.fences.len() {
-                    rt.desk.fences.remove(fence);
-                }
-                let _ = rt.store.save(&rt.desk);
+                delete_fence_and_reclaim_icons(rt, fence);
             }
         }
     }
@@ -201,7 +199,7 @@ pub(crate) fn handle_context_menu(
 
 /// 图标右键菜单（简版回退）：打开 / 移出栅栏（Sylva 管理项不提供移出，见 `handle_context_menu`）。
 pub(crate) fn icon_context_menu(
-    hwnd: HWND,
+    rt: &Runtime,
     sx: i32,
     sy: i32,
     managed: bool,
@@ -218,22 +216,11 @@ pub(crate) fn icon_context_menu(
             let _ = AppendMenuW(menu, MF_STRING, MENU_ICON_REMOVE, PCWSTR(s2.as_ptr()));
         }
     }
-    let cmd = unsafe {
-        TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_NONOTIFY,
-            sx,
-            sy,
-            Some(0),
-            hwnd,
-            None,
-        )
-        .0 as usize
-    };
+    let cmd = track_popup_menu(rt, menu, sx, sy);
     unsafe {
         let _ = DestroyMenu(menu);
     }
-    match cmd as usize {
+    match cmd {
         MENU_ICON_OPEN => Some(IconMenuAction::Open),
         MENU_ICON_REMOVE => Some(IconMenuAction::Remove),
         _ => None,
@@ -252,7 +239,7 @@ pub(crate) enum MultiMenuAction {
 /// `managed`（右键项为 Sylva 管理项，见 `handle_context_menu`）：移出与「删除」等价，
 /// 跳过「移出栅栏」，只留 打开/复制/删除。
 pub(crate) fn multi_icon_context_menu(
-    hwnd: HWND,
+    rt: &Runtime,
     sx: i32,
     sy: i32,
     managed: bool,
@@ -274,22 +261,11 @@ pub(crate) fn multi_icon_context_menu(
         }
         let _ = AppendMenuW(menu, MF_STRING, M_DELETE, PCWSTR(wide("删除").as_ptr()));
     }
-    let cmd = unsafe {
-        TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_NONOTIFY,
-            sx,
-            sy,
-            Some(0),
-            hwnd,
-            None,
-        )
-        .0 as usize
-    };
+    let cmd = track_popup_menu(rt, menu, sx, sy);
     unsafe {
         let _ = DestroyMenu(menu);
     }
-    match cmd as usize {
+    match cmd {
         M_OPEN => Some(MultiMenuAction::Open),
         M_COPY => Some(MultiMenuAction::Copy),
         M_REMOVE => Some(MultiMenuAction::Remove),
@@ -399,16 +375,36 @@ pub(crate) fn pick_folder(owner: HWND) -> Option<String> {
 /// 栅栏右键菜单：粘贴 / 重命名 / 删除（精简版）。
 pub(crate) fn fence_context_menu(
     rt: &mut Runtime,
-    _fence: usize,
+    fence: usize,
     sx: i32,
     sy: i32,
 ) -> Option<FenceMenuAction> {
-    let hwnd = rt.hwnd;
     let main = popup_menu();
     if main.is_invalid() {
         return None;
     }
+    let is_sidebar = rt
+        .desk
+        .fences
+        .get(fence)
+        .map(|f| f.appearance.layout == FenceLayout::Sidebar)
+        .unwrap_or(false);
+    let is_collapsed = rt
+        .desk
+        .fences
+        .get(fence)
+        .map(|f| f.collapsed)
+        .unwrap_or(false);
+    let collapse_text = if is_collapsed {
+        "展开栅栏"
+    } else {
+        "收起栅栏"
+    };
     unsafe {
+        if !is_sidebar {
+            let s = wide(collapse_text);
+            let _ = AppendMenuW(main, MF_STRING, MENU_TOGGLE_COLLAPSE, PCWSTR(s.as_ptr()));
+        }
         let s = wide("粘贴文件");
         let _ = AppendMenuW(main, MF_STRING, MENU_PASTE, PCWSTR(s.as_ptr()));
         let s = wide("重命名栅栏");
@@ -419,22 +415,12 @@ pub(crate) fn fence_context_menu(
         let s = wide("删除栅栏");
         let _ = AppendMenuW(main, MF_STRING, MENU_DELETE_FENCE, PCWSTR(s.as_ptr()));
     }
-    let cmd = unsafe {
-        TrackPopupMenu(
-            main,
-            TPM_RETURNCMD | TPM_NONOTIFY,
-            sx,
-            sy,
-            Some(0),
-            hwnd,
-            None,
-        )
-        .0 as usize
-    };
+    let cmd = track_popup_menu(rt, main, sx, sy);
     unsafe {
         let _ = DestroyMenu(main);
     }
     match cmd {
+        MENU_TOGGLE_COLLAPSE => Some(FenceMenuAction::ToggleCollapse),
         MENU_PASTE => Some(FenceMenuAction::Paste),
         MENU_RENAME_FENCE => Some(FenceMenuAction::Rename),
         MENU_ORGANIZE => Some(FenceMenuAction::Organize),
@@ -446,6 +432,39 @@ pub(crate) fn fence_context_menu(
 /// 创建一个弹出菜单句柄（失败返回无效句柄，后续用 `is_invalid` 判空）。
 pub(crate) fn popup_menu() -> HMENU {
     unsafe { CreatePopupMenu().unwrap_or_default() }
+}
+
+/// 模态弹出菜单，返回选中的命令 id（0 = 用户取消：Esc 或点击菜单外）。
+///
+/// `TrackPopupMenu` 要求 owner 窗口在弹出前**已经**是前台窗口，否则点击菜单外区域
+/// 菜单不会关闭——一直悬在屏幕上，只剩 Esc 和「随便选一项」两条退路（托盘右键菜单
+/// 就是这个症状）。overlay 本体带 `WS_EX_NOACTIVATE`（激活它会把桌面壳层提到应用
+/// 之上，系统也不接受激活），所以 owner 与前台都交给可激活的焦点代理窗口，见
+/// `OverlayWindow::menu_owner`。
+///
+/// 菜单收起后，只有前台仍停在代理窗口（用户选了某项或按 Esc）才把焦点还给菜单弹出
+/// 前的窗口，避免用户当前窗口一直灰着；用户点到别的窗口时不抢焦点回来。
+pub(crate) fn track_popup_menu(rt: &Runtime, menu: HMENU, sx: i32, sy: i32) -> usize {
+    unsafe {
+        let prev = GetForegroundWindow();
+        let owner = (*rt.overlay_ptr).menu_owner();
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            sx,
+            sy,
+            Some(0),
+            owner,
+            None,
+        )
+        .0 as usize;
+        // 收尾空消息：确保菜单的模态状态彻底退出（owner 收到 WM_NULL 无副作用）。
+        let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
+        if !prev.is_invalid() && GetForegroundWindow() == owner {
+            let _ = SetForegroundWindow(prev);
+        }
+        cmd
+    }
 }
 
 /// 把字符串转成 UTF-16（含结尾 NUL），供 Win32 宽字符 API 使用。

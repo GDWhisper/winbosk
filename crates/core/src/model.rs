@@ -483,6 +483,9 @@ pub struct Fence {
     /// 分类规则配置。None = 无分类规则。
     #[serde(default)]
     pub rule: Option<FenceRule>,
+    /// 栅栏是否收起（折叠仅留标题栏）。
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 /// 图标元数据。核心层只关心标识与展示信息。

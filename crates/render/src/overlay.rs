@@ -17,6 +17,8 @@
 
 use std::sync::OnceLock;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -31,8 +33,9 @@ use windows::Win32::UI::Input::Ime::{
     IME_COMPOSITION_STRING,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, MOD_ALT,
-    MOD_CONTROL, MOD_SHIFT, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL, VK_F10,
+    GetDoubleClickTime, GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus,
+    TrackMouseEvent, MOD_ALT, MOD_CONTROL, MOD_SHIFT, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL,
+    VK_F10,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, Shell_NotifyIconW, HDROP,
@@ -56,6 +59,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
+
+/// 托盘左键单击去重用：上次派发 `TrayToggle` 的时刻（Unix 纪元毫秒）。
+///
+/// 双击托盘会派发两次 `WM_LBUTTONUP`（序列：UP → DBLCLK → UP），不去重就变成
+/// 「打开又立刻关上」白闪一次。以系统双击时限做间隔闸门，双击只算一次点击。
+static LAST_TRAY_CLICK_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 当前时刻（Unix 纪元毫秒）；时钟异常（早于纪元）时退回 0。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// 窗口类名（全局唯一，单实例）。
 const CLASS_NAME: &str = "SylvaOverlay";
@@ -417,16 +434,41 @@ pub struct OverlayWindow {
 impl OverlayWindow {
     /// 让 overlay 获得键盘输入（前台交给隐藏代理，overlay 本体不被激活/提层）。
     pub fn focus_for_input(&self) {
+        self.with_foreground_lock(|| unsafe {
+            let _ = SetForegroundWindow(self.proxy);
+            let _ = SetFocus(Some(self.hwnd));
+        });
+    }
+
+    /// 弹出菜单要用的 owner 窗口（可激活的焦点代理），并已把它提到前台。
+    ///
+    /// `TrackPopupMenu` 要求 owner 在弹出前**已经**是前台窗口，否则点击菜单外区域
+    /// 菜单不会消失（一直悬在屏幕上，只能靠选中某项或 Esc 收场）。overlay 本体带
+    /// `WS_EX_NOACTIVATE`——激活它会把桌面壳层提到应用之上，且系统压根不接受激活，
+    /// 所以前台与 owner 都交给可激活的焦点代理窗口。
+    pub fn menu_owner(&self) -> HWND {
+        self.with_foreground_lock(|| unsafe {
+            let _ = SetForegroundWindow(self.proxy);
+        });
+        self.proxy
+    }
+
+    /// 在「本线程已挂到前台线程」的保护下执行 `f`。
+    ///
+    /// 前台锁：非前台进程的 `SetForegroundWindow` 会被系统直接拒绝。经典解法是把
+    /// 本线程暂时挂到当前前台线程，设完前台再解挂——无需真正激活 overlay，
+    /// 桌面壳层仍保持在应用之下。
+    ///
+    /// 任何需要「把某个窗口提到前台」的场景都必须走它：App 层的 Shell 右键菜单
+    /// （`shell_menu`）要把自己的宿主窗口前置，否则 `TrackPopupMenu` 弹出的菜单
+    /// 点击外部不会关闭。
+    pub fn with_foreground_lock(&self, f: impl FnOnce()) {
         unsafe {
-            // 前台锁：非前台进程的 SetForegroundWindow 会被系统拒绝。经典解法是把
-            // 本线程暂时挂到当前前台线程，再设前台，最后解挂——无需真正激活 overlay，
-            // 桌面壳层仍保持在应用之下。
             let cur = GetCurrentThreadId();
             let fg_hwnd = GetForegroundWindow();
             let fg = GetWindowThreadProcessId(fg_hwnd, None);
             let attached = cur != fg && fg != 0 && AttachThreadInput(cur, fg, true).0 != 0;
-            let _ = SetForegroundWindow(self.proxy);
-            let _ = SetFocus(Some(self.hwnd));
+            f();
             if attached {
                 let _ = AttachThreadInput(cur, fg, false);
             }
@@ -509,7 +551,7 @@ impl OverlayWindow {
         }
 
         // 托盘图标（通知区，默认折叠在「隐藏的图标」里）：右键 = 控制中心菜单，
-        // 双击 = 切换控制中心开合。日常入口不再占任务栏按钮。
+        // 左键单击 = 切换控制中心开合。日常入口不再占任务栏按钮。
         let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
@@ -1039,7 +1081,7 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-        // 托盘图标回调：右键 → 控制中心菜单；双击 → 切换控制中心开合
+        // 托盘图标回调：右键 → 控制中心菜单；左键单击 → 切换控制中心开合
         WM_TRAY if lparam.0 as u32 == WM_RBUTTONUP => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if !ptr.is_null() {
@@ -1048,11 +1090,17 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-        WM_TRAY if lparam.0 as u32 == WM_LBUTTONDBLCLK => {
-            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
-            if !ptr.is_null() {
-                let state = unsafe { &mut *ptr };
-                emit_event(hwnd, state, OverlayEvent::TrayToggle);
+        // 左键单击：一次点击即开/关控制中心。双击不另作处理，并用双击时限去重，
+        // 否则双击派发的两次 WM_LBUTTONUP 会「打开又立刻关上」。
+        WM_TRAY if lparam.0 as u32 == WM_LBUTTONUP => {
+            let now = now_ms();
+            let last = LAST_TRAY_CLICK_MS.swap(now, Ordering::Relaxed);
+            if now.saturating_sub(last) >= unsafe { GetDoubleClickTime() } as u64 {
+                let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+                if !ptr.is_null() {
+                    let state = unsafe { &mut *ptr };
+                    emit_event(hwnd, state, OverlayEvent::TrayToggle);
+                }
             }
             LRESULT(0)
         }

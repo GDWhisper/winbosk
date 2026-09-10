@@ -332,7 +332,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
     let title_h = CONSOLE_TITLE_H * s;
     let content_top = panel.y + title_h;
 
-    // —— 标题栏：关闭 + 切换桌面 ——
+    // —— 标题栏：关闭 + 恢复桌面 ——
     let close = RectF {
         x: panel.x + panel.w - CONSOLE_CLOSE_W * s - 8.0 * s,
         y: panel.y + 8.0 * s,

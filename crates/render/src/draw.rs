@@ -380,12 +380,12 @@ fn draw_fences_page(
             accent
         },
     );
-    // 「切换桌面 / 回到栅栏」按钮（删除栅栏下方）
+    // 「恢复桌面 / 回到栅栏」按钮（删除栅栏下方）
     let toggle_hover = matches!(c.hover_zone, Some(ConsoleZone::DesktopToggle));
     let toggle_label = if c.desktop_mode {
         "回到栅栏"
     } else {
-        "切换桌面"
+        "恢复桌面"
     };
     draw_segmented_button(
         target,
