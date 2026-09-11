@@ -3,6 +3,7 @@
 //! 坐标全部为**物理像素**（虚拟屏幕坐标），与 overlay 窗口客户端坐标一致。
 
 use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
+use sylva_core::storage::StorageKind;
 
 use crate::overlay::{ConsoleZone, RectF};
 
@@ -168,8 +169,19 @@ pub struct SceneFenceDetail {
     /// 色调：默认（恢复玻璃底色）+ 预设色板（与 App 层 TINT_PRESETS 平行）。
     pub tint_default: RectF,
     pub tints: Vec<RectF>,
-    /// 「更改位置…」按钮（存储位置行）。
+    /// 「更改位置…」按钮（文件位置行第一行）。
     pub storage_btn: RectF,
+    /// 当前落地模式（状态芯片文案与配色）。
+    pub storage_kind: StorageKind,
+    /// 中段省略后的真实落地路径（App 层按当前 DPI 预算预计算，绘制层不再二次截断）。
+    pub storage_path_text: String,
+    /// 路径文本区（第二行；绘制 + 点击 = 更改位置…）。
+    pub storage_path_rect: RectF,
+    /// 落地模式状态芯片（第二行左端；仅绘制，不参与命中）。
+    pub storage_chip: RectF,
+    /// 「恢复默认」按钮（解除外部链接，回到应用内部库）。
+    /// `h <= 0.0` 表示当前不可回退（不绘制、不参与命中）。
+    pub storage_reset: RectF,
     /// 当前侧边栏停靠位置（仅 Sidebar 布局显示）。
     pub sidebar_pos: SidebarPosition,
     /// 侧边栏位置按钮：左 / 上 / 右

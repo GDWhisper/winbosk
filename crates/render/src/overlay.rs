@@ -198,6 +198,8 @@ pub enum ConsoleZone {
     RemoveFence,
     /// 栅栏管理页：更改选中栅栏的存储位置（打开文件夹选择器）。
     ChangeStoragePath,
+    /// 栅栏管理页：把选中栅栏的存储位置恢复为应用内部库（解除外部文件夹链接）。
+    ResetStoragePath,
     /// 栅栏管理页：设置选中栅栏的分类规则（预设模板；None = 无规则）。
     FenceRulePreset(Option<CategoryPreset>),
     /// 栅栏管理页：「一键整理」按钮（按各栅栏规则自动收纳桌面图标）。

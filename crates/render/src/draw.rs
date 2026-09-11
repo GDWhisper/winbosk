@@ -26,6 +26,7 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
 use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
+use sylva_core::storage::StorageKind;
 use sylva_shell::icons::IconData;
 
 use crate::overlay::{ConsoleZone, RectF};
@@ -598,7 +599,8 @@ fn draw_fence_detail(
         }
     }
 
-    // 存储位置行（始终显示）
+    // 文件位置行（始终显示，占两行）：第一行 = 标签 + 操作按钮，第二行 = 模式芯片 + 真实路径。
+    // 该行是用户唯一能得知"文件到底存在哪 / 删除是删副本还是删真身"的入口，故常显不可折叠。
     let r4 = d.storage_btn;
     if r4.h > 0.0 {
         let lr5 = D2D_RECT_F {
@@ -607,7 +609,7 @@ fn draw_fence_detail(
             right: label_x + label_w,
             bottom: r4.y + 24.0 * s,
         };
-        draw_text(target, "存储", &formats.detail, lr5, &label_brush);
+        draw_text(target, "文件位置", &formats.detail, lr5, &label_brush);
     }
     let storage_hover = matches!(c.hover_zone, Some(ConsoleZone::ChangeStoragePath));
     draw_segmented_button(
@@ -620,6 +622,49 @@ fn draw_fence_detail(
         formats,
         accent,
     );
+    // 「恢复默认」：仅外部文件夹模式出现（应用内部已是默认，无按钮可点）。
+    if d.storage_reset.h > 0.0 {
+        let reset_hover = matches!(c.hover_zone, Some(ConsoleZone::ResetStoragePath));
+        draw_segmented_button(
+            target,
+            theme,
+            d.storage_reset,
+            "恢复默认",
+            false,
+            reset_hover,
+            formats,
+            accent,
+        );
+    }
+    // 第二行：模式芯片 + 中段省略的真实路径（整块可点 = 更改位置…）。
+    if d.storage_path_rect.h > 0.0 {
+        draw_storage_chip(
+            target,
+            theme,
+            d.storage_kind,
+            d.storage_chip,
+            formats,
+            accent,
+        );
+        let path_brush = unsafe {
+            // 悬停高亮：路径行与「更改位置…」是同一动作，共用 ChangeStoragePath 命中区。
+            let alpha = if storage_hover { 0.95 } else { 0.62 };
+            target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, alpha * full_t]), None)?
+        };
+        let tr = D2D_RECT_F {
+            left: d.storage_path_rect.x,
+            top: d.storage_path_rect.y,
+            right: d.storage_path_rect.x + d.storage_path_rect.w,
+            bottom: d.storage_path_rect.y + d.storage_path_rect.h,
+        };
+        draw_text(
+            target,
+            &d.storage_path_text,
+            &formats.detail,
+            tr,
+            &path_brush,
+        );
+    }
 
     // 侧边栏停靠位置（仅 Sidebar 布局时显示）
     if d.sidebar_left.h > 0.0 {
@@ -771,6 +816,53 @@ fn draw_segmented_button(
     let alpha = if active { 0.96 } else { 0.80 };
     if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, alpha]), None) } {
         draw_text_centered(target, label, &formats.label, lr, &b);
+    }
+}
+
+/// 文件位置模式芯片：胶囊描边小标签（「应用内部」/「外部文件夹」）。
+///
+/// 两种落地模式是**机制差异**（索引副本库 vs 与目录双向镜像）而非程度差异，必须可辨：
+/// 外部文件夹用 accent 描边，提示"文件在你自己选的目录里"；应用内部用中性描边，
+/// 避免被误读为错误状态。
+fn draw_storage_chip(
+    target: &ID2D1RenderTarget,
+    theme: &Theme,
+    kind: StorageKind,
+    rect: RectF,
+    formats: &TextFormats,
+    accent: [f32; 4],
+) {
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return;
+    }
+    let s = theme.scale;
+    let rr = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: rect.x,
+            top: rect.y,
+            right: rect.x + rect.w,
+            bottom: rect.y + rect.h,
+        },
+        radiusX: rect.h / 2.0,
+        radiusY: rect.h / 2.0,
+    };
+    let (stroke, text_alpha) = match kind {
+        StorageKind::ExternalFolder => ([accent[0], accent[1], accent[2], 0.85], 0.92),
+        StorageKind::AppLibrary => ([1.0, 1.0, 1.0, 0.32], 0.60),
+    };
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(stroke), None) } {
+        unsafe { target.DrawRoundedRectangle(&rr, &b, 1.0 * s, None) };
+    }
+    let lr = D2D_RECT_F {
+        left: rect.x,
+        top: rect.y + (rect.h - theme.label.size * 1.6) / 2.0,
+        right: rect.x + rect.w,
+        bottom: rect.y + rect.h,
+    };
+    if let Ok(b) =
+        unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, text_alpha]), None) }
+    {
+        draw_text_centered(target, kind.badge(), &formats.detail, lr, &b);
     }
 }
 

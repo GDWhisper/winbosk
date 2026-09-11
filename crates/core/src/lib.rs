@@ -18,6 +18,7 @@ pub mod event;
 pub mod layout;
 pub mod magnet;
 pub mod model;
+pub mod storage;
 pub mod text;
 
 pub use error::{CoreError, Result};

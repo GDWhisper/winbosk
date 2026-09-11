@@ -125,7 +125,10 @@ pub(crate) const CONSOLE_FENCE_ROW_H: f32 = 36.0;
 /// 栅栏管理页：最多同时显示的行数（超出滚动）。
 pub(crate) const CONSOLE_FENCE_MAX_ROWS: usize = 5;
 /// 栅栏管理页：选中栅栏详情区高度。
-pub(crate) const CONSOLE_FENCE_DETAIL_H: f32 = 248.0;
+///
+/// 必须 ≥ `detail_visible_rows` 的最大值（`24 + 8 × 30 = 264`：布局/大小/风格/色调各 1 行、
+/// 文件位置 2 行、侧边栏位置 1 行、分类规则 1 行），否则详情底板会短于内容。
+pub(crate) const CONSOLE_FENCE_DETAIL_H: f32 = 278.0;
 /// 控制台展开面板最大高度（DIP；内容再多也滚动）。
 pub(crate) const CONSOLE_MAX_H: f32 = 720.0;
 
@@ -221,6 +224,9 @@ pub(crate) struct Runtime {
     pub(crate) overlay_ptr: *mut OverlayWindow,
     /// 内部库文件夹（软件目录下）：粘贴/拖入的文件先物理复制进来，栅栏索引库内副本。
     pub(crate) library: PathBuf,
+    /// 真实桌面目录（启动时解析一次）。控制中心每帧都要用它判定「桌面镜像栅栏不可
+    /// 恢复默认」，不能每帧走一次 COM `SHGetKnownFolderPath`。
+    pub(crate) desktop_dir: Option<String>,
     /// 本次事件中新添加图标的位图（`handle_event` 末尾随场景一起上传）。
     pub(crate) pending_uploads: Vec<(u64, IconData)>,
     /// 最近一次用户交互时间（空闲时修剪工作集用；后台 `SyncLibrary` 不计）。
@@ -341,6 +347,9 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
     // 库内文件被外部删除时，栅栏对应项同步移除（定时器 `SyncLibrary` 与启动时各清一次）。
     let library_dir = data_dir.join("library");
     let _ = std::fs::create_dir_all(&library_dir);
+    // 真实桌面目录：只在此处解析一次（后续 `shell_desktop_path()` 仍用于迁移/镜像等
+    // 低频路径，控制中心绘制改读这份缓存，避免每帧一次 COM 调用）。
+    let desktop_dir = shell_desktop_path();
     tracing::info!(
         fences = desk.fences.len(),
         icons = desk.icons.len(),
@@ -503,6 +512,7 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
         hierarchy,
         overlay_ptr,
         library: library_dir,
+        desktop_dir,
         pending_uploads: Vec::new(),
         last_activity: std::time::Instant::now(),
         last_trim: std::time::Instant::now(),
@@ -1172,6 +1182,13 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                         change_fence_storage(rt, i, new_dir);
                     }
                 }
+            }
+            ConsoleZone::ResetStoragePath => {
+                // 恢复默认：解除外部文件夹链接，回到应用内部库（不移动任何磁盘文件）
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                reset_fence_storage(rt, i);
             }
             // 标签页已随小组件一并移除；命中模型不再产生该控件，兜底吞掉。
             ConsoleZone::Tab(_) => {}

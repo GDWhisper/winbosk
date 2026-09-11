@@ -157,6 +157,16 @@ $env:SYLVA_AUTOSTOP_MS="2000"; .\target\debug\sylva.exe
 - **Control Center（控制中心）**：单页「栅栏管理」控制面板（`Ctrl+Alt+T` 呼出），直接在 DirectComposition 视觉树内绘制，无独立 HWND。
 - **InlineEdit**：基于 Direct2D / DirectWrite 的合成表面内联文本编辑系统，用于栅栏与图标就地重命名。
 - **Internal Library（内部库）**：`<data_dir>/library` 目录，栅栏非桌面源文件拖入时存放的物理副本。
+- **Storage Mode（存储模式）**：由 `Fence::storage_path` 决定文件物理落地位置，**不是**磁盘容量。
+  两种模式是机制差异而非程度差异：
+  - `None` → **应用内部**：所有无链接栅栏**共享**同一个扁平内部库，栅栏索引其中的副本；
+  - `Some(dir)` → **外部文件夹**（链接栅栏 / Folder Portal）：栅栏与该目录双向镜像，后台
+    `SyncLibrary`（4s 周期）做集合差集同步。
+  该字段**同时决定删除语义**：`is_managed_path` 内的文件从栅栏删除会真删磁盘文件，在外的
+  只摘引用。控制中心栅栏详情区的「文件位置」行必须常显模式与真实路径，不得回退为只显示按钮。
+- **Reset Storage（恢复默认）**：把外部文件夹模式还原为应用内部模式。**不移动、不复制、不删除
+  任何磁盘文件**；原本镜像自该文件夹的成员从栅栏摘除（文件留在原处）。桌面镜像栅栏
+  （`storage_path == 真实桌面目录`）**禁止**执行——会让栅栏清空而真实图标正被壳层隐藏。
 
 ---
 

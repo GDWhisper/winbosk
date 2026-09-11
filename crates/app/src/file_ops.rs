@@ -91,7 +91,10 @@ pub(crate) fn register_fence_item(rt: &mut Runtime, fence: usize, path: &str) ->
             }
         };
         let item_id = item.id.clone();
-        let new_bitmap = rt.items.len() as u64;
+        // 位图槽必须**单调递增**分配，不能用 `rt.items.len()`：`remove_icon_entirely`
+        // 会从 items 池里移除元素并重建下标，之后 `items.len()` 会与既有槽号重合，
+        // 导致新项覆盖旧项的图标位图（与 `editing.rs` 改名路径同一口径）。
+        let new_bitmap = rt.bitmap_ids.values().copied().max().unwrap_or(0) + 1;
         let mut ic = Icon::new(item_id.clone(), item.display_name.clone(), item.kind);
         ic.path = Some(path.to_string());
         ic.added = true;
@@ -162,6 +165,13 @@ pub(crate) fn change_fence_storage(rt: &mut Runtime, fence_idx: usize, new_dir: 
         tracing::warn!(new_dir, "目标路径不是文件夹");
         return;
     }
+    // 防御：拒绝把存储位置设为应用内部库本身、其子目录或其祖先目录。
+    // 否则该栅栏会通过 `mirror_linked_fence` 把**整个共享库**（含其它栅栏的项）镜像进来，
+    // 同一文件同时出现在多个栅栏；祖先目录还会连带镜像 desk.json 等内部文件。
+    if is_inside_library(rt, new_path) || path_within(new_path, &rt.library) {
+        tracing::warn!(new_dir, "拒绝把存储位置设为应用内部库（或其父/子目录）");
+        return;
+    }
     let Some(fence) = rt.desk.fences.get(fence_idx) else {
         return;
     };
@@ -195,7 +205,7 @@ pub(crate) fn change_fence_storage(rt: &mut Runtime, fence_idx: usize, new_dir: 
         }
         // 换链接：清理旧链接文件夹里的残留镜像项（文件保留在旧文件夹，不删）
         if let Some(old) = &old_dir {
-            clear_stale_linked_items(rt, fence_idx, old, new_path);
+            clear_stale_linked_items(rt, fence_idx, old, Some(new_path));
         }
         // 链接：把文件夹里已有的文件立即镜像进栅栏（此后增删由后台 SyncLibrary 持续同步）
         if reconcile_fences(rt) {
@@ -254,7 +264,7 @@ pub(crate) fn change_fence_storage(rt: &mut Runtime, fence_idx: usize, new_dir: 
     }
     // 换链接：清理旧链接文件夹里的残留镜像项（文件保留在旧文件夹，不删）
     if let Some(old) = &old_dir {
-        clear_stale_linked_items(rt, fence_idx, old, new_path);
+        clear_stale_linked_items(rt, fence_idx, old, Some(new_path));
     }
     // 链接：把文件夹里已有的文件立即镜像进栅栏（此后增删由后台 SyncLibrary 持续同步）
     if reconcile_fences(rt) {
@@ -288,7 +298,19 @@ pub(crate) fn change_fence_storage(rt: &mut Runtime, fence_idx: usize, new_dir: 
 /// 不在新文件夹内，说明它属于旧链接而非新链接。从栅栏整体摘下（引用删除、
 /// 文件保留在旧文件夹磁盘上，用户仍可从资源管理器访问），使栅栏内容与
 /// 新链接文件夹保持一致，不再残留旧文件夹的项。
-fn clear_stale_linked_items(rt: &mut Runtime, fence_idx: usize, old_dir: &str, new_path: &Path) {
+///
+/// `new_path == None` 表示**解除链接**（不再有新文件夹）：旧文件夹内的镜像项
+/// 全部摘下，栅栏回到纯收纳状态。两种情况都**只删引用，磁盘文件一个不动**。
+///
+/// **归属保护**：若某成员同时落在**另一个栅栏**的链接文件夹内（两个栅栏的存储位置
+/// 互为父子目录时会出现），不得摘下——否则会连带注销那个栅栏的成员，≤4s 后被它的
+/// 后台镜像重新注册，表现为图标反复消失/重建。
+fn clear_stale_linked_items(
+    rt: &mut Runtime,
+    fence_idx: usize,
+    old_dir: &str,
+    new_path: Option<&Path>,
+) {
     let stale: Vec<String> = rt
         .desk
         .fences
@@ -306,8 +328,12 @@ fn clear_stale_linked_items(rt: &mut Runtime, fence_idx: usize, old_dir: &str, n
                                     .path
                                     .as_ref()
                                     .map(|p| {
-                                        path_within(Path::new(old_dir), Path::new(p))
-                                            && !path_within(new_path, Path::new(p))
+                                        let p = Path::new(p);
+                                        path_within(Path::new(old_dir), p)
+                                            && !new_path
+                                                .map(|np| path_within(np, p))
+                                                .unwrap_or(false)
+                                            && !claimed_by_other_fence(rt, fence_idx, p)
                                     })
                                     .unwrap_or(false)
                         })
@@ -325,6 +351,53 @@ fn clear_stale_linked_items(rt: &mut Runtime, fence_idx: usize, old_dir: &str, n
         );
         remove_icon_entirely(rt, &id);
     }
+}
+
+/// `path` 是否落在**除 `fence_idx` 之外**某个栅栏的链接文件夹内。
+fn claimed_by_other_fence(rt: &Runtime, fence_idx: usize, path: &Path) -> bool {
+    rt.desk.fences.iter().enumerate().any(|(j, f)| {
+        j != fence_idx
+            && f.storage_path
+                .as_deref()
+                .map(|sp| path_within(Path::new(sp), path))
+                .unwrap_or(false)
+    })
+}
+
+/// 把栅栏的文件位置恢复为应用内部库（解除外部文件夹链接）。
+///
+/// **契约**：不移动、不复制、不删除任何磁盘文件。原外部文件夹内的镜像成员从栅栏摘除
+/// （文件仍留在该文件夹里，用户可从资源管理器访问），栅栏回到「应用内部」纯收纳模式。
+///
+/// 桌面镜像栅栏（`storage_path == 桌面目录`）**拒绝执行**：解除链接会让栅栏清空，
+/// 而真实桌面图标此刻正被壳层接管隐藏，用户会看到「桌面全空」。
+/// UI 已隐藏该按钮，此处是第二道防线。
+pub(crate) fn reset_fence_storage(rt: &mut Runtime, fence_idx: usize) {
+    let Some(fence) = rt.desk.fences.get(fence_idx) else {
+        return;
+    };
+    let fence_id = fence.id;
+    // `None` = 已是应用内部模式：幂等，0 变动（连续两次点击第二次无事发生）
+    let Some(old_dir) = fence.storage_path.clone() else {
+        return;
+    };
+    let same_as = |a: &str, b: &str| {
+        a.trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
+    };
+    if let Some(desktop) = shell_desktop_path() {
+        if same_as(&old_dir, &desktop) {
+            tracing::warn!(fence = fence_id, "桌面镜像栅栏不允许恢复默认");
+            return;
+        }
+    }
+    if let Some(f) = rt.desk.fences.get_mut(fence_idx) {
+        f.storage_path = None;
+    }
+    // 原文件夹内的镜像项摘下（只删引用，磁盘文件一个不动）
+    clear_stale_linked_items(rt, fence_idx, &old_dir, None);
+    let _ = rt.store.save(&rt.desk);
+    tracing::info!(fence = fence_id, old_dir, "存储位置已恢复为应用内部库");
 }
 
 /// 库同步：检查所有内部库项，`library` 里的文件已被外部删除时，栅栏对应项同步移除。

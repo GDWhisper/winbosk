@@ -274,11 +274,11 @@ pub(crate) fn build_scene(rt: &mut Runtime, now: Instant) -> Scene {
 }
 
 /// 控制中心内容总高度（自适应，不含屏幕夹制）。
-pub(crate) fn console_full_height(desk: &Desk, s: f32) -> f32 {
+pub(crate) fn console_full_height(desk: &Desk, selected: usize, s: f32) -> f32 {
     let title_h = CONSOLE_TITLE_H * s;
     let rows = desk.fences.len().min(CONSOLE_FENCE_MAX_ROWS) as f32 * CONSOLE_FENCE_ROW_H * s;
-    // 详情区行数按当前布局/风格动态计算（与 build_console 保持一致）
-    let detail_rows = detail_visible_rows(desk, s);
+    // 详情区行数按选中栅栏的布局/风格动态计算（与 build_console 保持一致）
+    let detail_rows = detail_visible_rows(desk, selected, s);
     title_h
         + 8.0 * s
         + rows
@@ -292,12 +292,13 @@ pub(crate) fn console_full_height(desk: &Desk, s: f32) -> f32 {
 }
 
 /// 详情区可见行的总高度（行高 30px × 可见行数 + 标签行 24px）。
-fn detail_visible_rows(desk: &Desk, s: f32) -> f32 {
-    let app = desk
+///
+/// 必须按**当前选中栅栏**计算，与 `build_console` 渲染的栅栏严格同源——按"第一个非空栅栏"
+/// 猜测会在选中栅栏的布局/风格不同时算错高度，导致底部按钮压住详情内容。
+fn detail_visible_rows(desk: &Desk, selected: usize, s: f32) -> f32 {
+    let (layout, style) = desk
         .fences
-        .iter()
-        .find(|f| !f.icon_ids.is_empty() || desk.fences.len() == 1);
-    let (layout, style) = app
+        .get(selected.min(desk.fences.len().saturating_sub(1)))
         .map(|f| (f.appearance.layout, f.appearance.bg_style))
         .unwrap_or((FenceLayout::Grid, FenceStyle::Glass));
     let mut n = 1usize; // 布局选择（始终显示）
@@ -308,7 +309,7 @@ fn detail_visible_rows(desk: &Desk, s: f32) -> f32 {
     if style != FenceStyle::Blur {
         n += 1; // 背景色调（模糊时隐藏）
     }
-    n += 1; // 更改位置（始终显示）
+    n += 2; // 文件位置：第一行标签+操作按钮，第二行模式芯片+真实路径
     if layout == FenceLayout::Sidebar {
         n += 1; // 侧边栏位置（仅侧边栏）
     }
@@ -325,12 +326,19 @@ fn detail_visible_rows(desk: &Desk, s: f32) -> f32 {
 /// 尺寸策略：未手动缩放过（`console_size == None`）时宽取 `CONSOLE_W`、高取
 /// `console_full_height`（标签页/内容自适应）；用户拖边缘/角缩放后
 /// `console_size` 落为具体宽高（钳制在最小尺寸之上），之后高度固定、超出滚动。
-pub(crate) fn console_geometry(desk: &Desk, theme: &Theme, vw: f32, vh: f32, panel: f32) -> RectF {
+pub(crate) fn console_geometry(
+    desk: &Desk,
+    theme: &Theme,
+    vw: f32,
+    vh: f32,
+    panel: f32,
+    selected: usize,
+) -> RectF {
     let s = theme.scale;
     let margin = CONSOLE_MARGIN * s;
     // 可用高度：屏幕高度减去上下边距（面板不应溢出屏幕）
     let max_h = (vh - 2.0 * margin).max(CONSOLE_MIN_H * s);
-    let auto_full_h = console_full_height(desk, s).min(max_h);
+    let auto_full_h = console_full_height(desk, selected, s).min(max_h);
     let (w, full_h) = match desk.console_size {
         Some((w, h)) => (
             w.max(CONSOLE_MIN_W * s),
@@ -404,7 +412,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
     let desk = &rt.desk;
     let theme = &rt.theme;
     let s = theme.scale;
-    let panel = console_geometry(desk, theme, rt.vw, rt.vh, anim.panel);
+    let panel = console_geometry(desk, theme, rt.vw, rt.vh, anim.panel, rt.selected_fence);
     let title_h = CONSOLE_TITLE_H * s;
     let content_top = panel.y + title_h;
 
@@ -562,13 +570,63 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         } else {
             (RectF::default(), Vec::new())
         };
-        // 「更改位置…」按钮（始终显示）
+        // —— 文件位置行（占两行）——
+        // 第一行：标签 + 「更改位置…」+「恢复默认」（后者仅外部文件夹模式出现）。
+        // 第二行：落地模式芯片 + 中段省略的真实路径。
+        // 该行是用户唯一能得知"文件到底存在哪 / 删除是删副本还是删真身"的入口，故常显。
+        let storage = sylva_core::storage::describe(
+            desk.fences[sel].storage_path.as_deref(),
+            &rt.library.to_string_lossy(),
+            rt.desktop_dir.as_deref(),
+        );
         let storage_btn = RectF {
             x: d.x + label_w,
             y: row_y(row),
             w: 120.0 * s,
             h: btn_h,
         };
+        let storage_reset = if storage.can_reset {
+            // 宽度按可用空间收敛：面板被缩到最小宽（CONSOLE_MIN_W）时也不会顶出详情区右缘。
+            let reset_x = storage_btn.x + storage_btn.w + 6.0 * s;
+            let avail = (d.x + d.w - 2.0 * s - reset_x).max(0.0);
+            let reset_w = avail.min(84.0 * s);
+            if reset_w >= 40.0 * s {
+                RectF {
+                    x: reset_x,
+                    y: row_y(row),
+                    w: reset_w,
+                    h: btn_h,
+                }
+            } else {
+                RectF::default()
+            }
+        } else {
+            RectF::default()
+        };
+        row += 1;
+        let chip_w = 56.0 * s;
+        let path_gap = 6.0 * s;
+        let path_x = d.x + 2.0 * s + chip_w + path_gap;
+        let path_y = row_y(row) + 4.0 * s;
+        let path_h = 18.0 * s;
+        let storage_chip = RectF {
+            x: d.x + 2.0 * s,
+            y: path_y,
+            w: chip_w,
+            h: path_h,
+        };
+        let storage_path_rect = RectF {
+            x: path_x,
+            y: path_y,
+            w: (d.x + d.w - 2.0 * s - path_x).max(0.0),
+            h: path_h,
+        };
+        // 省略预算与绘制层同源（`text::estimate_width`），留 4px 内边距避免贴边。
+        let storage_path_text = sylva_core::storage::elide_middle(
+            &storage.path,
+            (storage_path_rect.w - 4.0 * s).max(0.0),
+            rt.theme.label.size * 0.72,
+        );
         row += 1;
         // 侧边栏位置按钮（仅侧边栏布局有；网格/列表隐藏）
         let show_sidebar_pos = app.layout == FenceLayout::Sidebar;
@@ -666,6 +724,11 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
             tint_default,
             tints,
             storage_btn,
+            storage_kind: storage.kind,
+            storage_path_text,
+            storage_path_rect,
+            storage_chip,
+            storage_reset,
             sidebar_pos: app.sidebar_pos,
             sidebar_left,
             sidebar_top,
@@ -685,7 +748,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
     let btn_w = panel.w - 2.0 * CONSOLE_PAD * s;
     let btn_h = CONSOLE_ADD_BTN_H * s;
     let btn_gap = 8.0 * s;
-    let detail_h = detail_visible_rows(desk, s);
+    let detail_h = detail_visible_rows(desk, sel, s);
     let btn_top = list_top + fence_shown as f32 * row_h_f + 8.0 * s + detail_h + 8.0 * s;
     let add_fence = RectF {
         x: panel.x + CONSOLE_PAD * s,
@@ -1303,7 +1366,7 @@ pub(crate) fn build_dock_magnify(rt: &mut Runtime, scene_fences: &mut [SceneFenc
     });
     // 光标落在控制中心面板内 → 同样不放大（避免面板上方触发 Dock 工具提示）
     let in_console = rt.desk.console_open && {
-        let cp = console_geometry(&rt.desk, &rt.theme, rt.vw, rt.vh, 1.0);
+        let cp = console_geometry(&rt.desk, &rt.theme, rt.vw, rt.vh, 1.0, rt.selected_fence);
         mx >= cp.x && mx <= cp.x + cp.w && my >= cp.y && my <= cp.y + cp.h
     };
     // 拖动排序期间保持放大但禁用工具提示（避免 tooltip 反复触发 surface 重建）
@@ -1509,6 +1572,14 @@ pub(crate) fn hit_model_from(theme: &Theme, scene: &Scene, _desk: &Desk) -> HitM
             }
             if let Some(d) = &c.fence_detail {
                 zones.push((ConsoleZone::ChangeStoragePath, d.storage_btn));
+                // 路径行整块也可点（等价于「更改位置…」）；零矩形不入表。
+                if d.storage_path_rect.w > 0.0 && d.storage_path_rect.h > 0.0 {
+                    zones.push((ConsoleZone::ChangeStoragePath, d.storage_path_rect));
+                }
+                // 「恢复默认」仅在外部文件夹模式出现；零矩形不入表，杜绝死按钮。
+                if d.storage_reset.h > 0.0 {
+                    zones.push((ConsoleZone::ResetStoragePath, d.storage_reset));
+                }
                 zones.push((ConsoleZone::FenceLayout(FenceLayout::Grid), d.layout_grid));
                 zones.push((ConsoleZone::FenceLayout(FenceLayout::List), d.layout_list));
                 zones.push((
