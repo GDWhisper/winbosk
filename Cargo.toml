@@ -7,6 +7,29 @@ members = [
     "crates/app",
 ]
 
+# ---------------------------------------------------------------------------
+# 快速迭代 profile：日常开发用 `cargo build --profile dev-fast`
+# 目标：改一行代码后重编只要几百毫秒级，同时运行时表现接近 release。
+#   - 依赖（windows-rs / D2D / WinRT 等重型泛型代码）按 opt-level 3 编译，
+#     但只编译一次，之后改业务代码不会触发它们重编；
+#   - 本工作区代码 opt-level 1 + incremental，重编极快；
+#   - debug = false 砍掉调试信息，链接耗时大幅下降（debuginfo 是链接大头）；
+#   - debug-assertions = false 使 `#![cfg_attr(not(debug_assertions), ...)]` 生效，
+#     产出与 release 一致的无控制台窗口行为（日志仍写入 data/logs 滚动文件）。
+# 注意：这是纯新增 profile，`cargo build` / `cargo build --release` / CI 行为完全不变。
+# ---------------------------------------------------------------------------
+[profile.dev-fast]
+inherits = "dev"
+opt-level = 1
+debug = false
+debug-assertions = false
+incremental = true
+codegen-units = 256
+lto = false
+
+[profile.dev-fast.package."*"]
+opt-level = 3
+
 [workspace.package]
 edition = "2021"
 version = "0.1.0"

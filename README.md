@@ -38,14 +38,18 @@
 需要 Windows + Rust 工具链（MSVC）。
 
 ```bash
-# 开发构建（生成 target\debug\sylva.exe）
+# 日常开发构建（推荐）：改一行只重编本工作区代码，产物无控制台窗口
+cargo build --profile dev-fast
+
+# 调试构建（生成 target\debug\sylva.exe，会额外弹出一个控制台窗口显示日志）
 cargo build
 
 # 发布构建（生成 target\release\sylva.exe，双击运行无控制台窗口）
 cargo build --release
 
 # 运行
-target\debug\sylva.exe        # 开发构建
+target\dev-fast\sylva.exe     # 日常开发构建（推荐）
+target\debug\sylva.exe        # 调试构建（带控制台）
 target\release\sylva.exe      # 发布构建
 
 # 测试 / 静态检查
@@ -55,6 +59,34 @@ cargo fmt --all -- --check
 ```
 
 也可用脚本：`scripts\build-release.ps1`（发布构建并把 exe 拷到 `dist\`）。
+
+开发时可用 `scripts\dev-watch.ps1`：监听 `crates\` 下 `.rs` / `.toml` 变更，自动重编 `dev-fast` 并重启程序
+（Ctrl+C 结束监听）。它通过向 overlay 窗口投递 `WM_APP_QUIT` 优雅关闭旧实例——
+**切勿硬杀 `sylva.exe`**（`Stop-Process -Force` / `taskkill /F`）：会跳过 `IconGuard::drop`，
+被隐藏的真实桌面图标将不会恢复。
+
+### 关于「热更新」
+
+本项目是**静态链接的原生 Win32 进程，不支持进程内热更新**：Rust 没有可换入的脚本层，且桌面接管（`IconGuard` 隐藏 `SysListView32`、overlay 挂 `WorkerW`）必须在进程启动时完成，改代码后只能重启进程。
+
+日常迭代请使用 `dev-fast` profile，它把「改代码 → 看到界面变化」的耗时压到最低：
+
+| Profile | 依赖编译 | 改一行后重编 | 控制台窗口 | 运行时性能 |
+| :--- | :--- | :--- | :--- | :--- |
+| `dev`（`cargo build`） | opt-level 0 | 快 | **有**（PE subsystem=CONSOLE） | 慢，动画易掉帧 |
+| `dev-fast`（推荐） | opt-level 3（仅首次） | **约 14 s** | 无（PE subsystem=GUI） | 接近 release |
+| `release` | opt-level 3（仅首次） | **约 65 s** | 无（PE subsystem=GUI） | 最佳 |
+
+> 重编耗时实测方式：`touch crates/app/src/main.rs` 后重新构建（Windows / rustc 1.95.0 / x86_64-pc-windows-msvc）。
+> 首次构建需把依赖按 opt-level 3 编一遍，与 release 首次构建同量级；此后改业务代码只重编 `sylva-app`。
+
+若要「保存即自动重编 + 重启」，可自行安装文件监听工具：
+
+```bash
+cargo install bacon          # 或 cargo install cargo-watch
+bacon                        # 默认跑 cargo check，按 r 运行
+cargo watch -x "run --profile dev-fast"
+```
 
 ## 快捷键
 
