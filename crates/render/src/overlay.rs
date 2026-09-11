@@ -405,6 +405,18 @@ struct WindowState {
     hovered: Option<(usize, Option<usize>)>,
     /// 当前悬停的控制台控件（仅在变化时上报 ConsoleHover 事件）。
     console_hovered: Option<ConsoleZone>,
+    /// 上一次「按下」是否被控制台面板整体消费（命中控件 / 标题栏 / 面板空白均算）。
+    ///
+    /// 双击处理以它为准，而不是「当前坐标是否还在面板矩形内」：点「关闭」会把面板折成
+    /// 胶囊乃至完全不渲染，此时按坐标判定会失效并放行穿透；拖动面板也会让它从光标下移开。
+    last_press_in_console: bool,
+    /// 上一次「按下」在控制台面板上命中的控件（未命中控件则为 None）。
+    ///
+    /// 快速连击时 Windows 会把第二次按下变成 `WM_LBUTTONDBLCLK`，需要判断它是否仍落在
+    /// **同一个**控件上才允许重复触发：控制台的行数会随选中栅栏/布局动态增减，一旦发生
+    /// 回流，同一坐标可能已经换成别的控件（例如点「列表」后下方整排上移），此时必须拒绝，
+    /// 否则会误触到相邻控件。
+    last_console_zone: Option<ConsoleZone>,
     /// 上次上报的光标位置（仅位置变化才发 CursorMove，避免无谓重绘）。
     last_cursor: Option<(f32, f32)>,
     /// 上次 SetWindowRgn 的区域句柄：区域几何未变时跳过 SetWindowRgn。
@@ -448,16 +460,29 @@ impl OverlayWindow {
         });
     }
 
+    /// 把本线程提到前台（前台交给隐藏焦点代理），供随后弹出的模态 UI 使用。
+    ///
+    /// Sylva 常驻后台，进程通常不是前台进程；此时直接弹 `TrackPopupMenu` / `MessageBoxW`
+    /// 会被系统拒绝前台化——菜单点外部不关闭，对话框不获焦、被前台窗口盖住。
+    /// 任何需要「把某个窗口提到前台」的场景都必须走它。
+    pub fn raise_to_foreground(&self) {
+        self.with_foreground_lock(|| unsafe {
+            let _ = SetForegroundWindow(self.proxy);
+        });
+    }
+
     /// 弹出菜单要用的 owner 窗口（可激活的焦点代理），并已把它提到前台。
     ///
     /// `TrackPopupMenu` 要求 owner 在弹出前**已经**是前台窗口，否则点击菜单外区域
     /// 菜单不会消失（一直悬在屏幕上，只能靠选中某项或 Esc 收场）。overlay 本体带
     /// `WS_EX_NOACTIVATE`——激活它会把桌面壳层提到应用之上，且系统压根不接受激活，
     /// 所以前台与 owner 都交给可激活的焦点代理窗口。
+    ///
+    /// **不要**拿它当 `MessageBoxW` 的 owner：代理是离屏 1×1（`-32000,-32000`），
+    /// 对话框会被居中到屏幕外。对话框应先 `raise_to_foreground()` 抢前台，
+    /// owner 仍用 overlay 本体（覆盖整屏，居中位置正常）。
     pub fn menu_owner(&self) -> HWND {
-        self.with_foreground_lock(|| unsafe {
-            let _ = SetForegroundWindow(self.proxy);
-        });
+        self.raise_to_foreground();
         self.proxy
     }
 
@@ -506,6 +531,8 @@ impl OverlayWindow {
             drag: None,
             hovered: None,
             console_hovered: None,
+            last_press_in_console: false,
+            last_console_zone: None,
             last_cursor: None,
             last_region: None,
             handler: None,
@@ -1273,10 +1300,15 @@ unsafe extern "system" fn wnd_proc(
 }
 
 /// 控制台面板内命中的控件（先匹配的生效；控件矩形已含「仅面板内」的前提）。
+///
+/// **必须排除零面积矩形**：未显示的控件用 `RectF::default()` = `(0,0,0,0)` 占位，
+/// 而 `RectF::contains` 含边界，于是客户端原点 `(0,0)` 会命中这些占位矩形，凭空报出一个
+/// 根本不存在的控件（如未展开的「图标尺寸」「侧边栏停靠位置」）。这既会让单击误触发，
+/// 也会让随后 `on_double_click` 的连击校验在原点重复触发幽灵控件。
 fn console_zone_at(c: &ConsoleHit, mx: f32, my: f32) -> Option<ConsoleZone> {
     c.zones
         .iter()
-        .find(|(_, r)| r.contains(mx, my))
+        .find(|(_, r)| r.w > 0.0 && r.h > 0.0 && r.contains(mx, my))
         .map(|(z, _)| *z)
 }
 
@@ -1297,9 +1329,44 @@ fn console_resize_zone_at(c: &ConsoleHit, mx: f32, my: f32) -> Option<ResizeZone
     None
 }
 
+/// 该控制台控件是否允许被快速连击重复触发。
+///
+/// 判据：**重复触发不产生任何额外副作用**。本列表刻意与 `scene.rs` 里真正会
+/// `zones.push` 的控件一一对应，只放行「把同一个值再设一遍」这类幂等设置项。
+///
+/// 被排除的都是重复执行有真实副作用的控件：
+/// - `AddFence`：一次双击会多建一个栅栏；
+/// - `RemoveFence`：一次双击会连删两个栅栏（虽有确认弹窗，也不该被一次手势触发两次）；
+/// - `ChangeStoragePath`：会弹两次文件夹选择器（模态）；
+/// - `AutoOrganize`：会跑两遍一键整理；
+/// - `DesktopToggle`：虽是纯状态翻转，但每次翻转都伴随 `restore_icons`/`hide_icons` 与
+///   整屏淡入淡出补间，重复触发会出现「桌面闪一下又回来」的可见抖动；
+/// - `Close`：会改变面板几何，原坐标随即失效。
+///
+/// `Expand` / `Tab` 目前不会被 `zones.push`（属死控件），故不列入——新增变体默认落到
+/// `false`（fail-safe），需要放行时再显式加进来。
+///
+/// 注意：栅栏收展按钮同样是状态翻转，但它走 `collapse_target_at` 单独处理，不经过本白名单。
+fn console_zone_is_repeatable(zone: ConsoleZone) -> bool {
+    matches!(
+        zone,
+        ConsoleZone::FenceSelect(_)
+            | ConsoleZone::FenceLayout(_)
+            | ConsoleZone::FenceIconSize(_)
+            | ConsoleZone::FenceStyle(_)
+            | ConsoleZone::FenceSidebarPos(_)
+            | ConsoleZone::FenceTint(_)
+            | ConsoleZone::FenceRulePreset(_)
+    )
+}
+
 /// 按下：命中控制台控件/标题栏、边缘/角标开始缩放；命中栅栏标题栏/空白开始移动。
 /// 拖拽类动作都捕获鼠标以跟踪拖出窗口的移动。
 fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
+    // 每次按下都重置控制台记忆：只有「紧接的下一次连击」才允许复用上一次的命中，
+    // 中间只要按过别处（或压根没命中面板），记忆立即失效。
+    state.last_press_in_console = false;
+    state.last_console_zone = None;
     // 内联编辑框优先：点编辑框内部 = 把光标定位到点击处，不落到下面的栅栏/图标
     // （否则会触发「点击别处提交编辑」，用户根本无法点击文本）。
     if let Some(er) = state.model.edit_rect {
@@ -1312,7 +1379,12 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
     // 标题栏拖动——关闭按钮就在标题栏内，先判控件才能「点 × 即关」而非开始拖动。
     if let Some(c) = &state.model.console {
         if c.rect.contains(mx, my) {
+            // 面板整体消费了这次按下（无论命中控件、标题栏还是空白）：
+            // 随后的 WM_LBUTTONDBLCLK 一律不得穿透到底层桌面。
+            state.last_press_in_console = true;
             if let Some(zone) = console_zone_at(c, mx, my) {
+                // 记住本次命中，供随后的 WM_LBUTTONDBLCLK 判断是否仍指向同一控件。
+                state.last_console_zone = Some(zone);
                 emit_event(hwnd, state, OverlayEvent::ConsoleClick { zone });
                 return;
             }
@@ -1870,7 +1942,30 @@ fn compute_reorder_target(
 
 /// 双击图标：把下标交给 App 打开对应项。
 fn on_double_click(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
-    // 控制台面板展开时阻断双击穿透底层桌面栅栏
+    // 控制台面板：既阻断双击穿透到底层桌面，也让幂等控件「跟手」。
+    //
+    // 判据是「上一次**按下**是否被控制台面板消费」，而不是「当前坐标是否还在面板矩形内」：
+    // 点「关闭」会把面板折成胶囊（`console_open=false` + 收起补间），补间结束后
+    // `scene.console` 直接变成 `None`（见 `scene.rs` 的 `console_open || panel > 0.01`）；
+    // 拖动面板也会让它从光标底下移开。这些情形下按坐标判定都会失效并放行穿透，
+    // **双击关闭按钮就会顺手打开正下方的一个桌面文件**。
+    //
+    // 落在**可重复控件**上的第二次按下要照常生效：与栅栏收展按钮同理，Windows 把快速连击
+    // 的第二次按下变成 WM_LBUTTONDBLCLK，若一律吞掉，面板按钮也会「不跟手」。两道闸门保证安全：
+    //   1. 必须与上一次按下命中**同一个**控件——面板行数随选中栅栏/布局动态增减，回流后
+    //      同一坐标可能已经换成别的控件；
+    //   2. 该控件必须可重复触发（见 `console_zone_is_repeatable`），否则「移出栅栏」会被一次双击触发两次。
+    if state.last_press_in_console {
+        if let Some(c) = &state.model.console {
+            if let Some(zone) = console_zone_at(c, mx, my) {
+                if state.last_console_zone == Some(zone) && console_zone_is_repeatable(zone) {
+                    emit_event(hwnd, state, OverlayEvent::ConsoleClick { zone });
+                }
+            }
+        }
+        return;
+    }
+    // 面板打开时，落在面板矩形内的双击同样不得穿透（标题栏、空白处等）
     if let Some(c) = &state.model.console {
         if c.rect.contains(mx, my) {
             return;
@@ -1895,22 +1990,46 @@ fn on_double_click(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
             return;
         }
     }
-    // 未命中图标：检测是否双击栅栏标题栏空白处以收起/展开
-    for f in &state.model.fences {
+    // 未命中图标：先判折叠/展开按钮，再判标题栏空白处（两者都是收起/展开）。
+    match collapse_target_at(&state.model, mx, my) {
+        Some(CollapseTarget::Button(fence)) => {
+            // 按钮必须在这里也响应：Windows 对「快速连击」只派发 DOWN → UP → DBLCLK → UP，
+            // 第二次按下不会再来 WM_LBUTTONDOWN。原先此处把落在按钮上的 DBLCLK 直接吞掉，
+            // 于是快速点按每两次只有一次生效（按钮「不跟手」）。按钮的语义是「按一次切换
+            // 一次」，与单击完全一致，所以 DBLCLK 照常切换即可，无需任何防抖/时间窗去重。
+            emit_event(hwnd, state, OverlayEvent::FenceCollapseToggle { fence });
+        }
+        Some(CollapseTarget::Title(fence)) => {
+            emit_event(hwnd, state, OverlayEvent::FenceTitleDoubleClicked { fence });
+        }
+        None => {}
+    }
+}
+
+/// 未命中图标时，双击（或快速连击）落在哪个收展目标上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollapseTarget {
+    /// 标题栏右侧的收展按钮（按一次切换一次）。
+    Button(usize),
+    /// 标题栏空白处（双击切换）。
+    Title(usize),
+}
+
+/// 解析收展命中目标。按钮绘制在标题栏内部，故必须**先判按钮**再判标题栏，
+/// 否则按钮会被标题栏抢走；且每个栅栏至多返回一个目标，避免同一次点击既算
+/// 按钮又算标题栏而切换两次。
+fn collapse_target_at(model: &HitModel, mx: f32, my: f32) -> Option<CollapseTarget> {
+    for f in &model.fences {
         if let Some(btn) = f.collapse_btn {
             if btn.contains(mx, my) {
-                return;
+                return Some(CollapseTarget::Button(f.id));
             }
         }
         if f.title.contains(mx, my) {
-            emit_event(
-                hwnd,
-                state,
-                OverlayEvent::FenceTitleDoubleClicked { fence: f.id },
-            );
-            return;
+            return Some(CollapseTarget::Title(f.id));
         }
     }
+    None
 }
 
 /// 把事件交给 App 回调，并用回调返回的新命中模型更新区域与命中数据。
@@ -2120,5 +2239,166 @@ mod tests {
         assert_eq!(resize_zone_at(&f, 298.0, 134.0), None);
         assert_eq!(resize_zone_at(&f, 200.0, 135.0), None);
         assert_eq!(resize_zone_at(&f, 298.0, 115.0), None);
+    }
+
+    /// 构造单栅栏命中模型：标题栏 (100,100) 200x36，收展按钮 (270,105) 20x20 —— 按钮落在标题栏内部。
+    fn model_with_collapse_button(collapse_btn: Option<RectF>) -> HitModel {
+        HitModel {
+            fences: vec![FenceHit {
+                body: RectF {
+                    x: 100.0,
+                    y: 100.0,
+                    w: 200.0,
+                    h: 200.0,
+                },
+                title: RectF {
+                    x: 100.0,
+                    y: 100.0,
+                    w: 200.0,
+                    h: 36.0,
+                },
+                grip: RectF {
+                    x: 274.0,
+                    y: 274.0,
+                    w: 26.0,
+                    h: 26.0,
+                },
+                id: 0,
+                tooltip: None,
+                is_sidebar: false,
+                collapse_btn,
+                collapsed: false,
+            }],
+            icons: vec![],
+            console: None,
+            edit_rect: None,
+        }
+    }
+
+    #[test]
+    fn collapse_target_button_beats_title() {
+        // 按钮完全落在标题栏内：必须先判按钮，否则收展按钮会被标题栏抢走，
+        // 变成「双击标题栏」而非「按一次切换一次」。
+        let model = model_with_collapse_button(Some(RectF {
+            x: 270.0,
+            y: 105.0,
+            w: 20.0,
+            h: 20.0,
+        }));
+        assert_eq!(
+            collapse_target_at(&model, 280.0, 115.0),
+            Some(CollapseTarget::Button(0))
+        );
+    }
+
+    #[test]
+    fn collapse_target_falls_back_to_title() {
+        // 标题栏左侧空白（不在按钮内）→ 标题栏目标
+        let model = model_with_collapse_button(Some(RectF {
+            x: 270.0,
+            y: 105.0,
+            w: 20.0,
+            h: 20.0,
+        }));
+        assert_eq!(
+            collapse_target_at(&model, 150.0, 115.0),
+            Some(CollapseTarget::Title(0))
+        );
+    }
+
+    #[test]
+    fn collapse_target_without_button_is_title() {
+        // 侧边栏 Dock 不生成收展按钮（collapse_btn = None）：同一位置退化为标题栏目标，
+        // 且绝不能凭空报出 Button。
+        let model = model_with_collapse_button(None);
+        assert_eq!(
+            collapse_target_at(&model, 280.0, 115.0),
+            Some(CollapseTarget::Title(0))
+        );
+    }
+
+    #[test]
+    fn collapse_target_outside_fences_is_none() {
+        let model = model_with_collapse_button(Some(RectF {
+            x: 270.0,
+            y: 105.0,
+            w: 20.0,
+            h: 20.0,
+        }));
+        assert_eq!(collapse_target_at(&model, 500.0, 500.0), None);
+    }
+
+    #[test]
+    fn repeatable_console_zones_are_the_pure_setters() {
+        // 纯设置项：重复触发与触发一次结果相同，允许快速连击的第二次按下生效
+        for zone in [
+            ConsoleZone::FenceSelect(2),
+            ConsoleZone::FenceLayout(FenceLayout::List),
+            ConsoleZone::FenceIconSize(72.0),
+            ConsoleZone::FenceStyle(FenceStyle::Glass),
+            ConsoleZone::FenceSidebarPos(SidebarPosition::Left),
+            ConsoleZone::FenceTint(Some([1.0, 0.0, 0.0])),
+            ConsoleZone::FenceRulePreset(None),
+        ] {
+            assert!(console_zone_is_repeatable(zone), "{zone:?} 应为可重复控件");
+        }
+    }
+
+    #[test]
+    fn side_effecting_console_zones_are_never_repeated() {
+        // 重复执行有真实副作用的控件：一次双击绝不能触发两次
+        for zone in [
+            ConsoleZone::Close,
+            ConsoleZone::AddFence,
+            ConsoleZone::RemoveFence,
+            ConsoleZone::ChangeStoragePath,
+            ConsoleZone::AutoOrganize,
+            // 纯状态翻转，但每次翻转都伴随图标层 ShowWindow 与整屏淡入淡出，会闪
+            ConsoleZone::DesktopToggle,
+            // 目前不会被 zones.push 的死控件：默认 fail-safe 拒绝
+            ConsoleZone::Expand,
+            ConsoleZone::Tab(1),
+        ] {
+            assert!(!console_zone_is_repeatable(zone), "{zone:?} 不得被重复触发");
+        }
+    }
+
+    #[test]
+    fn console_zone_at_ignores_zero_area_placeholders() {
+        // 未显示的控件用 RectF::default() = (0,0,0,0) 占位；RectF::contains 含边界，
+        // 若不排除零面积矩形，客户端原点 (0,0) 会命中这些并不存在的「幽灵控件」。
+        let c = ConsoleHit {
+            rect: RectF {
+                x: 0.0,
+                y: 0.0,
+                w: 300.0,
+                h: 200.0,
+            },
+            title: RectF {
+                x: 0.0,
+                y: 0.0,
+                w: 300.0,
+                h: 30.0,
+            },
+            zones: vec![
+                (ConsoleZone::FenceIconSize(32.0), RectF::default()),
+                (
+                    ConsoleZone::FenceSelect(0),
+                    RectF {
+                        x: 10.0,
+                        y: 40.0,
+                        w: 100.0,
+                        h: 20.0,
+                    },
+                ),
+            ],
+        };
+        // 原点不再命中占位控件
+        assert_eq!(console_zone_at(&c, 0.0, 0.0), None);
+        // 正常控件仍可命中
+        assert_eq!(
+            console_zone_at(&c, 50.0, 50.0),
+            Some(ConsoleZone::FenceSelect(0))
+        );
     }
 }

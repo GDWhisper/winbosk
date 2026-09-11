@@ -59,10 +59,10 @@ pub(crate) use windows::Win32::UI::Shell::{
 };
 pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
-    PostMessageW, SetForegroundWindow, SetProcessDPIAware, SystemParametersInfoW, TrackPopupMenu,
-    HMENU, MF_SEPARATOR, MF_STRING, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY,
-    TPM_RETURNCMD, WM_NULL,
+    MessageBoxW, PostMessageW, SetForegroundWindow, SetProcessDPIAware, SystemParametersInfoW,
+    TrackPopupMenu, HMENU, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MF_SEPARATOR, MF_STRING,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY, TPM_RETURNCMD, WM_NULL,
 };
 
 pub(crate) use sylva_core::config::ConfigStore;
@@ -1162,6 +1162,11 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 let i = rt
                     .selected_fence
                     .min(rt.desk.fences.len().saturating_sub(1));
+                // 常驻后台的进程直接弹系统模态对话框会被拒绝前台化（对话框不获焦、被前台
+                // 窗口盖住），先借焦点代理把本线程提到前台——与 `track_popup_menu`、
+                // `confirm_delete_fence` 同一套手法（见 overlay 的「任何需要把窗口提到
+                // 前台都必须走它」）。owner 仍用 overlay 本体，代理是离屏 1×1 不能当 owner。
+                unsafe { (*rt.overlay_ptr).raise_to_foreground() };
                 if let Some(paths) = pick_paths(rt.hwnd) {
                     if let Some(new_dir) = paths.first() {
                         change_fence_storage(rt, i, new_dir);
@@ -1623,6 +1628,17 @@ pub(crate) fn delete_fence_and_reclaim_icons(rt: &mut Runtime, fence_idx: usize)
     };
     let deleting_id = fence.id;
     let icon_ids = fence.icon_ids.clone();
+    let title = fence
+        .title
+        .clone()
+        .unwrap_or_else(|| "未命名栅栏".to_string());
+
+    // 删除不可撤销（栅栏配置随 `fences.remove` 消失并立即落盘），且入口之一是控制中心里
+    // 单击即触发的「移出栅栏」，故统一在此收口做二次确认。图标本身不会丢失：下方会无损
+    // 归流到「桌面」栅栏。确认弹窗是模态的，期间的再入事件由 `ReentryGuard` 丢弃。
+    if !confirm_delete_fence(rt, &title, icon_ids.len()) {
+        return;
+    }
 
     // 1. 寻找或兜底创建受纳栅栏
     let target_fid = match resolve_desktop_fence(&rt.desk, Some(deleting_id)) {

@@ -467,6 +467,44 @@ pub(crate) fn track_popup_menu(rt: &Runtime, menu: HMENU, sx: i32, sy: i32) -> u
     }
 }
 
+/// 删除栅栏前的二次确认。返回 `true` 表示用户确认删除。
+///
+/// 删除栅栏不可撤销：`fences.remove` 会连同标题、外观、布局、分类规则一起丢弃并立即落盘。
+/// 而入口之一是控制中心里**单击即触发**的「移出栅栏」，太容易误触，故统一收口做确认。
+/// 图标本身不会丢失（删除时会被无损归流到「桌面」栅栏），文案里说明这一点以免用户恐慌。
+///
+/// `MessageBoxW` 是模态的，会在本线程派发嵌套消息；调用方 `handle_event` 外层已由
+/// `ReentryGuard` 保护，再入事件会被直接丢弃，不会造成 `Runtime` 借用冲突。
+pub(crate) fn confirm_delete_fence(rt: &Runtime, title: &str, icon_count: usize) -> bool {
+    let text = format!(
+        "确定要删除栅栏「{title}」吗？\n\n其中的 {icon_count} 个图标会移回「桌面」栅栏，不会丢失。"
+    );
+    unsafe {
+        // 常驻后台的进程直接弹框会被系统拒绝前台化：对话框不获焦、可能被前台窗口盖住。
+        // 先借隐藏焦点代理把本线程提到前台（与 `track_popup_menu` 同一套手法）。
+        // owner 用 overlay 本体而**不是**代理——代理是离屏 1×1，拿它当 owner 会把对话框
+        // 居中到 (-32000,-32000) 屏幕外。
+        let prev = GetForegroundWindow();
+        let proxy = (*rt.overlay_ptr).menu_owner();
+        let text = wide(&text);
+        let caption = wide("删除栅栏");
+        let flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2; // 默认焦点落在「否」
+        let confirmed = MessageBoxW(
+            Some(rt.hwnd),
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            flags,
+        ) == IDYES;
+        // 与 `track_popup_menu` 一致：前台若仍停在我们自己的窗口上就还给弹出前的窗口，
+        // 免得用户原先的窗口一直灰着；用户已经切到别处则不去抢。
+        let fg = GetForegroundWindow();
+        if !prev.is_invalid() && (fg == rt.hwnd || fg == proxy) {
+            let _ = SetForegroundWindow(prev);
+        }
+        confirmed
+    }
+}
+
 /// 把字符串转成 UTF-16（含结尾 NUL），供 Win32 宽字符 API 使用。
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
