@@ -943,6 +943,39 @@ fn draw_fence_inner(
             unsafe { target.FillRectangle(&hl, &brush) };
         }
     }
+    // 底部内阴影：卡片内侧靠底边的一条渐暗暗带，与顶部高光一明一暗配合出浮雕/海拔感。
+    // **刻意不做成外扩投影**：窗口区域被 `SetWindowRgn` 裁成栅栏矩形的并集，
+    // 画到栅栏边界之外会被直接裁掉；外扩区域又会让投影带吞掉桌面图标点击。
+    // 用若干条等高分带按平方衰减近似渐变，避免每帧为每栅栏创建渐变画笔与色标集合。
+    // 与高光同样横向内缩一个圆角半径，保证落在圆角轮廓内；位于内容之前绘制，
+    // 因此图标与文字压在阴影之上（阴影属于材质层，不属于内容层）。
+    if theme.fence_shadow_h > 0.0 {
+        let radius = theme.fence_corner_radius.min(fence.width * 0.5);
+        let band_count = 4u32;
+        let band_h = theme.fence_shadow_h / band_count as f32;
+        let bottom = fence.y + fence.height - fence.border_width;
+        let base = theme.fence_shadow;
+        for i in 0..band_count {
+            // t 由 1/band_count 递增到 1：越靠底越暗，平方衰减让过渡更自然。
+            let t = (i as f32 + 1.0) / band_count as f32;
+            let band = D2D_RECT_F {
+                left: fence.x + radius,
+                top: bottom - theme.fence_shadow_h + i as f32 * band_h,
+                right: fence.x + fence.width - radius,
+                bottom: bottom - theme.fence_shadow_h + (i as f32 + 1.0) * band_h,
+            };
+            if band.right > band.left && band.bottom > band.top {
+                let c = D2D1_COLOR_F {
+                    r: base.r,
+                    g: base.g,
+                    b: base.b,
+                    a: base.a * t * t,
+                };
+                let brush = unsafe { target.CreateSolidColorBrush(&c, None)? };
+                unsafe { target.FillRectangle(&band, &brush) };
+            }
+        }
+    }
 
     let title_right = if let Some(btn) = fence.collapse_btn {
         btn.x.min(fence.x + fence.width - theme.fence_padding)

@@ -57,6 +57,14 @@ pub struct Theme {
     /// 厚度（物理像素）`<= 0` 时禁用，绘制层整段跳过。
     pub fence_highlight: Color,
     pub fence_highlight_h: f32,
+    /// 栅栏底部内阴影（海拔感）：卡片内侧靠底边的一条渐暗暗带，与 `fence_highlight`
+    /// 一明一暗配合出浮雕效果。厚度（物理像素）`<= 0` 时禁用。
+    ///
+    /// **不能改成外扩投影**：窗口区域被 `SetWindowRgn` 裁成栅栏矩形的并集
+    /// （见 `overlay::build_region`），画到栅栏边界之外会被直接裁掉；而把区域外扩
+    /// 会让投影带变成可点击区，吞掉栅栏四周的桌面图标点击（违反穿透前提）。
+    pub fence_shadow: Color,
+    pub fence_shadow_h: f32,
     /// 模糊背景高斯标准偏差（物理像素，`GaussianBlurEffect::SetStandardDeviation`）。
     /// GPU 效果按 sigma 直接设；初值 20 对旧观感微调。
     pub blur_stddev: f32,
@@ -92,6 +100,8 @@ impl Default for Theme {
             fence_padding: 14.0,
             fence_highlight: Color::rgba(1.0, 1.0, 1.0, 0.22),
             fence_highlight_h: 1.0,
+            fence_shadow: Color::rgba(0.0, 0.0, 0.0, 0.30),
+            fence_shadow_h: 6.0,
             blur_stddev: 20.0,
             title: TextStyle {
                 font_family: "Microsoft YaHei UI",
@@ -129,6 +139,7 @@ mod tests {
         assert!(t.title.size > 0.0 && t.label.size > 0.0);
         assert!(t.fence_padding >= 0.0);
         assert!(t.fence_highlight_h > 0.0);
+        assert!(t.fence_shadow_h > 0.0);
     }
 
     #[test]
