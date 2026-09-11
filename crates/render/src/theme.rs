@@ -53,6 +53,10 @@ pub struct Theme {
     pub fence_border: Color,
     pub fence_corner_radius: f32,
     pub fence_padding: f32,
+    /// 栅栏顶部高光描边（玻璃质感）：紧贴顶边内侧的一条亮线，让卡片从桌面浮起。
+    /// 厚度（物理像素）`<= 0` 时禁用，绘制层整段跳过。
+    pub fence_highlight: Color,
+    pub fence_highlight_h: f32,
     /// 模糊背景高斯标准偏差（物理像素，`GaussianBlurEffect::SetStandardDeviation`）。
     /// GPU 效果按 sigma 直接设；初值 20 对旧观感微调。
     pub blur_stddev: f32,
@@ -86,6 +90,8 @@ impl Default for Theme {
             fence_border: Color::rgba(1.0, 1.0, 1.0, 0.42),
             fence_corner_radius: 12.0,
             fence_padding: 14.0,
+            fence_highlight: Color::rgba(1.0, 1.0, 1.0, 0.22),
+            fence_highlight_h: 1.0,
             blur_stddev: 20.0,
             title: TextStyle {
                 font_family: "Microsoft YaHei UI",
@@ -122,6 +128,7 @@ mod tests {
         assert!(t.fence_corner_radius >= 0.0);
         assert!(t.title.size > 0.0 && t.label.size > 0.0);
         assert!(t.fence_padding >= 0.0);
+        assert!(t.fence_highlight_h > 0.0);
     }
 
     #[test]

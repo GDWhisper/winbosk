@@ -925,6 +925,24 @@ fn draw_fence_inner(
         let brush = unsafe { target.CreateSolidColorBrush(&color(fence.border_color), None)? };
         unsafe { target.DrawRoundedRectangle(&rr, &brush, fence.border_width, None) };
     }
+    // 顶部高光：紧贴顶边内侧的一条亮线（玻璃质感）。横向只取两圆角之间的直线段，
+    // 因此天然落在圆角轮廓内、不会溢出，无需 PushAxisAlignedClip；厚度 <= 0 时禁用。
+    // 位于 `collapsed` 提前返回之前，折叠态的标题栏同样带高光。
+    if theme.fence_highlight_h > 0.0 {
+        let radius = theme.fence_corner_radius.min(fence.width * 0.5);
+        let top = fence.y + fence.border_width;
+        let hl = D2D_RECT_F {
+            left: fence.x + radius,
+            top,
+            right: fence.x + fence.width - radius,
+            bottom: top + theme.fence_highlight_h,
+        };
+        if hl.right > hl.left && hl.bottom > hl.top {
+            let c = theme.fence_highlight.to_d2d();
+            let brush = unsafe { target.CreateSolidColorBrush(&c, None)? };
+            unsafe { target.FillRectangle(&hl, &brush) };
+        }
+    }
 
     let title_right = if let Some(btn) = fence.collapse_btn {
         btn.x.min(fence.x + fence.width - theme.fence_padding)

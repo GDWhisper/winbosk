@@ -1433,6 +1433,7 @@ fn apply_theme_scale(theme: &mut Theme, scale: f32) {
     theme.icon_caption_gap *= scale;
     theme.fence_padding *= scale;
     theme.fence_corner_radius *= scale;
+    theme.fence_highlight_h *= scale;
     theme.title_padding_bottom *= scale;
     theme.caption_max_width *= scale;
     theme.list_row_gap *= scale;
