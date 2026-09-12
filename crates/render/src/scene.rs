@@ -107,6 +107,25 @@ impl SceneFence {
     }
 }
 
+/// 收起栅栏的「原大小占位框」（瞬态：仅拖动期间存在，不持久化）。
+///
+/// 收起只改变视觉高度，碰撞/夹屏仍按展开时的原矩形计算。拖动期间把该矩形画成
+/// 虚线淡框，用户才能理解"为什么在这个位置就推不动了"。
+///
+/// 几何由 App 层按 `fence_collision_rect` 同源给出（禁止渲染层另算）；
+/// 颜色直通 alpha，已含占位透明度与桌面切换淡出。
+#[derive(Debug, Clone)]
+pub struct SceneReserved {
+    /// 占位矩形（物理像素，虚拟屏幕坐标）= 该栅栏的碰撞矩形。
+    pub rect: RectF,
+    /// 来源栅栏下标（`desk.fences`），仅用于日志与断言。
+    pub fence: usize,
+    /// 虚线描边色（直通 alpha）。
+    pub stroke_color: [f32; 4],
+    /// 极淡填充色（直通 alpha）；None = 只描边不填充。
+    pub fill_color: Option<[f32; 4]>,
+}
+
 /// 待办插件的一条（渲染用）。二级结构：名称 + 详细信息。
 #[derive(Debug, Clone)]
 pub struct SceneTodoRow {
@@ -265,6 +284,8 @@ pub struct Scene {
     pub edit: Option<SceneEdit>,
     /// 控制台面板（插件宿主）；None = 本帧不画。
     pub console: Option<SceneConsole>,
+    /// 收起栅栏的原大小占位框（仅拖动期间非空）；绘制在全部栅栏**之下**。
+    pub reserved: Vec<SceneReserved>,
 }
 
 impl Scene {
@@ -275,12 +296,15 @@ impl Scene {
             fences: Vec::new(),
             edit: None,
             console: None,
+            reserved: Vec::new(),
         }
     }
 
-    /// 全部内容的包围盒（虚拟屏幕坐标：全部栅栏 ∪ 控制台）。
+    /// 全部内容的包围盒（虚拟屏幕坐标：全部栅栏 ∪ 控制台 ∪ 占位框）。
     ///
     /// 合成器据此把合成表面缩到内容大小而非整屏（省内存）。没有内容时返回 None。
+    /// **占位框必须并入**：它比收起后的标题栏大得多，漏并会被合成表面裁掉（表现为
+    /// 「框只有部分方向可见」，与窗口区域漏并的症状一模一样，极易误判）。
     pub fn content_rect(&self) -> Option<RectF> {
         let mut min_x = f32::INFINITY;
         let mut min_y = f32::INFINITY;
@@ -306,6 +330,13 @@ impl Scene {
             min_y = min_y.min(c.y);
             max_x = max_x.max(c.x + c.width);
             max_y = max_y.max(c.y + c.height);
+            any = true;
+        }
+        for r in &self.reserved {
+            min_x = min_x.min(r.rect.x);
+            min_y = min_y.min(r.rect.y);
+            max_x = max_x.max(r.rect.x + r.rect.w);
+            max_y = max_y.max(r.rect.y + r.rect.h);
             any = true;
         }
         if !any {
@@ -406,6 +437,7 @@ mod tests {
     fn scene_defaults_empty() {
         let s = Scene::new(1920.0, 1080.0);
         assert!(s.fences.is_empty());
+        assert!(s.reserved.is_empty());
         assert_eq!(s.width, 1920.0);
         assert!(s.content_rect().is_none());
     }
@@ -427,5 +459,28 @@ mod tests {
         assert_eq!(r.y, 20.0);
         assert_eq!(r.w, 640.0); // (400+250) - 10
         assert_eq!(r.h, 400.0); // (300+120) - 20
+    }
+
+    #[test]
+    fn content_rect_covers_reserved_frames() {
+        // 占位框通常落在栅栏可见体之外（收起后只剩标题栏）→ 必须并入包围盒，
+        // 否则合成表面会把它裁掉。
+        let mut s = Scene::new(3072.0, 1920.0);
+        s.fences = vec![test_fence()]; // (10,20,100,80)
+        s.reserved = vec![SceneReserved {
+            rect: RectF {
+                x: 10.0,
+                y: 20.0,
+                w: 100.0,
+                h: 300.0,
+            },
+            fence: 0,
+            stroke_color: [1.0, 1.0, 1.0, 0.45],
+            fill_color: None,
+        }];
+        let r = s.content_rect().expect("有内容应返回包围盒");
+        assert_eq!(r.x, 10.0);
+        assert_eq!(r.y, 20.0);
+        assert_eq!(r.h, 300.0);
     }
 }

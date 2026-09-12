@@ -51,7 +51,8 @@ pub(crate) use windows::Win32::UI::Input::Ime::{
     ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow, CFS_POINT, COMPOSITIONFORM,
 };
 pub(crate) use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+    GetKeyState, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LBUTTON, VK_LEFT,
+    VK_RETURN, VK_RIGHT, VK_UP,
 };
 pub(crate) use windows::Win32::UI::Shell::{
     DragQueryFileW, FileOpenDialog, IFileOpenDialog, IShellItem, IShellItemArray,
@@ -175,6 +176,18 @@ impl Drop for IconGuard {
 /// Ctrl+C 通知主循环退出的 overlay 窗口句柄（仅信号，不做窗口访问）。
 static OVERLAY_HWND: OnceLock<usize> = OnceLock::new();
 
+/// 拖动栅栏期间的「占位框」提示状态（瞬态，不持久化）。
+///
+/// 收起只改变视觉高度，碰撞/夹屏仍按展开时的原矩形计算——占位框把这一不可见约束
+/// 画出来。`requested` 存的是**未经 settle 的请求矩形**：用它判定"哪些收起栅栏
+/// 拒绝了这次位置"，才能准确回答"是谁挡住了我"。
+pub(crate) struct DragHint {
+    /// 被拖动的栅栏下标（`desk.fences`）。
+    pub(crate) fence: usize,
+    /// 本帧请求的矩形（鼠标原始目标，settle 之前）。
+    pub(crate) requested: Rect,
+}
+
 /// App 运行时：领域模型 + 渲染 + 持久化的组合根。
 ///
 /// 由 `OverlayEvent` 回调持有（`Rc<RefCell>`），事件在主线程 wnd_proc 中同步处理，
@@ -247,6 +260,11 @@ pub(crate) struct Runtime {
     pub(crate) reorder_slot_order: std::collections::HashMap<usize, Vec<usize>>,
     /// 当前帧各图标渲染位置（fence_idx → Vec<(x, y)>），每帧更新，用于 lerp 动画。
     pub(crate) current_icon_positions: std::collections::HashMap<usize, Vec<(f32, f32)>>,
+    /// 拖动栅栏期间的占位框提示（None = 当前没有拖动）。**由白名单式清理维护**：
+    /// 只有 `FenceMove` 置位，任何非拖动事件都会清空——拖动异常终止（capture 被
+    /// 系统抢占、模态弹窗打断）时，占位框必须立刻消失，否则它会因并入窗口区域
+    /// 而持续吞掉那块区域的桌面点击。
+    pub(crate) drag_hint: Option<DragHint>,
 }
 
 // 事件处理器再入守卫：`handle_event` 打开模态菜单/属性页（`TrackPopupMenu`、Shell 动词
@@ -527,6 +545,7 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
         sidebar_reorder: None,
         reorder_slot_order: std::collections::HashMap::new(),
         current_icon_positions: std::collections::HashMap::new(),
+        drag_hint: None,
     };
     // 双向同步：启动时清一次——内部库被外部删除的文件、链接文件夹与栅栏的差集，
     // 都同步进栅栏（链接文件夹的预置文件启动即出现）。
@@ -636,9 +655,9 @@ unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> BOOL {
 
 /// 栅栏用于碰撞/夹屏的真实矩形：自动高度（`bounds.h <= 0`）时用最近一次布局
 /// 渲染高度。视觉矩形 = 模型矩形（拖拽已无补间），碰撞检测与实际可见区域一致。
+/// 口径唯一真源是 `Fence::collision_rect`（core）。
 fn fence_collision_rect(rt: &Runtime, i: usize) -> Rect {
-    let f = &rt.desk.fences[i];
-    Rect::new(f.bounds.x, f.bounds.y, f.bounds.w, fence_height(rt, i))
+    rt.desk.fences[i].collision_rect(rt.last_layout_h.get(i).copied().unwrap_or(0.0))
 }
 
 /// 除 `skip` 外其它栅栏的碰撞矩形（真实高度入算——自动高度栅栏不再以 0 高漏检，
@@ -776,6 +795,38 @@ pub(crate) fn set_console_open(rt: &mut Runtime, open: bool) {
     start_panel_tween(rt, if open { 1.0 } else { 0.0 });
 }
 
+/// 左键当前是否按下（取的是本线程消息队列对应的按键状态，非异步物理状态）。
+///
+/// 用于给「拖动是否仍在进行」一个不依赖事件送达的判据：拖动异常终止（capture 被
+/// 系统抢占、模态循环打断）时收不到 `FenceDragEnd`，只靠事件白名单会把占位框
+/// 永久留在屏幕上。
+fn left_button_down() -> bool {
+    unsafe { GetKeyState(VK_LBUTTON.0 as i32) < 0 }
+}
+
+/// 拖动进行中可能上报的事件白名单：只有它们（且左键仍按下）才允许保留占位框提示，
+/// 其余任何事件都意味着拖动已经结束（`FenceDragEnd` / 右键菜单 / 托盘 / DPI 变化 /
+/// 控制台操作…）。
+///
+/// **新增事件变体默认落入"清理"一侧**，这是刻意选的安全默认值：漏清会让占位框滞留
+/// 并吞掉它覆盖区域的桌面点击；误清最多让提示晚一帧出现（下一帧 `FenceMove` 立即重建）。
+fn keeps_drag_hint(ev: &OverlayEvent) -> bool {
+    matches!(
+        ev,
+        OverlayEvent::FenceMove { .. }
+            | OverlayEvent::FenceResize { .. }
+            | OverlayEvent::FenceScroll { .. }
+            | OverlayEvent::AnimTick
+            | OverlayEvent::SyncLibrary
+            | OverlayEvent::KeyDown { .. }
+            | OverlayEvent::HoverEnter { .. }
+            | OverlayEvent::HoverLeave
+            | OverlayEvent::CursorMove { .. }
+            | OverlayEvent::CursorLeave
+            | OverlayEvent::ConsoleHover { .. }
+    )
+}
+
 /// 处理一个用户交互事件：更新布局 → （按需）重绘 → 生成新命中模型。
 ///
 /// 返回 `None` 表示本事件不改变任何可见状态，无需重绘（overlay 保持当前
@@ -787,6 +838,16 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
     // `SyncLibrary` 每 4s 触发一次，若算活动则永远「不空闲」，修剪永不执行。
     if !matches!(ev, OverlayEvent::SyncLibrary) {
         rt.last_activity = std::time::Instant::now();
+    }
+    // 占位框提示的收口（两条规则，缺一不可，见字段注释与 `keeps_drag_hint`）：
+    //   1) 拖动进行中只可能收到白名单事件；
+    //   2) 左键仍按下。
+    // 占位框会并入窗口区域（区域外不渲染），滞留就等于那块区域永远吞掉桌面点击，
+    // 所以这里宁可多清不可漏清；清理后必须强制重绘一帧，否则窗口区域不会收缩。
+    let mut reserved_changed = false;
+    if rt.drag_hint.is_some() && !(keeps_drag_hint(&ev) && left_button_down()) {
+        rt.drag_hint = None;
+        reserved_changed = true;
     }
     // 就地重命名编辑期间，真正的用户交互事件先提交编辑（资源管理器行为：点击别处即确认）。
     // 只对「用户确实在别处点/拖/滚」的事件提交——定时器（SyncLibrary）与悬停高亮
@@ -828,7 +889,13 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             // 直接落到目标（无补间）：视觉 = 模型 = 鼠标位置，拖拽即时跟手；
             // 且鼠标坐标是整数，拖拽中不存在分数坐标导致的边框发虚。
             let (x, y) = pos;
-            let cur = rt.desk.fences.get(fence).map(|f| (f.bounds.w, f.bounds.h));
+            // 拖动矩形与"别人看它"的碰撞矩形同源（`fence_height`）：自动高度栅栏
+            // （`bounds.h <= 0`）不能再退化成 0 高，否则自身会漏检邻居并可被拖出屏幕。
+            let cur = rt
+                .desk
+                .fences
+                .get(fence)
+                .map(|f| (f.bounds.w, fence_height(rt, fence)));
             if let Some((w, h)) = cur {
                 let others = other_bounds(rt, fence);
                 let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
@@ -843,6 +910,18 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 if let Some(f) = rt.desk.fences.get_mut(fence) {
                     f.bounds.x = out.x;
                     f.bounds.y = out.y;
+                }
+                // 占位框提示：记录**请求位置**（settle 之前），收起栅栏才能显示
+                // "我仍按原尺寸占着这里"以及"是哪个收起栅栏挡住了我"。
+                // `left_button_down()` 守卫是必需的，不是冗余检查：capture 被系统
+                // 抢占后 overlay 的拖动状态可能残留，鼠标在窗口上移动仍会发
+                // `FenceMove`（此时左键早已松开）。若无条件重建提示，就会出现
+                // "上面刚清、这里又建"的循环，占位框与窗口区域双双滞留。
+                if left_button_down() {
+                    rt.drag_hint = Some(DragHint {
+                        fence,
+                        requested: cand,
+                    });
                 }
             }
         }
@@ -1414,6 +1493,11 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
 
     // 重绘门控落点：无可见变化的事件直接返回 None（overlay 保持当前命中模型
     // 与区域），省掉一次 build_scene + D2D 全量绘制 + commit。
+    // 占位框刚被清除时必须重绘一帧：命中模型携带窗口区域，不重建就不会收缩，
+    // 那块区域会继续吞掉桌面点击（清理与区域更新必须同一帧闭环）。
+    if reserved_changed {
+        redraw = true;
+    }
     if !redraw {
         return None;
     }
@@ -1461,10 +1545,13 @@ fn apply_theme_scale(theme: &mut Theme, scale: f32) {
 /// 栅栏当前实际高度（物理像素）：`bounds.h > 0` 为固定高度；否则（自动高度）用
 /// 最近一次布局渲染高度。碰撞检测与夹屏都必须按真实高度入算——自动高度栅栏
 /// `bounds.h == 0`，直接当 0 高会把碰撞检测和夹屏一起带偏。
+///
+/// 口径唯一真源是 `Fence::collision_height`（core），本函数只负责把 App 层的
+/// 旁路高度表 `last_layout_h` 喂进去。
 fn fence_height(rt: &Runtime, i: usize) -> f32 {
     match rt.desk.fences.get(i) {
-        Some(f) if f.bounds.h > 0.0 => f.bounds.h,
-        _ => rt.last_layout_h.get(i).copied().unwrap_or(0.0),
+        Some(f) => f.collision_height(rt.last_layout_h.get(i).copied().unwrap_or(0.0)),
+        None => 0.0,
     }
 }
 
@@ -1784,4 +1871,70 @@ fn cursor_screen() -> (i32, i32) {
         let _ = GetCursorPos(&mut pt);
     }
     (pt.x, pt.y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 占位框安全网的自检：白名单必须精确覆盖"拖动中会上报的事件"，其余一律清理。
+    ///
+    /// 这份断言的真正价值在于——将来新增 `OverlayEvent` 变体时若忘了考虑占位框，
+    /// 新变体会默认落入"清理"一侧（安全方向），而本测试会立刻暴露白名单的漂移。
+    #[test]
+    fn drag_hint_whitelist_covers_only_drag_events() {
+        // 拖动进行中会上报 → 保留
+        assert!(keeps_drag_hint(&OverlayEvent::FenceMove {
+            fence: 0,
+            pos: (1.0, 2.0)
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::FenceResize {
+            fence: 0,
+            zone: ResizeZone::BottomRight,
+            rect: (0.0, 0.0, 10.0, 10.0)
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::FenceScroll {
+            fence: 0,
+            delta: 120
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::KeyDown {
+            vk: 27,
+            ctrl: false
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::AnimTick));
+        assert!(keeps_drag_hint(&OverlayEvent::SyncLibrary));
+        assert!(keeps_drag_hint(&OverlayEvent::CursorMove {
+            x: 1.0,
+            y: 2.0
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::CursorLeave));
+        assert!(keeps_drag_hint(&OverlayEvent::HoverEnter {
+            fence: 0,
+            icon: 0
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::HoverLeave));
+
+        // 意味着拖动已结束 → 必须清理（否则占位框滞留、区域继续吞桌面点击）
+        assert!(!keeps_drag_hint(&OverlayEvent::FenceDragEnd { fence: 0 }));
+        assert!(!keeps_drag_hint(&OverlayEvent::ContextMenu {
+            fence: 0,
+            icon: None,
+            pos: (0.0, 0.0)
+        }));
+        assert!(!keeps_drag_hint(&OverlayEvent::FenceCollapseToggle {
+            fence: 0
+        }));
+        assert!(!keeps_drag_hint(&OverlayEvent::IconClicked {
+            fence: 0,
+            icon: 0,
+            ctrl: false
+        }));
+        assert!(!keeps_drag_hint(&OverlayEvent::TrayMenu));
+        assert!(!keeps_drag_hint(&OverlayEvent::DisplayChange));
+        assert!(!keeps_drag_hint(&OverlayEvent::OverlayFocusLost));
+        assert!(!keeps_drag_hint(&OverlayEvent::FilesDropped {
+            fence: 0,
+            paths: vec![]
+        }));
+    }
 }

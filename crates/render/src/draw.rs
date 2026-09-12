@@ -14,9 +14,11 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1Bitmap, ID2D1RenderTarget, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_ELLIPSE, D2D1_LAYER_PARAMETERS, D2D1_ROUNDED_RECT,
+    ID2D1Bitmap, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+    D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    D2D1_ELLIPSE, D2D1_LAYER_PARAMETERS, D2D1_LINE_JOIN_ROUND, D2D1_ROUNDED_RECT,
+    D2D1_STROKE_STYLE_PROPERTIES,
 };
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory, IDWriteTextFormat, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -32,6 +34,7 @@ use sylva_shell::icons::IconData;
 use crate::overlay::{ConsoleZone, RectF};
 use crate::scene::{
     ListColumns, Scene, SceneConsole, SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow,
+    SceneReserved,
 };
 use crate::theme::{TextStyle, Theme, GRID_CAPTION_H_MULT};
 
@@ -156,6 +159,12 @@ pub fn draw_scene(
         label: unsafe { target.CreateSolidColorBrush(&theme.label.color.to_d2d(), None)? },
     };
 
+    // 收起栅栏的原大小占位框：画在**全部栅栏之下**（它表示"这里仍被原尺寸占着"，
+    // 是地板说明，不该压住任何真实内容）。仅拖动期间非空。
+    for r in &scene.reserved {
+        draw_reserved(target, theme, r)?;
+    }
+
     for fence in &scene.fences {
         draw_fence(target, theme, fence, &brushes, icons, formats)?;
     }
@@ -167,6 +176,67 @@ pub fn draw_scene(
         draw_inline_edit(target, theme, edit, formats)?;
     }
     Ok(())
+}
+
+/// 收起栅栏的「原大小占位框」：虚线圆角描边 + 极淡填充。
+///
+/// 它不承载任何交互（不进命中模型，只并入窗口区域与合成表面），纯粹把"收起后
+/// 仍按原矩形参与碰撞/夹屏"这一不可见约束画出来——用户才不会觉得在撞空气墙。
+///
+/// 描边宽度与虚线花纹都随 `theme.scale` 缩放：渲染层一律物理像素，只放文字/
+/// 只放线宽中的任一项都会在高低 DPI 之间出现比例失真。
+fn draw_reserved(target: &ID2D1RenderTarget, theme: &Theme, r: &SceneReserved) -> Result<()> {
+    let rect = r.rect;
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return Ok(());
+    }
+    let rr = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: rect.x,
+            top: rect.y,
+            right: rect.x + rect.w,
+            bottom: rect.y + rect.h,
+        },
+        // 圆角与栅栏本体一致：用户能直观认出"这就是那个栅栏展开后的位置"
+        radiusX: theme.fence_corner_radius,
+        radiusY: theme.fence_corner_radius,
+    };
+    if let Some(fill) = r.fill_color {
+        if fill[3] > 0.0 {
+            let brush = unsafe { target.CreateSolidColorBrush(&color(fill), None)? };
+            unsafe { target.FillRoundedRectangle(&rr, &brush) };
+        }
+    }
+    if r.stroke_color[3] <= 0.0 {
+        return Ok(());
+    }
+    let width = (1.0 * theme.scale).max(1.0);
+    let style = dashed_stroke_style(target)?;
+    let brush = unsafe { target.CreateSolidColorBrush(&color(r.stroke_color), None)? };
+    unsafe { target.DrawRoundedRectangle(&rr, &brush, width, Some(&style)) };
+    Ok(())
+}
+
+/// 虚线描边样式：`4w 实 / 3w 虚`（`dashes` 的长度单位是**描边宽度的倍数**，D2D 约定）。
+///
+/// 每帧创建：拖动的每一帧本就会重建全部画笔（渲染目标每帧重建），同量级开销；
+/// 缓存它反而要引入设备无关资源的所有权管理，得不偿失。
+fn dashed_stroke_style(target: &ID2D1RenderTarget) -> Result<ID2D1StrokeStyle> {
+    let props = D2D1_STROKE_STYLE_PROPERTIES {
+        startCap: D2D1_CAP_STYLE_FLAT,
+        endCap: D2D1_CAP_STYLE_FLAT,
+        dashCap: D2D1_CAP_STYLE_FLAT,
+        lineJoin: D2D1_LINE_JOIN_ROUND,
+        miterLimit: 1.0,
+        dashStyle: D2D1_DASH_STYLE_DASH,
+        dashOffset: 0.0,
+    };
+    let dashes = [4.0f32, 3.0f32];
+    unsafe {
+        target
+            .GetFactory()?
+            .CreateStrokeStyle(&props, Some(&dashes))
+    }
 }
 
 /// 控制中心：玻璃卡片面板（栅栏管理）。关闭后完全不渲染（不留残影）。

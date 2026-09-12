@@ -96,6 +96,14 @@ $env:SYLVA_AUTOSTOP_MS="2000"; .\target\debug\sylva.exe
     - **证据**：[`crates/app/src/main.rs:201`](file:///g:/Codes/sylva/crates/app/src/main.rs#L201)、[`crates/render/src/lib.rs:20-22`](file:///g:/Codes/sylva/crates/render/src/lib.rs#L20-L22)。
     - **原因**：背景模糊由 WinRT DWM GPU 实时渲染，无截屏高斯。所有补间动画（`AnimTick`）结束后必须立刻停用 `WM_TIMER`，空闲时不得占用 CPU 周期。
 
+11. **收起栅栏的「原大小占位框」必须同时并入窗口区域与合成表面，且必须白名单式清理**
+    - **证据**：[`crates/app/src/scene.rs`](file:///g:/Codes/sylva/crates/app/src/scene.rs)（`reserved_frames`）、[`crates/render/src/overlay.rs`](file:///g:/Codes/sylva/crates/render/src/overlay.rs)（`build_region`）、[`crates/render/src/scene.rs`](file:///g:/Codes/sylva/crates/render/src/scene.rs)（`content_rect`）。
+    - **原因**：折叠只改变视觉高度，碰撞/夹屏仍按原矩形计算；拖动期间把该矩形画成虚线淡框，用户才不会觉得在撞空气墙。两个裁剪口缺一不可——**窗口区域（`SetWindowRgn`）之外既不渲染也不收事件**，**合成表面按 `content_rect` 裁剪**，漏任一处都表现为「框看不见」。而并入窗口区域意味着该区域短暂不再点击穿透，所以占位框只在拖动期间存在，并由 App 层**白名单式清理**（只有 `FenceMove` 等拖动事件保留，其余任何事件 + 左键已松开都清空），清理后必须强制重绘一帧让区域收缩——否则滞留的占位框会持续吞掉那块区域的桌面点击。
+
+12. **碰撞口径唯一真源是 `Fence::collision_rect`**
+    - **证据**：[`crates/core/src/model.rs`](file:///g:/Codes/sylva/crates/core/src/model.rs)（`collision_height` / `collision_rect`）。
+    - **原因**：`bounds.h > 0` 为手动缩放的固定高度，`bounds.h <= 0` 为自动高度（真实高度由 App 层旁路表 `last_layout_h` 提供）。拖动、避让、启动重叠消解、占位框提示必须共用同一函数——历史上 `FenceMove` 直接取 `bounds.h`，自动高度栅栏退化成 0 高后自身漏检邻居、还能被拖出屏幕。
+
 ---
 
 ## 边界与禁区

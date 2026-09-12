@@ -261,6 +261,10 @@ pub struct HitModel {
     /// 当前内联编辑框矩形（浮于栅栏之上）：点击内部用于定位光标，不再落到
     /// 下面的栅栏/图标（否则会误触发「点击别处提交编辑」）。
     pub edit_rect: Option<RectF>,
+    /// 收起栅栏的「原大小占位框」矩形：**只并入窗口区域**（`SetWindowRgn`），
+    /// 绝不参与命中判定——区域外既不渲染也不接收事件，不并入就画不出来；
+    /// 而并入又意味着该区域短暂不再穿透，故仅拖动期间存在（见 App 层 `drag_hint`）。
+    pub reserved: Vec<RectF>,
 }
 
 /// 缩放拖拽所作用的栅栏区域（决定改宽 / 改高 / 是否随动左上角）。
@@ -957,8 +961,8 @@ fn apply_region(hwnd: HWND, model: &HitModel, cached: &mut Option<HRGN>) {
     *cached = Some(rgn);
 }
 
-/// 把全部栅栏矩形 + 侧边栏工具提示 + 内联编辑框 + 控制台面板合并成一个区域
-/// （RGN_OR 并集）。无有效矩形时返回 None。
+/// 把全部栅栏矩形 + 侧边栏工具提示 + 内联编辑框 + 占位框 + 控制台面板合并成一个
+/// 区域（RGN_OR 并集）。无有效矩形时返回 None。
 fn build_region(model: &HitModel) -> Option<HRGN> {
     let mut acc: Option<HRGN> = None;
     for f in &model.fences {
@@ -971,6 +975,11 @@ fn build_region(model: &HitModel) -> Option<HRGN> {
     // 否则框内点击穿透到桌面、光标定位收不到。
     if let Some(er) = model.edit_rect {
         add_rect(&mut acc, er);
+    }
+    // 占位框：大于收起后的可见体，不并入就被区域裁掉（完全看不见）。
+    // 它不进入 `model.fences`，故不会产生命中热区。
+    for r in &model.reserved {
+        add_rect(&mut acc, *r);
     }
     if let Some(c) = &model.console {
         add_rect(&mut acc, c.rect);
@@ -2420,10 +2429,32 @@ mod tests {
             icons: vec![],
             console: None,
             edit_rect: None,
+            reserved: vec![],
         };
         let rgn = build_region(&model).expect("有栅栏就应有区域");
+
+        // 并入一个落在全部栅栏之外的占位框：区域必须随之改变——占位框大于收起后的
+        // 可见体，不进区域就会被 `SetWindowRgn` 裁掉（完全看不见）。
+        let only_reserved = HitModel {
+            fences: vec![],
+            icons: vec![],
+            console: None,
+            edit_rect: None,
+            reserved: vec![RectF {
+                x: 400.0,
+                y: 400.0,
+                w: 120.0,
+                h: 200.0,
+            }],
+        };
+        let rgn_reserved = build_region(&only_reserved).expect("只有占位框也应构成区域");
         unsafe {
+            assert!(
+                EqualRgn(rgn, rgn_reserved) != TRUE,
+                "占位框必须并入窗口区域，否则会被区域裁掉"
+            );
             let _ = DeleteObject(rgn.into());
+            let _ = DeleteObject(rgn_reserved.into());
         }
     }
 
@@ -2497,6 +2528,35 @@ mod tests {
             icons: vec![],
             console: None,
             edit_rect: None,
+            reserved: vec![],
+        }
+    }
+
+    /// 构造单栅栏命中模型（(100,100) 200x200，标题栏高 36）+ 一个落在栅栏之外的占位框。
+    fn model_with_reserved(reserved: Vec<RectF>) -> HitModel {
+        HitModel {
+            reserved,
+            ..model_with_collapse_button(None)
+        }
+    }
+
+    #[test]
+    fn reserved_rect_joins_region_but_is_not_a_hit_target() {
+        // 占位框只是「可见的碰撞提示」：并入窗口区域以能绘制，但绝不能被当成
+        // 栅栏/图标命中——否则会出现看不见却能点的幽灵热区。
+        let model = model_with_reserved(vec![RectF {
+            x: 100.0,
+            y: 100.0,
+            w: 200.0,
+            h: 400.0,
+        }]);
+        // 落在标题栏之外、占位框之内的点：不可命中任何栅栏/图标/折叠目标
+        assert_eq!(hover_key(&model, 200.0, 450.0), None);
+        assert_eq!(collapse_target_at(&model, 200.0, 450.0), None);
+        // 同一模型并入占位框后仍能构建区域（说明它只影响区域，不影响命中集合）
+        let rgn = build_region(&model).expect("应能构建区域");
+        unsafe {
+            let _ = DeleteObject(rgn.into());
         }
     }
 

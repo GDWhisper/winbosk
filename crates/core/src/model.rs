@@ -488,6 +488,35 @@ pub struct Fence {
     pub collapsed: bool,
 }
 
+impl Fence {
+    /// 碰撞 / 夹屏用的真实高度（物理像素）。
+    ///
+    /// `bounds.h > 0` = 用户手动缩放过的固定高度；`bounds.h <= 0` = 自动高度，真实高度
+    /// 由最近一次布局回写的 `layout_h` 提供（0 高当真实高度用会把碰撞检测与夹屏一起带偏）。
+    ///
+    /// **收起态不改变本口径**：折叠只影响视觉高度，原矩形始终是碰撞占位的依据——
+    /// 否则展开时会与其他栅栏重叠，而展开并不做重新避让。
+    pub fn collision_height(&self, layout_h: f32) -> f32 {
+        if self.bounds.h > 0.0 {
+            self.bounds.h
+        } else {
+            layout_h
+        }
+    }
+
+    /// 碰撞 / 夹屏用的真实矩形：左上角与宽度取 `bounds`，高度按 [`Self::collision_height`]。
+    ///
+    /// 这是全工程唯一的碰撞口径真源（拖动、避让、启动重叠消解、占位框提示共用）。
+    pub fn collision_rect(&self, layout_h: f32) -> Rect {
+        Rect::new(
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.w,
+            self.collision_height(layout_h),
+        )
+    }
+}
+
 /// 图标元数据。核心层只关心标识与展示信息。
 ///
 /// 新增字段均带 `#[serde(default)]`，保证旧版 `desk.json` 能加载。
@@ -1488,5 +1517,48 @@ mod tests {
         let fence2: Fence =
             serde_json::from_str(new_json).expect("包含 collapsed: true 应可成功反序列化");
         assert!(fence2.collapsed);
+    }
+
+    fn fence_with_h(h: f32, collapsed: bool) -> Fence {
+        Fence {
+            id: 1,
+            title: Some("t".into()),
+            monitor_id: 0,
+            bounds: Rect::new(10.0, 20.0, 300.0, h),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed,
+        }
+    }
+
+    #[test]
+    fn collision_rect_prefers_bounds_then_layout_height() {
+        // 固定高度（用户手动缩放过）：用 bounds.h
+        let fixed = fence_with_h(200.0, false);
+        assert_eq!(fixed.collision_height(999.0), 200.0);
+        // 自动高度（bounds.h <= 0）：用最近一次布局回写的真实高度
+        let auto = fence_with_h(0.0, false);
+        assert_eq!(auto.collision_height(180.0), 180.0);
+        assert_eq!(
+            auto.collision_rect(180.0),
+            Rect::new(10.0, 20.0, 300.0, 180.0)
+        );
+    }
+
+    #[test]
+    fn collision_rect_is_unaffected_by_collapse() {
+        // 收起只改视觉高度：碰撞口径必须保持原矩形，否则展开时会与邻居重叠
+        //（展开不做重新避让）。
+        let expanded = fence_with_h(200.0, false);
+        let collapsed = fence_with_h(200.0, true);
+        assert_eq!(
+            expanded.collision_rect(200.0),
+            collapsed.collision_rect(200.0)
+        );
     }
 }

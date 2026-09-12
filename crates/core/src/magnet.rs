@@ -88,6 +88,15 @@ fn gap_separated(a: &Rect, b: &Rect, gap: f32) -> bool {
     clearance_x(a, b) >= gap || clearance_y(a, b) >= gap
 }
 
+/// 候选矩形是否被 `other` 拒绝（两者间距不足 `gap`）——即该位置不会被采纳。
+///
+/// 判据与 [`settle_move`] 内部的 `gap_separated` **完全同源**：本函数只对外暴露
+/// 「谁挡住了这次移动」这一事实，供交互层把不可见的碰撞约束可视化（UI 提示），
+/// 不参与任何几何求解。若将来调整移动判据，两处必须同时改，否则提示会与实际阻挡脱节。
+pub fn blocks_move(cand: &Rect, other: &Rect, gap: f32) -> bool {
+    !gap_separated(cand, other, gap)
+}
+
 /// 为让水平空隙达到 `gap`，沿 x 需要施加的位移（仅当推离方向明确时返回非 0）。
 fn gap_push_x(r: &Rect, o: &Rect, gap: f32) -> f32 {
     if r.right() <= o.x {
@@ -475,5 +484,52 @@ mod tests {
         assert!(FreeSides::Left.left_free() && !FreeSides::Left.right_free());
         assert!(FreeSides::BottomLeft.left_free() && FreeSides::BottomLeft.bottom_free());
         assert!(!FreeSides::BottomLeft.top_free() && !FreeSides::BottomLeft.right_free());
+    }
+
+    #[test]
+    fn blocks_move_matches_gap_separated() {
+        let g = gap();
+        let o = Rect::new(500.0, 200.0, 200.0, 100.0);
+        // 完全叠在邻居上 → 阻挡
+        assert!(blocks_move(&Rect::new(520.0, 220.0, 200.0, 100.0), &o, g));
+        // 水平净空隙不足 gap → 阻挡
+        assert!(blocks_move(&Rect::new(494.0, 200.0, 200.0, 100.0), &o, g));
+        // 恰好等于 gap → 不算阻挡（与 gap_separated 的 `>=` 判据一致）
+        assert!(!blocks_move(&Rect::new(288.0, 200.0, 200.0, 100.0), &o, g));
+        // 任一轴分开超过 gap → 不算阻挡
+        assert!(!blocks_move(&Rect::new(800.0, 200.0, 200.0, 100.0), &o, g));
+        assert!(!blocks_move(&Rect::new(500.0, 400.0, 200.0, 100.0), &o, g));
+    }
+
+    #[test]
+    fn blocks_move_on_degenerate_rects_does_not_panic() {
+        let g = gap();
+        let o = Rect::new(500.0, 200.0, 200.0, 100.0);
+        // 零面积候选：水平重叠且 y 落在邻居范围内 → 仍判为阻挡（与 settle_move 同判据）
+        let zero = Rect::new(550.0, 250.0, 0.0, 0.0);
+        assert_eq!(blocks_move(&zero, &o, g), !gap_separated(&zero, &o, g));
+        // 零面积候选远离邻居 → 不阻挡
+        assert!(!blocks_move(&Rect::new(0.0, 0.0, 0.0, 0.0), &o, g));
+    }
+
+    #[test]
+    fn blocks_move_agrees_with_settle_move_when_away_from_screen_edges() {
+        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let g = gap();
+        let cand = Rect::new(400.0, 200.0, 200.0, 100.0);
+        let cases = [
+            Rect::new(500.0, 200.0, 200.0, 100.0), // 水平压住
+            Rect::new(300.0, 240.0, 200.0, 100.0), // 垂直压住
+            Rect::new(380.0, 180.0, 200.0, 100.0), // 双轴压住
+            Rect::new(900.0, 600.0, 200.0, 100.0), // 完全分离
+            Rect::new(610.0, 200.0, 200.0, 100.0), // 净空隙 10 < gap，仍算阻挡
+            Rect::new(612.0, 200.0, 200.0, 100.0), // 净空隙正好 = gap，不算阻挡
+        ];
+        for o in cases {
+            let blocked = blocks_move(&cand, &o, g);
+            let settled = settle_move(&cand, &[o], &screen, g);
+            // 距屏幕边界足够远：判为阻挡 ⇔ 求解结果确实被改变
+            assert_eq!(blocked, settled != cand, "rect={o:?}");
+        }
     }
 }

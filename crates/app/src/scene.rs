@@ -1,7 +1,7 @@
 //! 场景构建：从领域模型 + 主题排布出渲染场景（栅栏/侧边栏/控制台/命中模型）。
 
 use crate::*;
-use sylva_render::scene::ReorderDrag;
+use sylva_render::scene::{ReorderDrag, SceneReserved};
 pub(crate) fn system_dark_mode() -> bool {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
     let subkey = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
@@ -229,10 +229,8 @@ pub(crate) fn build_scene(rt: &mut Runtime, now: Instant) -> Scene {
             sf.collapse_btn = Some(btn_rect);
 
             if f.collapsed {
-                let title_h =
-                    (rt.theme.title.size * 1.6 + rt.theme.title_padding_bottom + 2.0 * pad).round();
                 sf.collapsed = true;
-                sf.height = title_h;
+                sf.height = collapsed_title_h(&rt.theme, &f.appearance);
                 sf.icons.clear();
                 sf.scroll_max = 0.0;
                 sf.scroll_view = 0.0;
@@ -253,6 +251,15 @@ pub(crate) fn build_scene(rt: &mut Runtime, now: Instant) -> Scene {
     // 侧边栏 Dock 放大（第二遍：全部栅栏真实几何已就绪，光标若落在其他栅栏内则
     // 不放大，避免影响半径越过网格/列表抢走它们的悬停焦点）。
     build_dock_magnify(rt, &mut scene.fences);
+    // 收起栅栏的原大小占位框（仅拖动期间非空）。放在最后计算：`last_layout_h`
+    // 已由上面的循环回写为本帧真实展开高度，占位矩形才与碰撞入参同帧一致。
+    scene.reserved = reserved_frames(
+        &rt.desk,
+        &rt.last_layout_h,
+        rt.drag_hint.as_ref(),
+        &rt.theme,
+        alpha,
+    );
     // 控制中心：关闭后完全不渲染（不留胶囊）；展开动画期间 panel > 0 才画。
     let panel = rt.console_anim.panel;
     if rt.desk.console_open || panel > 0.01 {
@@ -271,6 +278,103 @@ pub(crate) fn build_scene(rt: &mut Runtime, now: Instant) -> Scene {
         comp: e.comp.clone(),
     });
     scene
+}
+
+/// 收起态栅栏的可见高度（只剩标题栏）。
+///
+/// `build_scene` 的收窄与占位框"是否还有信息量"的判定共用本公式：任何一处单独改动
+/// 都会让占位框在"该显示时不显示"或"占位≈可见仍在画"之间漂移。
+pub(crate) fn collapsed_title_h(theme: &Theme, appearance: &FenceAppearance) -> f32 {
+    let pad = appearance.padding * theme.scale;
+    (theme.title.size * 1.6 + theme.title_padding_bottom + 2.0 * pad).round()
+}
+
+/// 占位框提示色（与控制台 UI 同一强调色）：不随系统明暗主题变黑白，否则在
+/// 深色壁纸上会整个消失；蓝色虚线在明暗壁纸上都能读出"这是 UI 提示"。
+const RESERVED_RGB: [f32; 3] = [0.23, 0.51, 0.96];
+/// 描边 / 填充的基础不透明度（再乘场景 alpha，与栅栏同步淡出）。
+const RESERVED_STROKE_A: f32 = 0.55;
+const RESERVED_FILL_A: f32 = 0.07;
+
+/// 计算本帧要绘制的「原大小占位框」。
+///
+/// 两个来源（用户定的语义）：
+/// 1. **被拖动的栅栏**若处于收起态 → 画它自己的原矩形：说明"它仍按原尺寸占着这里"，
+///    所以屏幕下沿/邻居处的卡位不是 bug；
+/// 2. **拒绝了本次请求位置**的其它收起栅栏 → 画它的原矩形：回答"是谁挡住了我"。
+///
+/// 判据与碰撞求解严格同源：位置判定走 `magnet::blocks_move`（与 `settle_move`
+/// 内部同一谓词），矩形走 `Fence::collision_rect`（全工程唯一碰撞口径真源）。
+/// 纯函数（不触碰 Runtime / Win32），便于单测。
+///
+/// 已知的轻微过报：`blocks_move` 只看"这次请求与它够不够远"，而 `settle_move` 的推挤
+/// 方向有主次之分（贴屏幕边缘时推挤还可能被夹屏撤销）。因此极少数边缘情形会画出
+/// 一个其实没起决定作用的栅栏的框。取舍是刻意的——**宁可多提示一帧，也不漏报**：
+/// 漏报的代价是用户又撞上无法解释的空气墙，多提示的代价只是多一个淡框。
+pub(crate) fn reserved_frames(
+    desk: &Desk,
+    last_layout_h: &[f32],
+    hint: Option<&DragHint>,
+    theme: &Theme,
+    alpha: f32,
+) -> Vec<SceneReserved> {
+    let Some(hint) = hint else {
+        return Vec::new();
+    };
+    // 桌面切换淡出到不可见时不画：与栅栏同步，避免"栅栏没了框还在"
+    let a = alpha.clamp(0.0, 1.0);
+    if a <= 0.01 {
+        return Vec::new();
+    }
+    let layout_h = |i: usize| last_layout_h.get(i).copied().unwrap_or(0.0);
+    let mut out = Vec::new();
+
+    if let Some(f) = desk.fences.get(hint.fence) {
+        let rect = f.collision_rect(layout_h(hint.fence));
+        if worth_marking(f, &rect, theme) {
+            out.push(reserved_frame(hint.fence, rect, a));
+        }
+    }
+    for (i, f) in desk.fences.iter().enumerate() {
+        if i == hint.fence {
+            continue;
+        }
+        let rect = f.collision_rect(layout_h(i));
+        if !worth_marking(f, &rect, theme) {
+            continue;
+        }
+        if sylva_core::magnet::blocks_move(&hint.requested, &rect, FENCE_GAP) {
+            out.push(reserved_frame(i, rect, a));
+        }
+    }
+    out
+}
+
+/// 是否值得为该栅栏画占位框。
+///
+/// 复合判定（缺一不可）：**收起** + 非侧边栏（Dock 不支持折叠）+ 几何有效 +
+/// 占位明显高于收起后的可见体（几乎相等时画出来只是噪音）。
+fn worth_marking(f: &Fence, rect: &Rect, theme: &Theme) -> bool {
+    f.collapsed
+        && f.appearance.layout != FenceLayout::Sidebar
+        && rect.w > 0.0
+        && rect.h > collapsed_title_h(theme, &f.appearance) + 4.0
+}
+
+/// 组装一个占位框（颜色在此统一派生，渲染层只管画）。
+fn reserved_frame(fence: usize, rect: Rect, alpha: f32) -> SceneReserved {
+    let tint = |a: f32| [RESERVED_RGB[0], RESERVED_RGB[1], RESERVED_RGB[2], a * alpha];
+    SceneReserved {
+        rect: RectF {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+        },
+        fence,
+        stroke_color: tint(RESERVED_STROKE_A),
+        fill_color: Some(tint(RESERVED_FILL_A)),
+    }
 }
 
 /// 控制中心内容总高度（自适应，不含屏幕夹制）。
@@ -1665,6 +1769,9 @@ pub(crate) fn hit_model_from(theme: &Theme, scene: &Scene, _desk: &Desk) -> HitM
         console,
         // 内联编辑框浮于栅栏之上：overlay 据此把框内点击路由到 EditCaret（定位光标）
         edit_rect: scene.edit.as_ref().map(|e| e.rect),
+        // 占位框只并入窗口区域（区域外画不出来），不进入 `fences` —— 它绝不能
+        // 变成命中热区，否则会出现"看不见却能点"的死区。
+        reserved: scene.reserved.iter().map(|r| r.rect).collect(),
     }
 }
 
@@ -2037,5 +2144,107 @@ mod tests {
             tiny.h,
             CONSOLE_MIN_H
         );
+    }
+
+    /// 收起态栅栏的碰撞矩形（供占位框测试）。
+    fn collapsed_grid_fence(x: f32, y: f32) -> Fence {
+        let mut f = test_fence(FenceLayout::Grid);
+        f.bounds = Rect::new(x, y, 300.0, 400.0);
+        f.collapsed = true;
+        f
+    }
+
+    /// 占位框的出现条件：被拖动的收起栅栏 + 拒绝了本次请求位置的收起栅栏。
+    /// 几何必须等于碰撞矩形本身（同源），否则提示会与实际阻挡脱节。
+    #[test]
+    fn reserved_frames_follow_drag_and_blockers() {
+        use sylva_core::config::AppSettings;
+        let theme = Theme::default();
+        let mut desk = Desk::new(AppSettings::default());
+        desk.fences.push(collapsed_grid_fence(500.0, 200.0)); // 被拖的（原尺寸 300x400）
+        desk.fences.push(collapsed_grid_fence(900.0, 200.0)); // 挡路的
+        let layout_h = vec![400.0, 400.0];
+
+        // 无拖动 → 一个都不画
+        assert!(reserved_frames(&desk, &layout_h, None, &theme, 1.0).is_empty());
+
+        // 桌面切换淡出到不可见 → 不画（与栅栏同步）
+        let hint = DragHint {
+            fence: 1,
+            requested: Rect::new(560.0, 200.0, 300.0, 400.0),
+        };
+        assert!(reserved_frames(&desk, &layout_h, Some(&hint), &theme, 0.0).is_empty());
+
+        // 拖动 1 号压向 0 号：自己的占位框 + 挡路者的占位框
+        let frames = reserved_frames(&desk, &layout_h, Some(&hint), &theme, 1.0);
+        assert_eq!(frames.len(), 2, "自身 + 挡路者各一个");
+        assert_eq!(frames[0].fence, 1, "先列被拖动的栅栏");
+        assert_eq!(frames[1].fence, 0, "再列挡住它的收起栅栏");
+        assert_eq!(
+            frames[1].rect,
+            RectF {
+                x: 500.0,
+                y: 200.0,
+                w: 300.0,
+                h: 400.0
+            },
+            "占位矩形必须等于碰撞矩形（同源）"
+        );
+        assert!(frames[1].stroke_color[3] > 0.0);
+        assert!(
+            frames[1].fill_color.expect("应带极淡填充")[3] < frames[1].stroke_color[3],
+            "填充必须比描边更淡"
+        );
+
+        // 请求位置远离 0 号 → 只剩被拖的自己（不再误报"挡路"）
+        let far = DragHint {
+            fence: 1,
+            requested: Rect::new(1600.0, 800.0, 300.0, 400.0),
+        };
+        let frames = reserved_frames(&desk, &layout_h, Some(&far), &theme, 1.0);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].fence, 1);
+    }
+
+    /// 展开态与侧边栏都不画占位框：前者视觉=模型无需解释，后者不支持折叠
+    ///（即便配置里残留了 collapsed 标记）。
+    #[test]
+    fn reserved_frames_skips_expanded_and_sidebar() {
+        use sylva_core::config::AppSettings;
+        let theme = Theme::default();
+        let mut desk = Desk::new(AppSettings::default());
+        let mut expanded = test_fence(FenceLayout::Grid);
+        expanded.bounds = Rect::new(100.0, 100.0, 300.0, 400.0);
+        desk.fences.push(expanded);
+        let mut dock = test_fence(FenceLayout::Sidebar);
+        dock.bounds = Rect::new(0.0, 0.0, 168.0, 400.0);
+        dock.collapsed = true;
+        desk.fences.push(dock);
+
+        let hint = DragHint {
+            fence: 0,
+            requested: Rect::new(100.0, 100.0, 300.0, 400.0),
+        };
+        assert!(reserved_frames(&desk, &[400.0, 400.0], Some(&hint), &theme, 1.0).is_empty());
+    }
+
+    /// 原矩形与收起后的可见高度几乎一致时不画：那只是噪音，没有要解释的约束。
+    #[test]
+    fn reserved_frames_skips_negligible_height_gap() {
+        use sylva_core::config::AppSettings;
+        let theme = Theme::default();
+        let mut desk = Desk::new(AppSettings::default());
+        let mut f = test_fence(FenceLayout::Grid);
+        let title_h = collapsed_title_h(&theme, &f.appearance);
+        let h = title_h + 2.0;
+        f.bounds = Rect::new(100.0, 100.0, 300.0, h);
+        f.collapsed = true;
+        desk.fences.push(f);
+
+        let hint = DragHint {
+            fence: 0,
+            requested: Rect::new(100.0, 100.0, 300.0, h),
+        };
+        assert!(reserved_frames(&desk, &[h], Some(&hint), &theme, 1.0).is_empty());
     }
 }
