@@ -293,10 +293,14 @@
    建议保留硬约束、把例外显式化并给预算：「空闲期主线程除库同步心跳外不得有周期性唤醒；
    心跳 ≤ 1 次 / 4s，单次 ≤ X ms」。
 2. **做 C2-a**（十几行、零行为变更）：`should_mirror` 改用目录项自带属性。
-   **已于 2026-09-13 实施**（`crates/app/src/file_ops.rs`：`list_dir_entries` 改为返回
-   `DirEntry`、`should_mirror` 改读缓存属性）。代码可编译且无警告，但**四道门禁尚未跑完**
-   ——实施时工作树里有另一路并发改动（`crates/render/src/*`）正处于不可编译的中间态，
-   门禁与提交需等树静下来后补。
+   **已于 2026-09-13 实施并提交**（`7629ff7`，`crates/app/src/file_ops.rs`：
+   `list_dir_entries` 改为返回 `DirEntry`、`should_mirror` 改读缓存属性）。
+   门禁：`cargo test --workspace` 151 passed / 0 failed、`cargo clippy --workspace
+   -- -D warnings` 零警告、`cargo fmt --all -- --check` 通过；`cargo build --workspace`
+   编译层干净，但最终链接 `deps\sylva.exe` 报 `LNK1104` —— 当时另一会话正在运行
+   debug 实例（`target\debug\sylva.exe`）占用输出文件，属环境占用。
+   **注意**：§3.2 那个「~5 ms → ~0.3 ms」是**推算**（由 141 次属性查询的独立实测
+   ≈5.21 ms 与心跳实测 4.2~6.7 ms 推出），**尚未在新二进制上直接复测**。
 3. **做 C2-b**（约半小时）：心跳条件化降频，顺带缓解 §1.3 的线性增长。
 4. **方案 A/E 留待有明确需求时**（用户抱怨同步延迟 / 要把电池影响做实），
    届时单独出 plan + 独立审查。
