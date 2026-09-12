@@ -1941,4 +1941,37 @@ mod tests {
         // 5. 边界：只剩 1 个栅栏并被删除，剩余 0 个：钳制为 0
         assert_eq!(adjust_selected_fence_on_delete(0, 0, 0), 0);
     }
+
+    /// 守住「`12.0 * s.clamp(MIN_H*s, MAX_H*s)` ≡ 2040·s」笔误回归——曾把面板底部凭空
+    /// 多出约 2040 像素空白，几乎撑满屏幕；这里断言底部留白恰好 `12.0 * s`，且
+    /// 空桌面（无栅栏）下面板总高不超过屏幕一半（4K 屏 2160/2=1080）。
+    #[test]
+    fn console_full_height_no_bogus_bottom_padding() {
+        use sylva_core::{config::AppSettings, model::Desk};
+        let desk = Desk::new(AppSettings::default());
+        let s = 1.0_f32;
+        let full = console_full_height(&desk, 0, s);
+        // 内容底部 = 标题 + 列表(0 行) + 详情 + 四个按钮 + 三处间隙
+        let detail = detail_visible_rows(&desk, 0, s);
+        let rows_h =
+            (desk.fences.len().min(CONSOLE_FENCE_MAX_ROWS)) as f32 * CONSOLE_FENCE_ROW_H * s;
+        let content_bottom = CONSOLE_TITLE_H * s
+            + 8.0 * s
+            + rows_h
+            + 8.0 * s
+            + detail
+            + 8.0 * s
+            + CONSOLE_ADD_BTN_H * s * 4.0
+            + 8.0 * s * 3.0;
+        let bottom_padding = full - content_bottom;
+        assert!(
+            (bottom_padding - 12.0 * s).abs() < 1e-3,
+            "底部留白应恰好 12*s（s=1 时为 12），实测 {bottom_padding}"
+        );
+        // 二道防线：空桌面下总高不应撑过屏幕一半
+        assert!(
+            full < 1080.0,
+            "面板总高 {full} 异常——疑似 clamp 笔误让高度再次爆涨"
+        );
+    }
 }
