@@ -92,9 +92,11 @@ $env:SYLVA_AUTOSTOP_MS="2000"; .\target\debug\sylva.exe
    - **证据**：[`crates/render/src/lib.rs:17-18`](file:///g:/Codes/sylva/crates/render/src/lib.rs#L17-L18)、[`crates/app/src/main.rs:359-363`](file:///g:/Codes/sylva/crates/app/src/main.rs#L359-L363)。
    - **原因**：D2D 渲染目标固定在 96 DPI，所有文字、图标尺寸、行距、列宽、内边距必须同步乘以 `dpi_scale`。单独放大文字字号会导致严重的文字与图标重叠排版事故。
 
-10. **空闲时严格保持 0% CPU — 禁止常驻轮询定时器**
-    - **证据**：[`crates/app/src/main.rs:201`](file:///g:/Codes/sylva/crates/app/src/main.rs#L201)、[`crates/render/src/lib.rs:20-22`](file:///g:/Codes/sylva/crates/render/src/lib.rs#L20-L22)。
-    - **原因**：背景模糊由 WinRT DWM GPU 实时渲染，无截屏高斯。所有补间动画（`AnimTick`）结束后必须立刻停用 `WM_TIMER`，空闲时不得占用 CPU 周期。
+10. **空闲期主线程不得有周期性唤醒 — 唯一的例外是库同步心跳（1 次 / 4s）**
+    - **证据**：[`crates/app/src/main.rs:201`](file:///g:/Codes/sylva/crates/app/src/main.rs#L201)、[`crates/render/src/lib.rs:20-22`](file:///g:/Codes/sylva/crates/render/src/lib.rs#L20-L22)、[`docs/idle-cpu-feasibility.md`](file:///g:/Codes/sylva/docs/idle-cpu-feasibility.md)。
+    - **判据（必须可实测，不要写成纯描述性文字——那样 CI 与人都检查不了）**：用 `QueryThreadCycleTime` 对窗口线程（= 主线程）分桶采样，**非心跳桶必须精确为 0**，心跳桶稳定在 1 次 / 4s。进程级总量只做趋势对比、不设等式：它含 GPU 用户态驱动线程与第三方 Shell 扩展线程，本机实测 0.15%~0.25%，且**同一台机器不同时刻能差近 2 倍**。那些不是本工程能关掉的，既不要拿它们当借口，**也不要再声称"空闲 0% CPU"**。
+    - **原因**：背景模糊由 WinRT DWM GPU 实时渲染，无截屏高斯。所有补间动画（`AnimTick`）结束后必须立刻停用节拍时钟——现役为 `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` 可等待定时器，`SetTimer`/`WM_TIMER` 仅作降级兜底（见 `docs/plans/06-console-reveal-animation.md` §7-§8），空闲时不得占用 CPU 周期。
+    - **历史（为什么这条要写死口径）**：原作者 08-15（`4b74f80`）引入 4s 库同步轮询，13 天后（08-28）又在渲染层写下「空闲时 0% CPU……无刷新定时器」——这条约束**从诞生起就带着例外**，只是此前无人量化，才让"0%"的说法以讹传讹了一个月。
 
 11. **收起栅栏的「原大小占位框」必须同时并入窗口区域与合成表面，且必须白名单式清理**
     - **证据**：[`crates/app/src/scene.rs`](file:///g:/Codes/sylva/crates/app/src/scene.rs)（`reserved_frames`）、[`crates/render/src/overlay.rs`](file:///g:/Codes/sylva/crates/render/src/overlay.rs)（`build_region`）、[`crates/render/src/scene.rs`](file:///g:/Codes/sylva/crates/render/src/scene.rs)（`content_rect`）。
