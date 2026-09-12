@@ -104,6 +104,10 @@ $env:SYLVA_AUTOSTOP_MS="2000"; .\target\debug\sylva.exe
     - **证据**：[`crates/core/src/model.rs`](file:///g:/Codes/sylva/crates/core/src/model.rs)（`collision_height` / `collision_rect`）。
     - **原因**：`bounds.h > 0` 为手动缩放的固定高度，`bounds.h <= 0` 为自动高度（真实高度由 App 层旁路表 `last_layout_h` 提供）。拖动、避让、启动重叠消解、占位框提示必须共用同一函数——历史上 `FenceMove` 直接取 `bounds.h`，自动高度栅栏退化成 0 高后自身漏检邻居、还能被拖出屏幕。
 
+13. **桌面镜像栅栏的「已归属」判据是「归属」，不是「全局图标池」；且桌面 = 用户桌面 + 公共桌面**
+    - **证据**：[`crates/app/src/file_ops.rs`](file:///g:/Codes/sylva/crates/app/src/file_ops.rs)（`mirror_existing_paths` / `mirror_converged` / `desktop_source_dirs`）。
+    - **原因**：启动时的元数据补齐会把**枚举到的每一项**无条件写进 `desk.icons`（无论有没有栅栏归属），所以拿全局池判重会把所有桌面项都误判为「已归属」→ 桌面镜像栅栏**永远为空**；而真实桌面图标已被 `IconGuard` 隐藏、无归属的图标在渲染层又没有任何绘制入口，用户看到的是「桌面全空」。判据必须取「已被任一栅栏持有」（`fences[].icon_ids`）——它同时保证「一键整理」搬进分类栅栏的图标不被镜像抢回。未分组区 `free_icons` **不计入**归属（它没有绘制入口，算归属会让「移出栅栏」的项彻底消失）。源目录是两个：`FOLDERID_Desktop` + `FOLDERID_PublicDesktop`，只扫前者会让 `C:\Users\Public\Desktop` 的公共快捷方式凭空消失；`storage_path` 仍只指向用户桌面（新文件落盘位置与删除语义依赖它）。**同步快路径也必须用「两条子集断言」（`owned ⊆ 磁盘全部条目` 且 `可见条目 ⊆ owned`），禁止改成集合相等**：已归属但被外部置为隐藏的文件会让相等判定永久为假，每 4s 白跑一遍全量注册 + 全量 `exists()` 探测。
+
 ---
 
 ## 边界与禁区

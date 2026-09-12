@@ -66,13 +66,17 @@ pub fn describe(
     }
 }
 
-/// 两个目录字符串是否指向同一处：忽略尾部 `\` / `/` 与 ASCII 大小写。
+/// 两个目录字符串是否指向同一处：忽略分隔符差异（`/` 与 `\`）、尾部 `\` / `/` 与 ASCII 大小写。
+/// 口径与 App 层 `file_ops::dir_eq` 一致——否则「恢复默认」按钮的显隐（本函数）与
+/// 点击后的守卫（`reset_fence_storage`）会给出互相矛盾的结论。
 fn same_dir(a: &str, b: &str) -> bool {
-    fn trim(s: &str) -> &str {
-        s.trim_end_matches(['\\', '/'])
+    fn norm(s: &str) -> String {
+        s.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
     }
-    let (ta, tb) = (trim(a), trim(b));
-    !ta.is_empty() && ta.eq_ignore_ascii_case(tb)
+    let (ta, tb) = (norm(a), norm(b));
+    !ta.is_empty() && ta == tb
 }
 
 /// 中段省略：把过长的路径压成 `C:\…\debug\data\library` 形式。
@@ -203,6 +207,21 @@ mod tests {
             Some("C:\\Users\\me\\Desktop"),
         );
         assert!(!info.can_reset);
+    }
+
+    /// 分隔符风格不一致（正斜杠）也必须判为同一目录：与 App 层 `dir_eq` 同口径，
+    /// 否则控制中心会给出一个点了必然被守卫拒绝的「恢复默认」按钮。
+    #[test]
+    fn describe_dir_compare_ignores_separator_style() {
+        let info = describe(
+            Some("C:/Users/me/Desktop/"),
+            LIB,
+            Some(r"C:\Users\me\Desktop"),
+        );
+        assert!(
+            !info.can_reset,
+            "正斜杠写法同样是桌面镜像，不得给出可回退结论"
+        );
     }
 
     #[test]

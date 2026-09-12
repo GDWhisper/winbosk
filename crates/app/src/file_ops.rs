@@ -113,13 +113,16 @@ pub(crate) fn register_fence_item(rt: &mut Runtime, fence: usize, path: &str) ->
         item_id
     };
 
-    // 自动捕获：仅当源栅栏是桌面栅栏时，才允许分流到开启了 auto_capture 的其它栅栏中
-    let desktop_dir = shell_desktop_path();
+    // 自动捕获：仅当源栅栏是桌面栅栏时，才允许分流到开启了 auto_capture 的其它栅栏中。
+    // 「是否桌面镜像栅栏」统一走 `dir_eq`（忽略大小写/分隔符/尾分隔符），与
+    // `mirror_linked_fence`、`reset_fence_storage` 保持同一口径。
     let is_desktop_fence = rt
         .desk
         .fences
         .get(fence)
-        .map(|f| desktop_dir.is_some() && f.storage_path.as_deref() == desktop_dir.as_deref())
+        .and_then(|f| f.storage_path.as_deref())
+        .zip(shell_desktop_path())
+        .map(|(sp, d)| dir_eq(Path::new(sp), Path::new(&d)))
         .unwrap_or(false);
 
     let target_fence = if !is_desktop_fence
@@ -153,7 +156,10 @@ pub(crate) fn register_fence_item(rt: &mut Runtime, fence: usize, path: &str) ->
     if f.icon_ids.contains(&id) {
         return false;
     }
-    f.icon_ids.push(id);
+    f.icon_ids.push(id.clone());
+    // 状态全集校验：同一项不会「既在未分组区又在栅栏里」。未分组区在渲染层没有任何绘制入口，
+    // 残留只会让镜像刚加回的桌面项仍被当成「未分组」，语义自相矛盾。
+    rt.desk.free_icons.retain(|x| x != &id);
     true
 }
 
@@ -381,12 +387,8 @@ pub(crate) fn reset_fence_storage(rt: &mut Runtime, fence_idx: usize) {
     let Some(old_dir) = fence.storage_path.clone() else {
         return;
     };
-    let same_as = |a: &str, b: &str| {
-        a.trim_end_matches(['\\', '/'])
-            .eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
-    };
     if let Some(desktop) = shell_desktop_path() {
-        if same_as(&old_dir, &desktop) {
+        if dir_eq(Path::new(&old_dir), Path::new(&desktop)) {
             tracing::warn!(fence = fence_id, "桌面镜像栅栏不允许恢复默认");
             return;
         }
@@ -443,9 +445,12 @@ pub(crate) fn reconcile_fences(rt: &mut Runtime) -> bool {
 /// 新增/删除/改名 ≤ 后台 `SyncLibrary` 周期（4s）反映到栅栏。栅栏即文件夹——
 /// 目录内容与栅栏成员互为差集：多出的路径注册进栅栏，消失的路径移除对应图标。
 ///
-/// 廉价快路径：枚举目录名集合与栅栏内「路径在该目录下」的图标路径集合做比较，
-/// 集合相同立即返回——平时每周期只做一次 `read_dir`，低 CPU；仅差集非空才做
-/// 昂贵的 `DesktopItem` 构建/移除。文件夹不可用（被删/断连）时不动（防御）。
+/// 廉价快路径：只用一次 `read_dir` 得到两套磁盘视图，与「已归属」集合做**两条互不干扰的
+/// 子集断言**（`mirror_converged`）——收敛即立即返回，不进昂贵的 `DesktopItem` 构建/移除。
+/// 这里**不能**用「集合相等」做判据：已归属但被外部置为隐藏/系统属性的文件会出现在
+/// 「全部条目」里、却永远不在「可见条目」里，集合相等会永久不成立 → 每 4s 白跑一遍全量
+/// 注册 + 全量 `exists()` 探测（破坏空闲 0% CPU 铁律）。
+/// 文件夹不可用（被删/断连）时不动（防御）。
 fn mirror_linked_fence(rt: &mut Runtime, idx: usize) -> bool {
     let Some(dir) = rt.desk.fences.get(idx).and_then(|f| f.storage_path.clone()) else {
         return false;
@@ -460,55 +465,42 @@ fn mirror_linked_fence(rt: &mut Runtime, idx: usize) -> bool {
     let mut changed = rehome_linked_library_items(rt, idx, &dir);
 
     let is_desktop = shell_desktop_path()
-        .map(|d| Path::new(&d) == dir.as_path())
+        .map(|d| dir_eq(Path::new(&d), &dir))
         .unwrap_or(false);
 
-    // 栅栏内「路径在该目录下」的图标路径集合（小写，与磁盘大小写无关）
-    let existing: HashSet<String> = if is_desktop {
-        // 桌面源栅栏：只要全局任一栅栏或未分组区已持有此桌面文件，就视为已存在，杜绝循环重复注册
-        rt.desk
-            .icons
-            .values()
-            .filter_map(|ic| ic.path.as_ref())
-            .filter(|p| path_within(&dir, Path::new(p)))
-            .map(|p| p.to_ascii_lowercase())
-            .collect()
+    // 源目录：桌面镜像 = 用户桌面 + 公共桌面（Windows 桌面上显示的是两者并集）；
+    // 普通链接栅栏 = 它自己的目录。`dir` 自身仍是栅栏的 `storage_path`（新文件落盘位置、
+    // 删除语义、控制中心展示都依赖它），公共桌面只进「扫描集合」，不成为 storage_path。
+    let roots: Vec<PathBuf> = if is_desktop {
+        desktop_source_dirs(&dir, shell_public_desktop_path().map(PathBuf::from))
     } else {
-        // 普通目录镜像栅栏（Folder Portal）：严格维持当前栅栏成员
-        rt.desk
-            .fences
-            .get(idx)
-            .map(|f| {
-                f.icon_ids
-                    .iter()
-                    .filter_map(|id| rt.desk.icons.get(id).and_then(|ic| ic.path.clone()))
-                    .filter(|p| path_within(&dir, Path::new(p)))
-                    .map(|p| p.to_ascii_lowercase())
-                    .collect()
-            })
-            .unwrap_or_default()
+        vec![dir.clone()]
     };
 
-    // 枚举目录（跳过隐藏/系统文件，与资源管理器默认一致）；读取失败视为空 → 走删除分支
-    let entries: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| should_mirror(p))
-                .collect()
-        })
-        .unwrap_or_default();
-    let entry_set: HashSet<String> = entries
-        .iter()
-        .map(|p| p.to_string_lossy().to_ascii_lowercase())
-        .collect();
-    if entry_set == existing {
-        return changed; // 目录内容与栅栏一致 → 无事可做（可能刚迁移过库内项）
+    // 两套磁盘视图（同一次 `read_dir`，不额外产生系统调用）：
+    // - `all_set`：目录列出的**全部**条目（含隐藏/系统）→ 用于判「已归属项是否还在磁盘上」；
+    // - `visible`：应当镜像的条目（跳过隐藏/系统，与资源管理器默认一致）→ 用于注册。
+    let mut all_set: HashSet<String> = HashSet::new();
+    let mut visible: Vec<PathBuf> = Vec::new();
+    for d in &roots {
+        for p in list_dir_entries(d) {
+            all_set.insert(p.to_string_lossy().to_ascii_lowercase());
+            if should_mirror(&p) {
+                visible.push(p);
+            }
+        }
+    }
+
+    // 「已归属」路径集合（小写，限定在源目录内）——口径见 `mirror_existing_paths`。
+    let owned = mirror_existing_paths(&rt.desk, idx, &roots, is_desktop);
+    if mirror_converged(&owned, &all_set, &visible) {
+        return changed; // 无新项要注册、无孤儿要回收 → 无事可做（可能刚迁移过库内项）
     }
 
     // 文件夹 → 栅栏：新出现的文件/子文件夹注册进栅栏（含改名产生的新路径）
-    for p in &entries {
+    for p in &visible {
         let lower = p.to_string_lossy().to_ascii_lowercase();
-        if !existing.contains(&lower) && register_fence_item(rt, idx, &p.to_string_lossy()) {
+        if !owned.contains(&lower) && register_fence_item(rt, idx, &p.to_string_lossy()) {
             changed = true;
         }
     }
@@ -521,7 +513,8 @@ fn mirror_linked_fence(rt: &mut Runtime, idx: usize) -> bool {
             let Some(p) = rt.desk.icons.get(&id).and_then(|ic| ic.path.clone()) else {
                 continue;
             };
-            if path_within(&dir, Path::new(&p)) && !Path::new(&p).exists() {
+            // 「桌面」= 用户桌面 + 公共桌面：任一根目录内的文件消失都要回收
+            if roots.iter().any(|r| path_within(r, Path::new(&p))) && !Path::new(&p).exists() {
                 remove_icon_entirely(rt, &id);
                 changed = true;
             }
@@ -548,6 +541,100 @@ fn mirror_linked_fence(rt: &mut Runtime, idx: usize) -> bool {
         }
     }
     changed
+}
+
+/// 桌面镜像栅栏的源目录集合：用户桌面 + 公共桌面。
+///
+/// Windows 桌面上显示的是两者的并集（用户桌面文件 + `C:\Users\Public\Desktop` 的公共快捷方式），
+/// 只扫用户桌面会让那批公共快捷方式在真实桌面被壳层接管隐藏后凭空消失。`public` 由调用方注入
+/// （壳层解析结果），便于纯函数单测。
+fn desktop_source_dirs(user: &Path, public: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut dirs = vec![user.to_path_buf()];
+    if let Some(p) = public {
+        push_unique_dir(&mut dirs, p);
+    }
+    dirs
+}
+
+/// 目录去重追加：忽略 ASCII 大小写与尾部分隔符（Windows 路径语义），已在集合内则不追加。
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, extra: PathBuf) {
+    if !dirs.iter().any(|d| dir_eq(d, &extra)) {
+        dirs.push(extra);
+    }
+}
+
+/// 两个路径是否指向同一处目录：忽略分隔符差异（`/` 与 `\`）、尾部分隔符与 ASCII 大小写。
+pub(crate) fn dir_eq(a: &Path, b: &Path) -> bool {
+    fn norm(p: &Path) -> String {
+        p.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+    let (x, y) = (norm(a), norm(b));
+    !x.is_empty() && x == y
+}
+
+/// 读一个目录下的全部条目（**不做**任何属性过滤，含隐藏/系统文件，如 `desktop.ini`）。
+/// 读取失败（不存在/被占用）视为空。是否镜像由调用方用 `should_mirror` 过滤。
+fn list_dir_entries(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
+        .unwrap_or_default()
+}
+
+/// 镜像是否已收敛（本轮无事可做）——**两条互不干扰的子集断言**：
+///
+/// 1. `owned ⊆ all`：所有已归属项都还在磁盘上 → 没有孤儿要回收；
+/// 2. `visible ⊆ owned`：所有应当镜像的条目都已归属 → 没有新项要注册。
+///
+/// 反例（为什么不用「集合相等」）：某项被外部加上隐藏/系统属性后，它仍在 `all` 里、却不在
+/// `visible` 里；只要它已归属，`owned != visible` 会**永久**成立 → 每 4s 都白跑一遍注册与
+/// 全量 `exists()` 探测，违反空闲 0% CPU 铁律。两条子集断言则各自只关心自己那一侧。
+fn mirror_converged(owned: &HashSet<String>, all: &HashSet<String>, visible: &[PathBuf]) -> bool {
+    owned.is_subset(all)
+        && visible
+            .iter()
+            .all(|p| owned.contains(&p.to_string_lossy().to_ascii_lowercase()))
+}
+
+/// 计算镜像栅栏的「已归属」路径集合（小写，限定在源目录 `roots` 内）。
+///
+/// - `is_desktop == true`（**桌面镜像栅栏**）：**归属口径**——凡已被任一栅栏持有的桌面文件都算
+///   「已归属」，因此「一键整理」把图标搬进分类栅栏后不会被镜像抢回桌面栅栏。
+///   **禁止**改回「读全局图标池 `desk.icons`」：启动时的元数据补齐会把**枚举到的每一项**
+///   无条件写进池（无论有无归属），于是「池里有」被当成「栅栏里有」，所有项全被判为已归属
+///   → 桌面栅栏永远为空（线上事故，详见 `docs/plans/08-desktop-mirror-ownership-and-public-desktop.md`）。
+/// - `is_desktop == false`（普通目录镜像栅栏）：只取**本栅栏成员**，严格维持当前成员。
+///
+/// `free_icons`（未分组区）**不计入**归属：它在渲染层没有任何绘制入口，把它当归属会让
+/// 「移出栅栏」的桌面项彻底从视野里消失（真实桌面图标已被接管隐藏）；不计入则镜像会把它
+/// 加回栅栏，最坏结果只是「移出无效果」，优于图标凭空不见。
+///
+/// 本函数**不做**可见性（隐藏/系统属性）过滤——它要回答的是「这项是否已被某栅栏持有」，
+/// 与磁盘上「这项是否被隐藏」无关；两侧口径的差异由 `mirror_converged` 的**两条子集断言**
+/// 消化（见其文档，别改成集合相等）。
+fn mirror_existing_paths(
+    desk: &Desk,
+    idx: usize,
+    roots: &[PathBuf],
+    is_desktop: bool,
+) -> HashSet<String> {
+    let owned_ids: Vec<&String> = if is_desktop {
+        desk.fences.iter().flat_map(|f| f.icon_ids.iter()).collect()
+    } else {
+        desk.fences
+            .get(idx)
+            .into_iter()
+            .flat_map(|f| f.icon_ids.iter())
+            .collect()
+    };
+    owned_ids
+        .into_iter()
+        .filter_map(|id| desk.icons.get(id).and_then(|ic| ic.path.as_deref()))
+        .filter(|p| roots.iter().any(|r| path_within(r, Path::new(p))))
+        .map(|p| p.to_ascii_lowercase())
+        .collect()
 }
 
 /// 链接栅栏的旧库内项迁移：把「路径仍在内部库」的栅栏图标物理移到链接文件夹，
@@ -827,5 +914,236 @@ mod tests {
     #[test]
     fn path_within_empty_root_is_never_within() {
         assert!(!path_within(Path::new(""), Path::new(r"C:\x\y.txt")));
+    }
+
+    // ---- 桌面镜像的「已存在」口径（plan 08） ----
+
+    const USER_DESK: &str = r"C:\Users\me\Desktop";
+    const PUBLIC_DESK: &str = r"C:\Users\Public\Desktop";
+
+    fn test_fence(id: u64, icon_ids: &[&str]) -> Fence {
+        Fence {
+            id,
+            title: Some(format!("栅栏{id}")),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: icon_ids.iter().map(|s| s.to_string()).collect(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed: false,
+        }
+    }
+
+    /// 登记一个图标：id 即小写路径（与 `item_id` 同口径）。
+    fn desktop_icon(desk: &mut Desk, path: &str) {
+        let id = path.to_ascii_lowercase();
+        let mut ic = Icon::new(id.clone(), id.clone(), sylva_core::model::ItemKind::Unknown);
+        ic.path = Some(path.to_string());
+        desk.icons.insert(id, ic);
+    }
+
+    fn roots() -> Vec<PathBuf> {
+        vec![PathBuf::from(USER_DESK), PathBuf::from(PUBLIC_DESK)]
+    }
+
+    /// P0 回归：元数据池里有、但没有任何栅栏持有 → **不能**算「已存在」。
+    /// 历史 bug：这里读全局池，而启动时枚举到的每一项都被无条件写进池，于是所有项
+    /// 全被误判为已存在 → 桌面栅栏永远为空（图标全体消失）。
+    #[test]
+    fn desktop_existing_ignores_unowned_metadata_pool() {
+        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let f = test_fence(1, &[]);
+        desk.fences.push(f);
+        desktop_icon(&mut desk, r"C:\Users\me\Desktop\a.txt");
+        desktop_icon(&mut desk, r"C:\Users\me\Desktop\b.png");
+
+        let existing = mirror_existing_paths(&desk, 0, &roots(), true);
+        assert!(
+            existing.is_empty(),
+            "无归属的元数据不得算已存在（会导致栅栏恒空）: {existing:?}"
+        );
+        // 幂等：连续两次结果一致
+        assert_eq!(existing, mirror_existing_paths(&desk, 0, &roots(), true));
+
+        // 一旦归属本栅栏 → 立刻算已存在
+        desk.fences[0]
+            .icon_ids
+            .push(r"c:\users\me\desktop\a.txt".to_string());
+        let existing = mirror_existing_paths(&desk, 0, &roots(), true);
+        assert_eq!(existing.len(), 1);
+        assert!(existing.contains(r"c:\users\me\desktop\a.txt"));
+    }
+
+    /// 归属它栅栏（「一键整理」搬走）的桌面文件算已存在 → 不被镜像抢回。
+    #[test]
+    fn desktop_existing_covers_icons_owned_by_other_fences() {
+        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        desk.fences.push(test_fence(1, &[]));
+        desk.fences
+            .push(test_fence(2, &[r"c:\users\me\desktop\doc.pdf"]));
+        desktop_icon(&mut desk, r"C:\Users\me\Desktop\doc.pdf");
+
+        let existing = mirror_existing_paths(&desk, 0, &roots(), true);
+        assert!(existing.contains(r"c:\users\me\desktop\doc.pdf"));
+    }
+
+    /// 公共桌面同样是「桌面」的一部分：归属判定不受 storage_path 只指向用户桌面的限制。
+    #[test]
+    fn desktop_existing_covers_public_desktop() {
+        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        desk.fences
+            .push(test_fence(1, &[r"c:\users\public\desktop\chrome.lnk"]));
+        desktop_icon(&mut desk, r"C:\Users\Public\Desktop\Chrome.lnk");
+
+        let existing = mirror_existing_paths(&desk, 0, &roots(), true);
+        assert!(existing.contains(r"c:\users\public\desktop\chrome.lnk"));
+    }
+
+    /// 未分组区（渲染层无绘制入口）**不算归属**：否则「移出栅栏」的桌面项会彻底消失。
+    #[test]
+    fn desktop_existing_ignores_free_icons() {
+        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        desk.fences.push(test_fence(1, &[]));
+        desktop_icon(&mut desk, r"C:\Users\me\Desktop\loose.txt");
+        desk.free_icons
+            .push(r"c:\users\me\desktop\loose.txt".to_string());
+
+        assert!(mirror_existing_paths(&desk, 0, &roots(), true).is_empty());
+    }
+
+    /// 源目录之外的路径一律不进集合（例如库内项、桌面之外的分区）。
+    #[test]
+    fn desktop_existing_scopes_to_source_roots() {
+        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        desk.fences
+            .push(test_fence(1, &[r"c:\app\data\library\copy.txt"]));
+        desktop_icon(&mut desk, r"C:\app\data\library\copy.txt");
+
+        assert!(mirror_existing_paths(&desk, 0, &roots(), true).is_empty());
+    }
+
+    /// 普通目录镜像栅栏维持「本栅栏成员」口径：别的栅栏持有同一目录下的项不受影响。
+    #[test]
+    fn plain_mirror_existing_only_counts_own_members() {
+        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        desk.fences.push(test_fence(1, &[r"c:\portal\mine.txt"]));
+        desk.fences.push(test_fence(2, &[r"c:\portal\other.txt"]));
+        desktop_icon(&mut desk, r"C:\portal\mine.txt");
+        desktop_icon(&mut desk, r"C:\portal\other.txt");
+
+        let existing = mirror_existing_paths(&desk, 0, &[PathBuf::from(r"C:\portal")], false);
+        assert_eq!(existing.len(), 1);
+        assert!(existing.contains(r"c:\portal\mine.txt"));
+    }
+
+    /// 收敛态必须保持快路径：可见项全部已归属、且已归属项都还在磁盘上 → 直接返回。
+    /// 若这条不成立，每 4s 的同步都会退化成全量注册 + 全量 `exists()` 探测。
+    #[test]
+    fn desktop_converged_holds_fast_path() {
+        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let a = r"C:\Users\me\Desktop\a.txt";
+        let b = r"C:\Users\Public\Desktop\b.lnk";
+        desk.fences.push(test_fence(
+            1,
+            &[&a.to_ascii_lowercase(), &b.to_ascii_lowercase()],
+        ));
+        desktop_icon(&mut desk, a);
+        desktop_icon(&mut desk, b);
+
+        let roots = roots();
+        let owned = mirror_existing_paths(&desk, 0, &roots, true);
+        let visible = vec![PathBuf::from(a), PathBuf::from(b)];
+        let all: HashSet<String> = visible
+            .iter()
+            .map(|p| p.to_string_lossy().to_ascii_lowercase())
+            .collect();
+        assert!(mirror_converged(&owned, &all, &visible));
+    }
+
+    /// 快路径判据矩阵：两条子集断言各自只负责一侧。
+    #[test]
+    fn mirror_converged_subset_matrix() {
+        let owned: HashSet<String> = [r"c:\d\a.txt", r"c:\d\b.txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let vis = |p: &str| PathBuf::from(p);
+        let all_of = |ps: &[&str]| -> HashSet<String> {
+            ps.iter()
+                .map(|s| s.to_string().to_ascii_lowercase())
+                .collect()
+        };
+
+        // 收敛：可见项都已归属，已归属项都在磁盘上
+        assert!(mirror_converged(
+            &owned,
+            &all_of(&[r"C:\d\a.txt", r"C:\d\b.txt"]),
+            &[vis(r"C:\d\a.txt"), vis(r"C:\d\b.txt")]
+        ));
+
+        // 新文件出现在磁盘上（可见但未归属）→ 未收敛（要去注册）
+        assert!(!mirror_converged(
+            &owned,
+            &all_of(&[r"C:\d\a.txt", r"C:\d\b.txt", r"C:\d\c.txt"]),
+            &[vis(r"C:\d\a.txt"), vis(r"C:\d\b.txt"), vis(r"C:\d\c.txt")]
+        ));
+
+        // 已归属项被外部删除 → 未收敛（要去回收孤儿）
+        assert!(!mirror_converged(
+            &owned,
+            &all_of(&[r"C:\d\a.txt"]),
+            &[vis(r"C:\d\a.txt")]
+        ));
+
+        // 已归属项被外部加上隐藏属性：仍在「全部条目」里、不在「可见条目」里
+        // → 必须仍判为收敛（否则每 4s 白跑一轮，破坏空闲 0% CPU）
+        assert!(mirror_converged(
+            &owned,
+            &all_of(&[r"C:\d\a.txt", r"C:\d\b.txt"]),
+            &[vis(r"C:\d\a.txt")]
+        ));
+
+        // 普通栅栏：隐藏成员同理不得造成抖动
+        assert!(mirror_converged(
+            &owned,
+            &all_of(&[r"C:\d\a.txt", r"C:\d\b.txt"]),
+            &[]
+        ));
+
+        // 空目录 + 空归属（新链接的空文件夹）：收敛，不得 panic
+        assert!(mirror_converged(&HashSet::new(), &HashSet::new(), &[]));
+    }
+
+    #[test]
+    fn desktop_source_dirs_adds_public_and_dedupes() {
+        // 公共桌面存在 → 两个目录
+        let dirs = desktop_source_dirs(
+            Path::new(r"C:\Users\me\Desktop"),
+            Some(PathBuf::from(r"C:\Users\Public\Desktop")),
+        );
+        assert_eq!(dirs.len(), 2);
+
+        // 不可用（None）→ 退化为只扫用户桌面
+        let dirs = desktop_source_dirs(Path::new(r"C:\Users\me\Desktop"), None);
+        assert_eq!(dirs, vec![PathBuf::from(r"C:\Users\me\Desktop")]);
+
+        // 与用户桌面同一目录（大小写 / 尾分隔符差异）→ 只保留一份
+        let dirs = desktop_source_dirs(
+            Path::new(r"C:\Users\me\Desktop"),
+            Some(PathBuf::from(r"c:\users\ME\desktop\")),
+        );
+        assert_eq!(dirs.len(), 1);
+    }
+
+    #[test]
+    fn dir_eq_ignores_case_and_trailing_separator() {
+        assert!(dir_eq(Path::new(r"C:\A\B"), Path::new(r"c:\a\b\")));
+        assert!(dir_eq(Path::new(r"C:/A/B"), Path::new(r"C:\A\B")));
+        assert!(!dir_eq(Path::new(r"C:\A\B"), Path::new(r"C:\A\BC")));
+        assert!(!dir_eq(Path::new(""), Path::new("")));
     }
 }

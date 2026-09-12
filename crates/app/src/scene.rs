@@ -47,8 +47,6 @@ pub(crate) fn label_width(text: &str, font_size: f32) -> f32 {
     units * font_size
 }
 
-/// 首次运行：把全部图标按稳定顺序平分成两个演示栅栏，并建立图标元数据。
-/// 已有布局时不作任何改动（栅栏是用户显式成员列表）。
 /// 用 Shell API 获取用户桌面文件夹的真实路径。
 /// 支持用户自定义桌面位置（如移到 D 盘），比 `USERPROFILE\Desktop` 可靠。
 pub(crate) fn shell_desktop_path() -> Option<String> {
@@ -66,6 +64,32 @@ pub(crate) fn shell_desktop_path() -> Option<String> {
     }
 }
 
+/// 真实「公共桌面」目录（`FOLDERID_PublicDesktop`，通常 `C:\Users\Public\Desktop`）。
+///
+/// Windows 桌面上显示的是「用户桌面 + 公共桌面」两个目录的并集，桌面镜像栅栏必须两个都扫，
+/// 否则公共快捷方式（Chrome / NVIDIA App 等）在真实桌面被壳层隐藏后无处可去。
+/// 目录不存在/不可用 → `None`（镜像退化为只扫用户桌面）。
+pub(crate) fn shell_public_desktop_path() -> Option<String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        FOLDERID_PublicDesktop, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
+    };
+    unsafe {
+        let pwstr =
+            SHGetKnownFolderPath(&FOLDERID_PublicDesktop, KNOWN_FOLDER_FLAG(0), None).ok()?;
+        let path = pwstr.to_string().ok()?;
+        CoTaskMemFree(Some(pwstr.as_ptr() as *const _));
+        if std::path::Path::new(&path).is_dir() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+}
+
+/// 首次运行：创建一个链接到用户桌面文件夹的默认侧边栏栅栏。
+/// 已有布局时不作任何改动（栅栏是用户显式成员列表）。
+/// 不预填 `icon_ids`——内容由随后的 `reconcile_fences` 从桌面目录同步填充。
 pub(crate) fn seed_fences(desk: &mut Desk, _items: &[DesktopItem], _theme: &Theme) {
     if !desk.fences.is_empty() {
         return;
