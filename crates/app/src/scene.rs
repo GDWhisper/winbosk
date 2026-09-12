@@ -1974,4 +1974,68 @@ mod tests {
             "面板总高 {full} 异常——疑似 clamp 笔误让高度再次爆涨"
         );
     }
+
+    /// 卷帘揭示的几何契约（plan 06 §G1/G4）：
+    /// - panel=0 → 高度为 0；panel=1 → 高度贴合内容；过冲段高度被钳到 `CONSOLE_OVERSHOOT_MAX`
+    ///   倍且面板底边不越屏；极小屏下面板高度不小于 `CONSOLE_MIN_H`。
+    #[test]
+    fn console_geometry_reveals_by_panel_progress() {
+        use sylva_core::{config::AppSettings, model::Desk};
+        use sylva_render::theme::Theme;
+        let desk = Desk::new(AppSettings::default());
+        let mut theme = Theme::default();
+        theme.scale = 1.0;
+        let vw = 3840.0_f32;
+        let vh = 2160.0_f32;
+        let full_h = console_full_height(&desk, 0, 1.0);
+
+        // 折叠：panel=0 完全不渲染
+        let zero = console_geometry(&desk, &theme, vw, vh, 0.0, 0);
+        assert_eq!(zero.h, 0.0, "panel=0 应完全折叠");
+
+        // 展开中：panel=0.5 高度恰为 full_h * 0.5
+        let half = console_geometry(&desk, &theme, vw, vh, 0.5, 0);
+        assert!(
+            (half.h - full_h * 0.5).abs() < 1e-3,
+            "panel=0.5 高度={}, 期望={}",
+            half.h,
+            full_h * 0.5
+        );
+
+        // 稳态：panel=1 高度 = 内容高度
+        let full = console_geometry(&desk, &theme, vw, vh, 1.0, 0);
+        assert!(
+            (full.h - full_h).abs() < 1e-3,
+            "panel=1 高度={}, 期望={}",
+            full.h,
+            full_h
+        );
+        assert!(full.h < vh / 2.0, "panel=1 高度 {} 已撑过屏幕一半", full.h);
+
+        // 过冲钳制：panel=2.0（理论过冲 100%）被钳到 max_h，
+        // 面板底边绝不越出屏幕
+        let over = console_geometry(&desk, &theme, vw, vh, 2.0, 0);
+        let max_h = ((vh - 2.0 * CONSOLE_MARGIN) / CONSOLE_OVERSHOOT_MAX).max(CONSOLE_MIN_H);
+        assert!(
+            over.h <= max_h + 1e-3,
+            "过冲钳制失效：over.h={}, max_h={}",
+            over.h,
+            max_h
+        );
+        assert!(
+            over.y + over.h <= vh,
+            "过冲后面板底边 {} 越出屏 {}",
+            over.y + over.h,
+            vh
+        );
+
+        // 极小屏：max_h 被 MIN_H 兜底，面板仍可交互
+        let tiny = console_geometry(&desk, &theme, 800.0, 100.0, 1.0, 0);
+        assert!(
+            tiny.h >= CONSOLE_MIN_H,
+            "小屏高度 {} 小于最小高 {}",
+            tiny.h,
+            CONSOLE_MIN_H
+        );
+    }
 }
