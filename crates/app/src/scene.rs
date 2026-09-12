@@ -288,7 +288,10 @@ pub(crate) fn console_full_height(desk: &Desk, selected: usize, s: f32) -> f32 {
         // 添加 / 一键整理 / 删除栅栏 / 切换桌面 四个等宽按钮 + 三处间隙
         + CONSOLE_ADD_BTN_H * s * 4.0
         + 8.0 * s * 3.0
-        + 12.0 * s.clamp(CONSOLE_MIN_H * s, CONSOLE_MAX_H * s)
+        // 底部留白：面板正好包住内容（`build_console` 的最后一个按钮即止于此）。
+        // 曾误写成 `12.0 * s.clamp(CONSOLE_MIN_H * s, CONSOLE_MAX_H * s)`，clamp 下限
+        // 恒为 170·s，等于给面板底部凭空多加约 170px 空白。
+        + 12.0 * s
 }
 
 /// 详情区可见行的总高度（行高 30px × 可见行数 + 标签行 24px）。
@@ -320,8 +323,9 @@ fn detail_visible_rows(desk: &Desk, selected: usize, s: f32) -> f32 {
 /// 控制中心面板矩形（物理像素，虚拟屏幕坐标）。
 ///
 /// 未拖动过（`console_pos == None`）时默认摆右上角；拖动后记住 `console_pos`
-/// 左上角。高度按 `panel` 进度（0..1）在「折叠胶囊」与「完整面板」间插值——
-/// 胶囊始终可见（控制中心入口不会再找不到）。
+/// 左上角。高度按 `panel` 进度插值（0 = 完全不渲染，1 = 完整面板；回弹期间
+/// 可 >1，按 `CONSOLE_OVERSHOOT_MAX` 截断）——顶边锚定、底边下移，形成
+/// 「卷帘揭示」：绘制侧按面板矩形整体裁切，内容自上而下露出。
 ///
 /// 尺寸策略：未手动缩放过（`console_size == None`）时宽取 `CONSOLE_W`、高取
 /// `console_full_height`（标签页/内容自适应）；用户拖边缘/角缩放后
@@ -336,9 +340,13 @@ pub(crate) fn console_geometry(
 ) -> RectF {
     let s = theme.scale;
     let margin = CONSOLE_MARGIN * s;
-    // 可用高度：屏幕高度减去上下边距（面板不应溢出屏幕）
-    let max_h = (vh - 2.0 * margin).max(CONSOLE_MIN_H * s);
-    let auto_full_h = console_full_height(desk, selected, s).min(max_h);
+    // 可用高度：屏幕高度减去上下边距，并预留展开回弹的过冲余量——过冲高峰
+    // （`CONSOLE_OVERSHOOT_MAX`）不应把面板底边推出屏幕，否则末帧会画到屏外。
+    let avail = (vh - 2.0 * margin).max(CONSOLE_MIN_H * s);
+    let max_h = avail / CONSOLE_OVERSHOOT_MAX;
+    let auto_full_h = console_full_height(desk, selected, s)
+        .min(CONSOLE_MAX_H * s)
+        .min(max_h);
     let (w, full_h) = match desk.console_size {
         Some((w, h)) => (
             w.max(CONSOLE_MIN_W * s),
@@ -346,8 +354,8 @@ pub(crate) fn console_geometry(
         ),
         None => (CONSOLE_W * s, auto_full_h),
     };
-    // 允许小幅过冲（展开回弹），1.12 上限避免面板瞬时过高
-    let h = full_h * panel.clamp(0.0, 1.12);
+    // 允许小幅过冲（展开回弹），CONSOLE_OVERSHOOT_MAX 上限避免面板瞬时过高
+    let h = full_h * panel.clamp(0.0, CONSOLE_OVERSHOOT_MAX);
     let (x, y) = match desk.console_pos {
         Some(p) => (p.x, p.y),
         None => ((vw - w - margin).max(8.0 * s), margin.max(8.0 * s)),
@@ -795,6 +803,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         fill_color: [0.062, 0.086, 0.133, 0.92],
         border_color: [1.0, 1.0, 1.0, 0.18],
         panel: anim.panel,
+        fade: console_fade(anim.panel),
         hover_zone: if anim.panel >= 0.5 {
             rt.console_hover
         } else {

@@ -229,8 +229,11 @@ pub struct SceneConsole {
     pub remove_btn: RectF,
     pub fill_color: [f32; 4],
     pub border_color: [f32; 4],
-    /// 面板展开进度 0..1（0=折叠胶囊，1=完整面板）。
+    /// 面板展开进度（几何用）：0 = 完全不渲染，1 = 完整面板；展开回弹期间可 >1。
     pub panel: f32,
+    /// 面板整体不透明度 0..1：由 `panel` 派生（见 App 层 `CONSOLE_FADE_SPAN`），
+    /// 与高度解耦——淡入只在开场一小段完成，其后只有高度在动。
+    pub fade: f32,
     /// 当前悬停的控制台控件（App 层经 ConsoleHover 事件写入；绘制高亮用）。
     pub hover_zone: Option<ConsoleZone>,
     /// 是否处于原始桌面模式（标题栏按钮文案与状态）。

@@ -30,7 +30,9 @@ use sylva_core::storage::StorageKind;
 use sylva_shell::icons::IconData;
 
 use crate::overlay::{ConsoleZone, RectF};
-use crate::scene::{ListColumns, Scene, SceneConsole, SceneEdit, SceneFence, SceneFenceDetail};
+use crate::scene::{
+    ListColumns, Scene, SceneConsole, SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow,
+};
 use crate::theme::{TextStyle, Theme, GRID_CAPTION_H_MULT};
 
 /// 图标位图缓存：`bitmap_id` → 设备上的 D2D 位图。
@@ -167,11 +169,15 @@ pub fn draw_scene(
     Ok(())
 }
 
-/// 控制中心：玻璃卡片面板（栅栏管理）。关闭后完全不渲染（不留胶囊残影）。
+/// 控制中心：玻璃卡片面板（栅栏管理）。关闭后完全不渲染（不留残影）。
 ///
-/// 面板高度由 App 层按 `panel` 进度插值（0 = 完全隐藏，1 = 完整面板）；
-/// 这里把 `panel` 当作整体透明度，开合时淡入淡出。各控件矩形与 `SceneConsole`
-/// 几何一致（命中模型复用同一份）；内联文本编辑由场景级 `SceneEdit` 最后绘制。
+/// 展开/收起是「卷帘揭示」：面板顶边锚定、底边随 `panel` 进度下移，**内容整体按面板
+/// 矩形裁切**——否则展开中内容会按最终布局绘制、浮在尚未长出的边框之外，观感是
+/// 「零件先散出来，盒子后跟上」。不透明度取 `c.fade`（由 `panel` 派生但与高度解耦，
+/// 见 App 层 `console_fade`）：淡入只在开场一小段完成，其后只有高度在动。
+///
+/// 各控件矩形与 `SceneConsole` 几何一致（命中模型复用同一份）；内联文本编辑由场景级
+/// `SceneEdit` 最后绘制（在面板裁切之外，故不受本 clip 影响）。
 fn draw_console(
     target: &ID2D1RenderTarget,
     theme: &Theme,
@@ -180,13 +186,13 @@ fn draw_console(
     formats: &TextFormats,
 ) -> Result<()> {
     let s = theme.scale;
-    let a = c.panel.clamp(0.0, 1.0);
+    let a = c.fade.clamp(0.0, 1.0);
     if a <= 0.01 {
         return Ok(());
     }
     let accent = [0.23, 0.51, 0.96, 0.92];
 
-    // 玻璃卡片底色 + 描边
+    // 玻璃卡片底色 + 描边（面板本体：不裁切，否则描边会被自己的 clip 切掉）
     let panel = D2D1_ROUNDED_RECT {
         rect: D2D_RECT_F {
             left: c.x,
@@ -213,6 +219,33 @@ fn draw_console(
     ];
     let edge_brush = unsafe { target.CreateSolidColorBrush(&color(edge), None)? };
     unsafe { target.DrawRoundedRectangle(&panel, &edge_brush, 1.0, None) };
+
+    // 内容裁切：与面板矩形同源（同一份 x/y/width/height），不另算几何。
+    // Push/Pop 必须严格配对——故内容绘制整体放进内层函数，错误路径也在此统一 Pop，
+    // 否则残留的 clip 会污染后续帧（内联编辑、下一帧的栅栏）。
+    let clip = D2D_RECT_F {
+        left: c.x,
+        top: c.y,
+        right: c.x + c.width,
+        bottom: c.y + c.height,
+    };
+    unsafe { target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) };
+    let drawn = draw_console_content(target, theme, c, brushes, formats, a, accent);
+    unsafe { target.PopAxisAlignedClip() };
+    drawn
+}
+
+/// 控制中心面板内容（标题栏 + 栅栏管理页）：调用方已按面板矩形裁切。
+fn draw_console_content(
+    target: &ID2D1RenderTarget,
+    theme: &Theme,
+    c: &SceneConsole,
+    brushes: &Brushes,
+    formats: &TextFormats,
+    a: f32,
+    accent: [f32; 4],
+) -> Result<()> {
+    let s = theme.scale;
 
     // 标题「Sylva」：居中、粗体
     let title_h = c.title_h.max(34.0 * s);
@@ -263,29 +296,19 @@ fn draw_console(
     Ok(())
 }
 
-/// 栅栏管理页：可点选栅栏列表 + 选中栅栏的详情控制区。
-#[allow(clippy::too_many_arguments)]
-fn draw_fences_page(
+/// 栅栏列表行（可点选）：调用方已按列表可视区裁切，滚动时超出的行被裁掉。
+fn draw_fence_rows(
     target: &ID2D1RenderTarget,
     theme: &Theme,
-    c: &SceneConsole,
+    rows: &[SceneFenceRow],
+    hover_zone: Option<ConsoleZone>,
     formats: &TextFormats,
     full_t: f32,
     accent: [f32; 4],
 ) -> Result<()> {
     let s = theme.scale;
-    // 列表可视区裁剪（滚动时行被裁掉）
-    let clip = D2D_RECT_F {
-        left: c.fence_list_view.x,
-        top: c.fence_list_view.y,
-        right: c.fence_list_view.x + c.fence_list_view.w,
-        bottom: c.fence_list_view.y + c.fence_list_view.h,
-    };
-    if clip.bottom > clip.top {
-        unsafe { target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) };
-    }
-    for (i, r) in c.fence_rows.iter().enumerate() {
-        let hover = matches!(c.hover_zone, Some(ConsoleZone::FenceSelect(j)) if j == i);
+    for (i, r) in rows.iter().enumerate() {
+        let hover = matches!(hover_zone, Some(ConsoleZone::FenceSelect(j)) if j == i);
         let rr = D2D1_ROUNDED_RECT {
             rect: D2D_RECT_F {
                 left: r.rect.x,
@@ -334,9 +357,43 @@ fn draw_fences_page(
             unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.90 * full_t]), None)? };
         draw_text_centered(target, &r.title, &formats.label, lr, &txt);
     }
+    Ok(())
+}
+
+/// 栅栏管理页：可点选栅栏列表 + 选中栅栏的详情控制区。
+#[allow(clippy::too_many_arguments)]
+fn draw_fences_page(
+    target: &ID2D1RenderTarget,
+    theme: &Theme,
+    c: &SceneConsole,
+    formats: &TextFormats,
+    full_t: f32,
+    accent: [f32; 4],
+) -> Result<()> {
+    // 列表可视区裁剪（滚动时行被裁掉）
+    let clip = D2D_RECT_F {
+        left: c.fence_list_view.x,
+        top: c.fence_list_view.y,
+        right: c.fence_list_view.x + c.fence_list_view.w,
+        bottom: c.fence_list_view.y + c.fence_list_view.h,
+    };
+    if clip.bottom > clip.top {
+        unsafe { target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) };
+    }
+    // 行绘制可能返回 Err（画笔创建失败）：由本函数统一 Pop，杜绝 clip 残留。
+    let drawn = draw_fence_rows(
+        target,
+        theme,
+        &c.fence_rows,
+        c.hover_zone,
+        formats,
+        full_t,
+        accent,
+    );
     if clip.bottom > clip.top {
         unsafe { target.PopAxisAlignedClip() };
     }
+    drawn?;
     // 详情控制区
     if let Some(d) = &c.fence_detail {
         draw_fence_detail(target, theme, c, d, formats, full_t, accent)?;

@@ -2,13 +2,27 @@
 
 use crate::*;
 
-/// 面板展开/折叠补间（`from→to`，`dur` 秒，ease_out_cubic）。
+/// 面板展开/折叠缓动方向。
+///
+/// 展开与收起**不是**同一条曲线的正反向：展开用带轻微过冲的回弹（有「顶出来」的手感），
+/// 收起必须单调收敛——过冲会让进度越过 0 被钳成 0，面板在补间结束前就已消失，
+/// 尾段时间变成空转（观感「唰地没了」，而非收回）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PanelEase {
+    /// 单调收敛（`ease_out_cubic`）：收起/回位，绝不过冲。
+    CubicOut,
+    /// 轻微过冲回弹（峰值约 1.05）：仅用于展开。
+    BackOutSoft,
+}
+
+/// 面板展开/折叠补间（`from→to`，`dur` 秒，缓动由 `PanelEase` 指定）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PanelTween {
     pub(crate) t0: Instant,
     pub(crate) dur: f32,
     pub(crate) from: f32,
     pub(crate) to: f32,
+    pub(crate) ease: PanelEase,
 }
 
 /// 控制台面板动画状态（App 层驱动，overlay `AnimTick` 定时推进）。
@@ -70,12 +84,22 @@ pub(crate) fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - u).powi(3)
 }
 
-/// ease_out_back：过冲回弹（面板展开/待办行入场用，目标方向先超出一点再收回）。
-pub(crate) fn ease_out_back(t: f32) -> f32 {
+/// ease_out_back 的克制版：过冲约 5%（标准 `C1 = 1.70158` 过冲约 10%，
+/// 作用在面板高度上会「长高一大截再缩回」，观感是抖一下而不是回弹）。
+pub(crate) fn ease_out_back_soft(t: f32) -> f32 {
     let u = t.clamp(0.0, 1.0);
-    const C1: f32 = 1.70158;
+    const C1: f32 = 1.2;
     const C3: f32 = C1 + 1.0;
     1.0 + C3 * (u - 1.0).powi(3) + C1 * (u - 1.0).powi(2)
+}
+
+/// 面板不透明度：由展开进度派生，与高度**解耦**（见 `CONSOLE_FADE_SPAN`）。
+///
+/// 进度到 `CONSOLE_FADE_SPAN` 即完全不透明，之后只有高度在动；收起时反之——
+/// 进度降到该区间内才淡出。避免「既矮又透明」的双重衰减，也避免过冲段
+/// 「高度在回弹、透明度已饱和」的通道错位。
+pub(crate) fn console_fade(panel: f32) -> f32 {
+    (panel / CONSOLE_FADE_SPAN).clamp(0.0, 1.0)
 }
 
 /// 补间进度：`t0` 起 `dur` 秒内返回 0..1，超时返回 None（补间结束）。
@@ -118,7 +142,10 @@ pub(crate) fn advance_anim(rt: &mut Runtime) -> bool {
     if let Some(pt) = anim.panel_tween {
         match tween_progress(pt.t0, pt.dur, now) {
             Some(p) => {
-                let e = ease_out_back(p);
+                let e = match pt.ease {
+                    PanelEase::CubicOut => ease_out_cubic(p),
+                    PanelEase::BackOutSoft => ease_out_back_soft(p),
+                };
                 anim.panel = pt.from + (pt.to - pt.from) * e;
             }
             None => {
@@ -137,11 +164,30 @@ pub(crate) fn advance_anim(rt: &mut Runtime) -> bool {
 /// 视觉高度由补间在 `AnimTick` 逐帧推进。
 pub(crate) fn start_panel_tween(rt: &mut Runtime, to: f32) {
     let from = rt.console_anim.panel;
+    // 已在目标态（如重复唤出/重复收起）：直接落定，不建空转补间、不唤醒定时器。
+    if (to - from).abs() <= 1e-3 {
+        rt.console_anim.panel = to;
+        rt.console_anim.panel_tween = None;
+        return;
+    }
+    // 方向语义（非位置假设）：目标进度大于当前进度即展开，否则收起。
+    let opening = to > from;
+    let ease = if opening {
+        PanelEase::BackOutSoft
+    } else {
+        PanelEase::CubicOut
+    };
+    let dur = if opening {
+        CONSOLE_TWEEN_OPEN_S
+    } else {
+        CONSOLE_TWEEN_CLOSE_S
+    };
     rt.console_anim.panel_tween = Some(PanelTween {
         t0: Instant::now(),
-        dur: 0.24,
+        dur,
         from,
         to,
+        ease,
     });
     arm_anim_timer(rt);
 }
@@ -198,4 +244,57 @@ pub(crate) fn icon_hover_active(rt: &Runtime) -> bool {
     rt.icon_hover
         .map(|h| tween_progress(h.t0, h.dur, Instant::now()).is_some())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 展开缓动：端点精确、全程非负、过冲存在且不超过几何钳制上限
+    /// （一旦超过 `CONSOLE_OVERSHOOT_MAX`，高度会被截断成「停顿一下再回弹」）。
+    #[test]
+    fn back_out_soft_is_bounded_by_overshoot_clamp() {
+        assert!(ease_out_back_soft(0.0).abs() < 1e-5);
+        assert!((ease_out_back_soft(1.0) - 1.0).abs() < 1e-5);
+        let samples = (0..=1000).map(|i| i as f32 / 1000.0);
+        let peak = samples
+            .clone()
+            .map(ease_out_back_soft)
+            .fold(0.0_f32, f32::max);
+        assert!(peak > 1.0, "展开应保留过冲，实测峰值 {peak}");
+        assert!(
+            peak <= CONSOLE_OVERSHOOT_MAX,
+            "过冲峰值 {peak} 超过几何钳制上限 {CONSOLE_OVERSHOOT_MAX}"
+        );
+        assert!(samples.map(ease_out_back_soft).all(|v| v >= 0.0));
+    }
+
+    /// 收起必须单调收敛且恒落在 [0, 1]：过冲会让进度越过 0 被钳成 0，面板在补间
+    /// 结束前就消失、尾段定时器空转（观感「唰地没了」）——本用例是该缺陷的回归守卫。
+    #[test]
+    fn close_tween_never_undershoots_zero() {
+        let (from, to) = (1.0_f32, 0.0_f32);
+        let mut prev = from;
+        for i in 1..=100 {
+            let p = i as f32 / 100.0;
+            let panel = from + (to - from) * ease_out_cubic(p);
+            assert!(
+                panel <= prev + 1e-6,
+                "收起进度必须单调不增: {panel} > {prev}"
+            );
+            assert!((0.0..=1.0).contains(&panel), "收起进度越界: {panel}");
+            prev = panel;
+        }
+        assert!(prev.abs() < 1e-6, "收起终值应精确为 0，实测 {prev}");
+    }
+
+    /// 不透明度与高度解耦：进度到 `CONSOLE_FADE_SPAN` 即完全不透明，过冲段饱和为 1。
+    #[test]
+    fn console_fade_saturates_before_full_height() {
+        assert_eq!(console_fade(0.0), 0.0);
+        assert!((console_fade(CONSOLE_FADE_SPAN * 0.5) - 0.5).abs() < 1e-6);
+        assert_eq!(console_fade(CONSOLE_FADE_SPAN), 1.0);
+        assert_eq!(console_fade(1.0), 1.0);
+        assert_eq!(console_fade(1.05), 1.0);
+    }
 }

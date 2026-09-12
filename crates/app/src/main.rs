@@ -116,8 +116,6 @@ pub(crate) const CONSOLE_TITLE_H: f32 = 40.0;
 pub(crate) const CONSOLE_CLOSE_W: f32 = 32.0;
 /// 待办列表距面板左右的内边距。
 pub(crate) const CONSOLE_PAD: f32 = 12.0;
-/// 折叠胶囊高度（始终可见的控制中心入口）。
-pub(crate) const CONSOLE_PILL_H: f32 = 34.0;
 /// 组件页：添加按钮高度。
 pub(crate) const CONSOLE_ADD_BTN_H: f32 = 34.0;
 /// 栅栏管理页：每行高度。
@@ -131,6 +129,16 @@ pub(crate) const CONSOLE_FENCE_MAX_ROWS: usize = 5;
 pub(crate) const CONSOLE_FENCE_DETAIL_H: f32 = 278.0;
 /// 控制台展开面板最大高度（DIP；内容再多也滚动）。
 pub(crate) const CONSOLE_MAX_H: f32 = 720.0;
+/// 控制台展开补间时长（秒）：`PanelEase::BackOutSoft`，末端轻微过冲回弹。
+pub(crate) const CONSOLE_TWEEN_OPEN_S: f32 = 0.24;
+/// 控制台收起补间时长（秒）：`PanelEase::CubicOut`，单调收敛（收起禁止过冲）。
+pub(crate) const CONSOLE_TWEEN_CLOSE_S: f32 = 0.20;
+/// 淡入/淡出占用的展开进度区间：进度到达该值即完全不透明（见 `console_fade`）。
+///
+/// 与高度解耦，避免「展开进度 40% 时既只有 40% 高、又只有 40% 不透明」的双重衰减。
+pub(crate) const CONSOLE_FADE_SPAN: f32 = 0.40;
+/// 展开回弹的几何钳制上限：进度可 >1（过冲），高度按此上限截断，防止瞬时过高。
+pub(crate) const CONSOLE_OVERSHOOT_MAX: f32 = 1.08;
 
 /// 背景色调预设（标签, RGB 0..1）：菜单项顺序即此处顺序（+1 起）。
 pub(crate) const TINT_PRESETS: &[(&str, [f32; 3])] = &[
@@ -1272,13 +1280,15 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             }
         }
         OverlayEvent::ConsoleResize { rect } => {
-            // 拖右/下边缘缩放面板：宽度直接生效；高度换算为「完全展开高度」
-            // （可见高度 = 胶囊高 + (展开高 - 胶囊高) × panel 进度，反解展开高）。
+            // 拖右/下边缘缩放面板：宽度直接生效；高度换算为「完全展开高度」。
+            // 几何契约是「可见高度 = 展开高 × panel 进度」（无胶囊基线），故反解为除法；
+            // 动画中途缩放时按当前进度反解，稳定态 panel=1 时即等于拖出的高度。
             let s = rt.theme.scale;
-            let pill_h = CONSOLE_PILL_H * s;
             let panel = rt.console_anim.panel.max(0.05); // 折叠态按最小进度反解，避免除零
             let full_w = rect.2.max(CONSOLE_MIN_W * s);
-            let full_h = (pill_h + (rect.3 - pill_h) / panel).max(CONSOLE_MIN_H * s);
+            // 反解值必须钳在合法区间：否则动画中途缩放（panel 很小）会把展开高度放大
+            // 数十倍并**持久化**进 `console_size`，之后面板永远高得离谱。
+            let full_h = (rect.3 / panel).clamp(CONSOLE_MIN_H * s, CONSOLE_MAX_H * s);
             rt.desk.console_size = Some((full_w, full_h));
         }
         OverlayEvent::ConsoleResizeEnd => {
@@ -1737,11 +1747,13 @@ fn toggle_desktop(rt: &mut Runtime) {
     rt.desk.desktop_mode = !rt.desk.desktop_mode;
     if rt.desk.desktop_mode {
         rt.hierarchy.restore_icons();
+        // 桌面淡出：缓动固定为 ease_out_cubic（`fence_alpha` 内取值），此处仅对齐字段语义。
         rt.desktop_fade = Some(PanelTween {
             t0: Instant::now(),
             dur: 0.22,
             from: 1.0,
             to: 0.0,
+            ease: PanelEase::CubicOut,
         });
     } else {
         rt.hierarchy.hide_icons();
@@ -1750,6 +1762,7 @@ fn toggle_desktop(rt: &mut Runtime) {
             dur: 0.22,
             from: 0.0,
             to: 1.0,
+            ease: PanelEase::CubicOut,
         });
     }
     arm_anim_timer(rt);
