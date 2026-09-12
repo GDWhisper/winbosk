@@ -17,16 +17,24 @@
 
 use std::sync::OnceLock;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use windows::core::{Result, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, TRUE, WAIT_FAILED,
+    WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, EqualRgn, SetBkColor, SetTextColor,
     SetWindowRgn, HBRUSH, HDC, HRGN, RGN_OR,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, CancelWaitableTimer, CreateWaitableTimerExW, GetCurrentThreadId,
+    SetWaitableTimer, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, SYNCHRONIZATION_SYNCHRONIZE,
+    TIMER_MODIFY_STATE,
+};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::Ime::{
     ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_COMPSTR, GCS_RESULTSTR,
@@ -41,21 +49,24 @@ use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, Shell_NotifyIconW, HDROP,
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
+use windows::Win32::UI::WindowsAndMessaging::MsgWaitForMultipleObjectsEx;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor, GetCursorPos,
     GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
-    GetWindowThreadProcessId, KillTimer, LoadCursorW, LoadIconW, PostQuitMessage, RegisterClassW,
-    SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, CS_DBLCLKS, GA_ROOT, GWLP_USERDATA, GW_HWNDPREV, HCURSOR, HICON,
-    HTCLIENT, HTTRANSPARENT, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW,
-    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNA, SW_SHOWNOACTIVATE, WM_CHAR, WM_CLOSE,
-    WM_CTLCOLOREDIT, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY,
-    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_TIMER,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetWindowThreadProcessId, KillTimer, LoadCursorW, LoadIconW, PeekMessageW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_DBLCLKS, GA_ROOT,
+    GWLP_USERDATA, GW_HWNDPREV, HCURSOR, HICON, HTCLIENT, HTTRANSPARENT, HWND_TOP, ICON_BIG,
+    ICON_SMALL, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG,
+    MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, PM_REMOVE, QS_ALLINPUT, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNA, SW_SHOWNOACTIVATE,
+    WM_CHAR, WM_CLOSE, WM_CTLCOLOREDIT, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES,
+    WM_ERASEBKGND, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SETICON, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
@@ -91,6 +102,17 @@ pub const WM_SYLVA_INJECT: u32 = 0x8000 + 2;
 /// 托盘图标回调消息（WM_APP + 3）：`lParam` 为托盘鼠标消息（WM_RBUTTONUP 等）。
 pub const WM_TRAY: u32 = 0x8000 + 3;
 
+/// 一帧动画节拍到点的自投递消息（WM_APP + 4）。
+///
+/// 不走 `WM_TIMER`：`SetTimer` 的到期时刻会被吸附到系统 ~15.6ms 的定时器栅格，
+/// 请求 16ms 实测得到的是 15/30ms 交替的节拍（240ms 的补间只有 10 帧，肉眼可见
+/// 一跳一跳）。改由 `run_message_loop` 等待**高分辨率可等待定时器**，到点后投递
+/// 本消息给窗口过程——实测节拍稳定 16ms、零抖动，且不依赖 `timeBeginPeriod`
+/// （Win11 对「被遮挡进程」会无视它，而本窗口常驻桌面层、天然被上层窗口盖住）。
+/// 投递而非在循环里直接回调，是为了复用 `WM_TIMER` 那条路径上的再入保护与
+/// 模态丢弃语义（见 `set_event_handler` 注释）。
+pub const WM_APP_ANIM_TICK: u32 = 0x8000 + 4;
+
 /// 托盘图标 ID（进程内唯一）。
 const TRAY_ID: u32 = 1;
 
@@ -107,11 +129,10 @@ const SYNC_LIBRARY_TIMER: usize = 0x5311;
 /// 库同步间隔（毫秒）。
 const SYNC_LIBRARY_MS: u32 = 4000;
 
-/// 动画定时器 ID：周期触发 `AnimTick`，App 推进控制台面板/待办行动画并重绘。
-/// 无动画进行时由 App 通知停止（保持空闲 0% CPU）。
-const ANIM_TIMER: usize = 0x5312;
 /// 动画帧间隔（毫秒，≈60fps）。
 const ANIM_MS: u32 = 16;
+/// 兜底时钟（`SetTimer`/`WM_TIMER`）的定时器 ID，仅在拿不到可等待定时器时使用。
+const ANIM_TIMER_FALLBACK: usize = 0x5313;
 
 /// 右下角缩放手柄尺寸（物理像素）。App 层用同样数值生成手柄命中区域。
 pub const GRIP_SIZE: f32 = 26.0;
@@ -128,6 +149,18 @@ const REORDER_THRESHOLD: f32 = 8.0;
 /// 类只注册一次（同一 HINSTANCE）。
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 static PROXY_CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
+
+/// 动画节拍定时器句柄（`CreateWaitableTimerExW` 高分辨率定时器）。
+///
+/// 进程内只有一个 overlay（单实例互斥），故用静态保存，供 `run_message_loop`
+/// 在等待消息时一并等待。`0` = 尚未创建；创建后长期复用，只做 arm/cancel。
+static ANIM_TIMER_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// 节拍定时器是否已武装（arm）。为 false 时消息循环回到纯阻塞 `GetMessageW`。
+static ANIM_TIMER_ARMED: AtomicBool = AtomicBool::new(false);
+/// 节拍时钟是否处于 `SetTimer`/`WM_TIMER` 兜底态（拆除时要 `KillTimer` 而非 cancel）。
+static ANIM_CLOCK_FALLBACK: AtomicBool = AtomicBool::new(false);
+/// overlay 主窗口句柄：`run_message_loop` 投递 `WM_APP_ANIM_TICK` 用。
+static OVERLAY_HWND: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// 矩形（虚拟屏幕坐标，物理像素）。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -624,6 +657,7 @@ impl OverlayWindow {
         };
         // 创建完成、消息泵启动前写入状态，wnd_proc 从此刻起可安全读取
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
+        OVERLAY_HWND.store(hwnd.0, Ordering::Relaxed);
         // 显式设置任务栏/Alt+Tab 图标（大+小），确保运行中的任务栏按钮显示 Sylva 图标。
         // LoadIconW 返回共享句柄，无需释放；资源缺失时返回空图标，WM_SETICON 接受空值
         // 并退回默认图标，不会出错。
@@ -739,16 +773,32 @@ impl OverlayWindow {
         unsafe { &mut *self.state }.handler = Some(handler);
     }
 
-    /// 启用/停用动画定时器（16ms 触发一次 `AnimTick`）。
-    /// App 在启动动画时启用、动画全部结束后停用，保证空闲时 0% CPU。
+    /// 启用/停用动画节拍定时器。App 在启动动画时启用、全部结束后停用，
+    /// 保证空闲时 0% CPU。
+    ///
+    /// 时钟**必须有兜底**：见 [`anim_clock`] ——一旦时钟失效而没有退路，
+    /// `AnimTick` 永不再来，App 的补间会永远停在半途、且无从自愈。
+    ///
+    /// 幂等：已在目标态时直接返回——动画进行中每建一个补间都会 arm 一次，
+    /// 不去重会重置周期相位，反而拉长第一个间隔。
     pub fn set_anim_active(&self, active: bool) {
-        unsafe {
-            if active {
-                let _ = SetTimer(Some(self.hwnd), ANIM_TIMER, ANIM_MS, None);
-            } else {
-                let _ = KillTimer(Some(self.hwnd), ANIM_TIMER);
-            }
+        if ANIM_TIMER_ARMED.load(Ordering::Relaxed) == active {
+            return;
         }
+        if !active {
+            disarm_anim_clock(self.hwnd);
+        } else if let Some(h) = anim_clock() {
+            // 负 due = 相对时间，单位 100ns；`lPeriod` 让它自动周期性重武装。
+            let due: i64 = -(ANIM_MS as i64) * 10_000;
+            let rc = unsafe { SetWaitableTimer(h, &due, ANIM_MS as i32, None, None, false) };
+            if rc.is_err() {
+                tracing::warn!("节拍定时器武装失败（{rc:?}），降级到 SetTimer/WM_TIMER");
+                arm_fallback_clock(self.hwnd);
+            }
+        } else {
+            arm_fallback_clock(self.hwnd);
+        }
+        ANIM_TIMER_ARMED.store(active, Ordering::Relaxed);
     }
 
     /// 显示拓扑变化后把 overlay 重设到新的虚拟屏幕（移动 + 缩放）。
@@ -779,7 +829,15 @@ impl Drop for OverlayWindow {
         // 避免窗口销毁期间 wnd_proc 引用已释放的内存。
         unsafe {
             let _ = KillTimer(Some(self.hwnd), SYNC_LIBRARY_TIMER);
-            let _ = KillTimer(Some(self.hwnd), ANIM_TIMER);
+        }
+        // 走统一入口拆动画节拍定时器（它还要关闭句柄，不只是停表）。
+        self.set_anim_active(false);
+        OVERLAY_HWND.store(std::ptr::null_mut(), Ordering::Relaxed);
+        let h = HANDLE(ANIM_TIMER_HANDLE.swap(std::ptr::null_mut(), Ordering::Relaxed));
+        if !h.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
         }
         let _ = unsafe { DestroyWindow(self.hwnd) };
         let _ = unsafe { DestroyWindow(self.proxy) };
@@ -1207,8 +1265,18 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-        // 动画定时器：App 推进控制台/待办行动画并重绘（无动画时 App 自行停表）
-        WM_TIMER if wparam.0 == ANIM_TIMER => {
+        // 兜底节拍：拿不到可等待定时器时由 `SetTimer` 发来（见 `arm_fallback_clock`）。
+        WM_TIMER if wparam.0 == ANIM_TIMER_FALLBACK => {
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ptr.is_null() {
+                let state = unsafe { &mut *ptr };
+                emit_event(hwnd, state, OverlayEvent::AnimTick);
+            }
+            LRESULT(0)
+        }
+        // 动画节拍：由 `run_message_loop` 等到的高分辨率定时器投递（见 `WM_APP_ANIM_TICK`）。
+        // App 推进控制台/待办行动画并重绘（无动画时 App 自行停表）。
+        WM_APP_ANIM_TICK => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if !ptr.is_null() {
                 let state = unsafe { &mut *ptr };
@@ -2135,13 +2203,111 @@ fn client_point(lparam: LPARAM) -> (f32, f32) {
     (x as f32, y as f32)
 }
 
+/// 取动画节拍定时器句柄（惰性创建，长期复用）。
+///
+/// 优先 `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`（Win10 1803+）：它不受系统
+/// 15.625ms 定时器栅格约束，实测节拍稳定 16ms。失败则退化为普通可等待定时器
+/// （节拍仍比 `WM_TIMER` 规整），两者都不成才返回 `None` 让调用方走 `SetTimer` 兜底。
+fn anim_clock() -> Option<HANDLE> {
+    let cached = HANDLE(ANIM_TIMER_HANDLE.load(Ordering::Relaxed));
+    if !cached.is_invalid() {
+        return Some(cached);
+    }
+    // 最小权限：只需改状态 + 等待，不要 TIMER_ALL_ACCESS。
+    let rights = (TIMER_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE).0;
+    let h = unsafe {
+        CreateWaitableTimerExW(
+            None,
+            PCWSTR::null(),
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            rights,
+        )
+        .or_else(|_| CreateWaitableTimerExW(None, PCWSTR::null(), 0, rights))
+        .unwrap_or_default()
+    };
+    if h.is_invalid() {
+        tracing::warn!("可等待定时器创建失败，动画节拍降级到 SetTimer/WM_TIMER");
+        return None;
+    }
+    ANIM_TIMER_HANDLE.store(h.0, Ordering::Relaxed);
+    Some(h)
+}
+
+/// 拆除节拍时钟（两种实现都要能停）。
+fn disarm_anim_clock(hwnd: HWND) {
+    if ANIM_CLOCK_FALLBACK.swap(false, Ordering::Relaxed) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), ANIM_TIMER_FALLBACK);
+        }
+        return;
+    }
+    let h = HANDLE(ANIM_TIMER_HANDLE.load(Ordering::Relaxed));
+    if !h.is_invalid() {
+        unsafe {
+            let _ = CancelWaitableTimer(h);
+        }
+    }
+}
+
+/// 兜底时钟：`SetTimer`/`WM_TIMER`。节拍退回 15.6ms 栅格（≈41fps），
+/// 但至少补间能走完——时钟彻底停摆会让面板永远卡在半开状态。
+fn arm_fallback_clock(hwnd: HWND) {
+    unsafe {
+        let _ = SetTimer(Some(hwnd), ANIM_TIMER_FALLBACK, ANIM_MS, None);
+    }
+    ANIM_CLOCK_FALLBACK.store(true, Ordering::Relaxed);
+}
+
 /// 处理消息直到收到 `WM_QUIT`（`PostQuitMessage`）。返回后线程退出。
+///
+/// 两种等待形态：
+/// - **空闲**（无动画）：阻塞式 `GetMessageW`，线程挂起、0% CPU；
+/// - **动画中**（`ANIM_TIMER_ARMED`）：`MsgWaitForMultipleObjectsEx` 同时等消息与
+///   高分辨率节拍定时器。不能直接沿用 `SetTimer`/`WM_TIMER`——那套走系统 ~15.6ms
+///   栅格，请求 16ms 实测得到 15/30ms 交替的节拍，240ms 补间只有 10 帧。
 pub fn run_message_loop() {
     unsafe {
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).0 != 0 {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        loop {
+            let h = HANDLE(ANIM_TIMER_HANDLE.load(Ordering::Relaxed));
+            if ANIM_TIMER_ARMED.load(Ordering::Relaxed) && !h.is_invalid() {
+                // 节拍与消息任一就绪即返回（无新消息时不会因「队列非空」空转）。
+                let rc = MsgWaitForMultipleObjectsEx(
+                    Some(std::slice::from_ref(&h)),
+                    INFINITE,
+                    QS_ALLINPUT,
+                    MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS(0),
+                );
+                if rc.0 == WAIT_FAILED.0 {
+                    // 等待本身失败（句柄异常等）：绝不能带着坏句柄重进本分支——
+                    // 那会以 100% CPU 空转。降级到兜底时钟并回到阻塞等待。
+                    tracing::error!("动画节拍等待失败，降级到 SetTimer/WM_TIMER");
+                    ANIM_TIMER_ARMED.store(false, Ordering::Relaxed);
+                    arm_fallback_clock(HWND(OVERLAY_HWND.load(Ordering::Relaxed)));
+                    continue;
+                }
+                if rc.0 == WAIT_OBJECT_0.0 {
+                    let _ = PostMessageW(
+                        Some(HWND(OVERLAY_HWND.load(Ordering::Relaxed))),
+                        WM_APP_ANIM_TICK,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+                // 排空：等待只在新消息到达时返回，必须一次取净再回到等待。
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_QUIT {
+                        return;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            } else if GetMessageW(&mut msg, None, 0, 0).0 != 0 {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            } else {
+                return; // WM_QUIT
+            }
         }
     }
 }

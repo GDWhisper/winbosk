@@ -227,3 +227,144 @@ cargo fmt --all -- --check
 
 独立上下文子代理审查要点：D2D clip 配对与错误路径、补间状态机与定时器生命周期、
 `fade`/`panel` 派生一致性、`ConsoleResize` 反解在 `panel → 0` 时的数值稳定性。
+
+---
+## 7. 追加：补间节拍退化与帧率修复（实测 41fps → 60fps）
+
+### 7.1 实测证据（修复前）
+
+在 `advance_anim` 头部插入临时帧计数器（统计一次补间内 `AnimTick` 次数与相邻间隔），
+实跑 `target\debug\sylva.exe`，用 `PostMessageW(WM_HOTKEY)` 脚本触发开合：
+
+```
+[anim-probe] 面板补间结束 frames=9  elapsed_ms=216 dur=0.2  gaps_ms=[15,30,15,30,30,15,30,15]
+[anim-probe] 面板补间结束 frames=10 elapsed_ms=240 dur=0.24 gaps_ms=[45,30,5,27,28,30,31,5,28,29]
+```
+
+即**收起 9 帧 / 展开 10 帧**（≈41fps）。关键是间隔被量化在 **15 / 30 / 45ms**——
+正好是系统默认定时器分辨率 15.625ms 的整数倍。
+
+### 7.2 根因：`SetTimer`/`WM_TIMER` 被吸附到 15.6ms 栅格
+
+`SetTimer(16ms)` 的到期时刻被吸附到 15.625ms 栅格，请求 16ms 得到的是 15/30ms 交替的
+节拍。消息循环是阻塞式 `GetMessageW`，不存在忙等挤压或消息饥饿，退化只可能来自栅格吸附。
+
+补间是**时间驱动**（`tween_progress` 用 `elapsed / dur`）而非帧驱动，帧数少不改变时长，
+只降低采样密度并带来 ±15ms 的**间隔抖动**——这才是「一跳一跳」的观感来源。它与第 1 章
+的四条根因是叠加关系：修好几何与透明度后，残余的粗糙感全部来自帧密度。
+
+### 7.3 死路：`timeBeginPeriod(1)` 对本项目无效
+
+第一版尝试在动画期间 `timeBeginPeriod(1)` / `timeEndPeriod(1)`（成对、幂等、`Drop` 兜底）。
+实测：**返回 0（成功），但栅格纹丝不动**，仍是 15/30 交替。
+
+原因见 MSDN `timeBeginPeriod` Remarks：
+
+> Starting with Windows 11, if a window-owning process becomes fully occluded, minimized,
+> or otherwise invisible or inaudible to the end user, Windows does not guarantee a higher
+> resolution than the default system resolution.
+
+本项目的 overlay 常驻**桌面层**（`WorkerW` 之下、普通窗口之下），用户桌面上但凡有一个
+最大化窗口，它在系统眼里就是 fully occluded——也就是说「动画恰恰最需要精度时，
+系统偏偏不给」。这条路对本项目是结构性死路，已整体回退（连带撤回 `Win32_Media` feature）。
+
+### 7.4 定案：高分辨率可等待定时器 + `MsgWaitForMultipleObjectsEx`
+
+独立探针（无窗口进程，即最严苛的「不可见」场景）三组对照，各 30 次等待：
+
+```
+A 普通可等待定时器            : [15,15,15,16,15,15,16,...,30,...]   偶发 30
+B 高分辨率可等待定时器        : [16,16,16,16,16,16,16,...,16]       零抖动
+C B + timeBeginPeriod(1)      : [16,16,16,16,16,16,16,...,16]       与 B 无异
+```
+
+`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`（Win10 1803+）不受 15.6ms 栅格约束，也不需要
+`timeBeginPeriod`——既绕开了栅格，也绕开了遮挡降频，且没有全局功耗副作用。
+
+改动（`crates/render/src/overlay.rs`）：
+
+- 删掉 `ANIM_TIMER`（`SetTimer`）常量与 `WM_TIMER` 分支，改用自投递消息
+  `WM_APP_ANIM_TICK`（`WM_APP + 4`，避开已占用的 +1~+3）；
+- `set_anim_active(true)`：`CreateWaitableTimerExW(..., HIGH_RESOLUTION, ...)` + 周期性
+  `SetWaitableTimer`（负 due = 相对 100ns）。武装失败就不置位——否则消息循环会死等一个
+  不响的节拍；
+- `set_anim_active(false)`：`CancelWaitableTimer`（句柄保留复用，`Drop` 里 `CloseHandle`）；
+- `run_message_loop`：空闲走原阻塞 `GetMessageW`；动画中走
+  `MsgWaitForMultipleObjectsEx(Some([timer]), INFINITE, QS_ALLINPUT, 0)`，节拍到则
+  `PostMessageW(WM_APP_ANIM_TICK)`，**随后用 `PeekMessageW(PM_REMOVE)` 排空消息队列**——
+  该等待只在新消息到达时返回，不排空会丢消息；
+- 投递而非在循环里直接回调：复用 `WM_TIMER` 原路径上的再入保护与模态丢弃语义。
+
+`ANIM_MS` 保持 16——高分辨率定时器实测正好 16ms，60fps 已是全虚拟屏 D2D 重绘的合理上限。
+
+### 7.5 隐性动力学自查
+
+| 律 | 风险 | 处置 |
+| :-- | :--- | :--- |
+| 常驻后台冲突 | 定时器句柄与武装态是进程级静态量 | 进程内只有一个 overlay（单实例互斥），静态量语义明确；句柄创建后长期复用，只 arm/cancel |
+| 0% 空闲 CPU | 动画中每 16ms 一帧，是否停不下来 | 停表链路不变：`advance_anim` 返回 false → App 调 `set_anim_active(false)` → `CancelWaitableTimer` + `ARMED=false` → 循环回到阻塞 `GetMessageW` |
+| 孤儿清理 | 句柄 / 武装态残留 | `Drop` 先走统一入口 cancel，再 `CloseHandle`；高分辨率定时器是内核对象，进程终止亦自动回收 |
+| 状态全集 | 动画中每建一个补间都 arm 一次；武装失败；`Drop` 时已未武装 | `ARMED` 与请求态相同即早退（不去重会重置周期相位，拉长首帧）；`SetWaitableTimer` 失败不置位；`Drop` 无条件 swap+close |
+| 旁路数据对齐 | `ARMED` / 句柄 / `OVERLAY_HWND` 三者脱节 | `OVERLAY_HWND` 在 `SetWindowLongPtrW(GWLP_USERDATA)` 之后、消息泵启动前写入；`ARMED` 只在 `set_anim_active` 一处改写，且与真实 arm/cancel 同步 |
+| 再入与模态 | 节拍投递到窗口过程时 App 正处理模态菜单 | 与原先 `WM_TIMER` 完全同构：App 的再入守卫照旧丢弃 |
+
+### 7.6 修复后实测
+
+```
+[anim-probe] 面板补间结束 frames=15 elapsed_ms=244 dur=0.24 gaps_ms=[16,16,15,16,16,...,16]
+[anim-probe] 面板补间结束 frames=13 elapsed_ms=210 dur=0.2  gaps_ms=[16,16,16,...,16]
+```
+
+| | 修复前 | 修复后 |
+| :-- | :-- | :-- |
+| 展开帧数 | 10 | **15** |
+| 收起帧数 | 9 | **13** |
+| 帧间隔 | 15 / 30 / 45 跳变 | **稳定 16ms** |
+
+帧数 +50%、抖动从 ±15ms 收敛到 ±1ms。
+
+### 7.7 门禁
+
+四道门禁全绿；复测帧数确认后**删除临时探针**再提交。
+
+---
+
+## 8. 审查跟进（独立子代理对抗性审查）
+
+### 8.1 已采纳
+
+| 级别 | 问题 | 处置 |
+| :-- | :--- | :--- |
+| P0 | 时钟创建/武装失败 → `AnimTick` 永不再来，App 补间永远停在半途且无从自愈（面板卡在半开） | 三级降级：高分辨率定时器 → 普通可等待定时器 → `SetTimer`/`WM_TIMER`。兜底态用 `ANIM_CLOCK_FALLBACK` 记录，拆除时走 `KillTimer` 而非 cancel。节拍退化但补间一定能走完 |
+| P1 | `MsgWaitForMultipleObjectsEx` 返回 `WAIT_FAILED` 时既不发节拍也取不到消息 → 立刻重进等待 → **100% CPU 空转** | 判定 `WAIT_FAILED` 即降级到兜底时钟并 `continue`，不再重进本分支 |
+| P2 | `TIMER_ALL_ACCESS` 权限过宽 | 改 `TIMER_MODIFY_STATE \| SYNCHRONIZATION_SYNCHRONIZE` |
+| P2 | `OVERLAY_HWND` 在 `Drop` 后仍残留 | `Drop` 里置空，避免投递到已销毁窗口（退化成线程消息被丢弃） |
+
+### 8.2 未采纳
+
+**P1「改用独立动画线程（`WaitForMultipleObjects([timer, stop_event])` → `PostMessage`）」——不采纳。**
+它确能让 `run_message_loop` 保持单一 `GetMessageW`，但代价是引入线程生命周期、停止事件与
+退出时序（先 SetEvent 再 Join，否则 `Drop` 与 PostMessage 竞争）。本仓库明确要求「不引入
+额外运行时、单线程轻量架构」，且现行方案已把复杂度收敛在 `overlay.rs` 的三个静态量与一个
+双形态循环里。收益不抵风险，保持现状。
+
+### 8.3 与 `WM_TIMER` 的语义差异（非缺陷，记录备查）
+
+1. **停表后可能多一帧**：`CancelWaitableTimer` 不清**已投递**的 `WM_APP_ANIM_TICK`
+   （`KillTimer` 会清队列里的 `WM_TIMER`）。补间是时间驱动且 arm 幂等，多一帧无害。
+2. **优先级**：自投递消息优先于输入消息（`WM_TIMER` 是最低优先级）。动画中鼠标消息
+   最多让位一帧，反而利于动画连续。
+3. **节拍不堆积**：可等待定时器是二值信号，一轮等待至多投递一拍；渲染超 16ms 时是
+   「追赶」而非队列堆积——与 `WM_TIMER` 的合并语义等价。
+4. **嵌套模态期间无节拍**：`TrackPopupMenu` / 文件属性对话框期间外层等待未在运行，
+   不再投递节拍（原先 `WM_TIMER` 会继续到点）。模态结束后按墙钟直接跳到终点。
+   模态即「用户在操作菜单」，可接受。
+
+### 8.4 复测（加固后）
+
+```
+[anim-probe] frames=15 elapsed_ms=242 dur=0.24 gaps_ms=[16,16,16,...,16,15,16]
+[anim-probe] frames=13 elapsed_ms=210 dur=0.2  gaps_ms=[16,15,16,16,15,...,16]
+```
+
+与加固前一致，降级分支未影响主路径。
