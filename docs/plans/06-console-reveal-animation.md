@@ -16,8 +16,10 @@
 
 顺带发现两处既有缺陷（同属本面板几何契约，一并修复）：
 
-- `console_full_height` 末项写成 `12.0 * s.clamp(CONSOLE_MIN_H * s, CONSOLE_MAX_H * s)`，
-  `clamp` 下限恒为 170·s，等价于给面板底部多加约 170px 空白（笔误，本意是 12·s 的底部留白）。
+- `console_full_height` 末项写成 `12.0 * s.clamp(CONSOLE_MIN_H * s, CONSOLE_MAX_H * s)`：
+  `clamp` 的下限恒为 `170·s`，于是这项恒等于 `12 × 170·s ≈ 2040·s` 像素（本意只是 12·s 的
+  底部留白）。面板因此被撑到几乎满屏——内容只占上部约 680·s，下方是一大片空白。这也放大了
+  第 1 条问题：展开时内容很早就全部露出，剩下的行程全在长一段空白，观感上「框一直往下长」。
 - `ConsoleResize` 反解「完全展开高度」仍用胶囊时代公式 `pill_h + (rect.3 - pill_h) / panel`，
   与当前几何 `h = full_h * panel` 不符（胶囊形态早已移除）。
 
@@ -170,6 +172,13 @@ pub struct SceneConsole {
    - **未采纳**：审查提出「启动恢复 `console_open=true` 时未调用 `raise_console()`」——
      这是 `05-console-temporary-topmost.md` §3 的既定语义（提权限定为「本会话用户显式唤出」），
      不是缺陷，本次不动。
+8. **第二轮审查后的收尾修正**：
+   - `console_geometry`：`max_h` 补 `.max(CONSOLE_MIN_H * s)` 兜底，且手动尺寸分支改用
+     `h.clamp(MIN_H * s, max_h)` —— 原 `h.max(MIN_H).min(max_h)` 在 `max_h < MIN_H`
+     （小屏且 `avail` 被最小值兜底）时会把面板压到最小高以下。
+   - `ConsoleResize`：补间进行中按满进度（`panel = 1.0`）反解，避免同一段拖动随 `panel`
+     逐帧变化算出不同展开高度并持久化。
+   - `overlay.rs` 修正仍写「折成胶囊」的过时注释（收起即完全不渲染）。
 
 ## 5. 防御性自查清单 (Defensive Invariants)
 

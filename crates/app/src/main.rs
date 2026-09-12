@@ -1284,7 +1284,13 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             // 几何契约是「可见高度 = 展开高 × panel 进度」（无胶囊基线），故反解为除法；
             // 动画中途缩放时按当前进度反解，稳定态 panel=1 时即等于拖出的高度。
             let s = rt.theme.scale;
-            let panel = rt.console_anim.panel.max(0.05); // 折叠态按最小进度反解，避免除零
+            // 补间进行中（面板尚未完全展开）时按满进度反解：否则同一段拖动会随
+            // `panel` 逐帧变化算出不同的展开高度并持久化，松手后尺寸漂移。
+            let panel = if rt.console_anim.panel_tween.is_some() {
+                1.0
+            } else {
+                rt.console_anim.panel.max(0.05) // 折叠态按最小进度反解，避免除零
+            };
             let full_w = rect.2.max(CONSOLE_MIN_W * s);
             // 反解值必须钳在合法区间：否则动画中途缩放（panel 很小）会把展开高度放大
             // 数十倍并**持久化**进 `console_size`，之后面板永远高得离谱。

@@ -2004,7 +2004,7 @@ fn on_double_click(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
     // 控制台面板：既阻断双击穿透到底层桌面，也让幂等控件「跟手」。
     //
     // 判据是「上一次**按下**是否被控制台面板消费」，而不是「当前坐标是否还在面板矩形内」：
-    // 点「关闭」会把面板折成胶囊（`console_open=false` + 收起补间），补间结束后
+    // 点「关闭」会收起面板（`console_open=false` + 收起补间），补间结束后
     // `scene.console` 直接变成 `None`（见 `scene.rs` 的 `console_open || panel > 0.01`）；
     // 拖动面板也会让它从光标底下移开。这些情形下按坐标判定都会失效并放行穿透，
     // **双击关闭按钮就会顺手打开正下方的一个桌面文件**。

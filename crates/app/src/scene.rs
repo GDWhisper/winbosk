@@ -343,15 +343,15 @@ pub(crate) fn console_geometry(
     // 可用高度：屏幕高度减去上下边距，并预留展开回弹的过冲余量——过冲高峰
     // （`CONSOLE_OVERSHOOT_MAX`）不应把面板底边推出屏幕，否则末帧会画到屏外。
     let avail = (vh - 2.0 * margin).max(CONSOLE_MIN_H * s);
-    let max_h = avail / CONSOLE_OVERSHOOT_MAX;
+    // 可用高度预留展开回弹的过冲余量（过冲高峰不应把面板底边推出屏幕），
+    // 同时保证不小于最小高度——否则小屏上 `avail` 被最小值兜底时，
+    // 除以过冲系数后反而低于最小高，面板会被压扁。
+    let max_h = (avail / CONSOLE_OVERSHOOT_MAX).max(CONSOLE_MIN_H * s);
     let auto_full_h = console_full_height(desk, selected, s)
         .min(CONSOLE_MAX_H * s)
         .min(max_h);
     let (w, full_h) = match desk.console_size {
-        Some((w, h)) => (
-            w.max(CONSOLE_MIN_W * s),
-            h.max(CONSOLE_MIN_H * s).min(max_h),
-        ),
+        Some((w, h)) => (w.max(CONSOLE_MIN_W * s), h.clamp(CONSOLE_MIN_H * s, max_h)),
         None => (CONSOLE_W * s, auto_full_h),
     };
     // 允许小幅过冲（展开回弹），CONSOLE_OVERSHOOT_MAX 上限避免面板瞬时过高
