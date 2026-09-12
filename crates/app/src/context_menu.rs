@@ -36,10 +36,7 @@ pub(crate) fn handle_tray_menu(rt: &mut Runtime) {
             execute_auto_organize(rt);
         }
         MENU_TRAY_CONSOLE => {
-            let open = !rt.desk.console_open;
-            rt.desk.console_open = open;
-            let _ = rt.store.save(&rt.desk);
-            start_panel_tween(rt, if open { 1.0 } else { 0.0 });
+            set_console_open(rt, !rt.desk.console_open);
         }
         MENU_TRAY_QUIT => unsafe {
             let _ = PostMessageW(Some(rt.hwnd), WM_APP_QUIT, WPARAM(0), LPARAM(0));

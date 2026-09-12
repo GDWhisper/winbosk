@@ -747,6 +747,27 @@ fn is_popup_dismiss_event(ev: &OverlayEvent) -> bool {
     )
 }
 
+/// 控制中心开合的单一状态变迁出口：写状态 → 持久化 → 同步 overlay Z 序 → 驱动补间。
+///
+/// 全仓库唯一的 `desk.console_open` 写入点。控制中心是用户显式唤出的面板，展开期间
+/// overlay 临时提升到普通 Z 序带顶部（盖住浏览器等普通窗口），收起立即落回桌面带；
+/// 状态与 Z 序在同一函数内同步，杜绝「面板开着但仍在桌面带 / 关了却悬在普通带」的组合态。
+/// 提权仅存在于本会话显式唤出期间，不持久化（重启后 overlay 始终在桌面带）。
+pub(crate) fn set_console_open(rt: &mut Runtime, open: bool) {
+    rt.desk.console_open = open;
+    if let Err(e) = rt.store.save(&rt.desk) {
+        tracing::warn!("控制台状态持久化失败: {e}");
+    }
+    unsafe {
+        if open {
+            (*rt.overlay_ptr).raise_console();
+        } else {
+            (*rt.overlay_ptr).restore_desktop_band();
+        }
+    }
+    start_panel_tween(rt, if open { 1.0 } else { 0.0 });
+}
+
 /// 处理一个用户交互事件：更新布局 → （按需）重绘 → 生成新命中模型。
 ///
 /// 返回 `None` 表示本事件不改变任何可见状态，无需重绘（overlay 保持当前
@@ -1000,20 +1021,12 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
         }
         OverlayEvent::ConsoleClick { zone } => match zone {
             ConsoleZone::Close => {
-                // 折叠为胶囊（面板始终可见，不再「消失」）；保存开关状态供重启恢复
-                rt.desk.console_open = false;
-                if let Err(e) = rt.store.save(&rt.desk) {
-                    tracing::warn!("控制台状态持久化失败: {e}");
-                }
-                start_panel_tween(rt, 0.0);
+                // 收起面板（完全不渲染，不留胶囊）；保存开关状态供重启恢复
+                set_console_open(rt, false);
             }
             ConsoleZone::Expand => {
-                // 点击胶囊展开面板
-                rt.desk.console_open = true;
-                if let Err(e) = rt.store.save(&rt.desk) {
-                    tracing::warn!("控制台状态持久化失败: {e}");
-                }
-                start_panel_tween(rt, 1.0);
+                // 唤出面板（热键/托盘/入口按钮同语义）
+                set_console_open(rt, true);
             }
             ConsoleZone::DesktopToggle => {
                 toggle_desktop(rt);
@@ -1275,24 +1288,12 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             }
         }
         OverlayEvent::ConsoleToggle => {
-            // 热键 Ctrl+Alt+T：展开/折叠面板（胶囊始终可见，热键只是切换形态）
-            let open = !rt.desk.console_open;
-            rt.desk.console_open = open;
-            if let Err(e) = rt.store.save(&rt.desk) {
-                tracing::warn!("控制台状态持久化失败: {e}");
-            }
-            if open {
-                start_panel_tween(rt, 1.0);
-            } else {
-                start_panel_tween(rt, 0.0);
-            }
+            // 热键 Ctrl+Alt+T：唤出/收起面板（与托盘左键同语义）
+            set_console_open(rt, !rt.desk.console_open);
         }
         OverlayEvent::TrayToggle => {
             // 托盘图标左键单击：切换控制中心开合（与 Ctrl+Alt+T 相同）
-            let open = !rt.desk.console_open;
-            rt.desk.console_open = open;
-            let _ = rt.store.save(&rt.desk);
-            start_panel_tween(rt, if open { 1.0 } else { 0.0 });
+            set_console_open(rt, !rt.desk.console_open);
         }
         OverlayEvent::TrayMenu => {
             handle_tray_menu(rt);

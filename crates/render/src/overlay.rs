@@ -42,20 +42,20 @@ use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor, GetCursorPos,
+    GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
     GetWindowThreadProcessId, KillTimer, LoadCursorW, LoadIconW, PostQuitMessage, RegisterClassW,
     SendMessageW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, CS_DBLCLKS, GWLP_USERDATA, HCURSOR, HICON, HTCLIENT,
-    HTTRANSPARENT, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS,
-    IDC_SIZENWSE, IDC_SIZEWE, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOZORDER, SW_SHOWNA,
-    SW_SHOWNOACTIVATE, WM_CHAR, WM_CLOSE, WM_CTLCOLOREDIT, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    ShowWindow, TranslateMessage, CS_DBLCLKS, GA_ROOT, GWLP_USERDATA, GW_HWNDPREV, HCURSOR, HICON,
+    HTCLIENT, HTTRANSPARENT, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNA, SW_SHOWNOACTIVATE, WM_CHAR, WM_CLOSE,
+    WM_CTLCOLOREDIT, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCHITTEST, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_TIMER,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
@@ -450,6 +450,10 @@ pub struct OverlayWindow {
     /// 覆盖的虚拟屏幕尺寸（物理像素）。
     pub width: u32,
     pub height: u32,
+    /// create 时的父/owner 窗口（持有 DefView 的 WorkerW，无 DefView 时为 Progman）。
+    /// 仅用于收起控制中心时把窗口插回 owner 之后、落回桌面带；overlay 与 owner 的
+    /// 生命周期被所有权机制绑定（owner 销毁则 owned overlay 一并销毁），句柄不会悬空。
+    owner: HWND,
     state: *mut WindowState,
 }
 
@@ -471,6 +475,58 @@ impl OverlayWindow {
         self.with_foreground_lock(|| unsafe {
             let _ = SetForegroundWindow(self.proxy);
         });
+    }
+
+    /// 控制中心唤出：把 overlay 从桌面带临时提升到普通 Z 序带顶部（`HWND_TOP`）。
+    ///
+    /// overlay 以 WorkerW 为 owner 锚在桌面带，默认永远低于普通应用窗口；用户显式唤出
+    /// 控制中心时需要临时浮于其上（盖住浏览器等普通窗口，仍低于真正的 TOPMOST 窗口）。
+    /// 必须经 `with_foreground_lock`：Sylva 是后台进程，直接 `SetWindowPos(HWND_TOP)`
+    /// 会被系统静默拒绝（返回 TRUE 但 Z 序纹丝不动，已实测）——与 `raise_to_foreground`
+    /// 同一套 AttachThreadInput 手法。只动 Z 序：`SWP_NOACTIVATE` 不激活——激活会把
+    /// 桌面壳层提到应用之上，且系统不接受激活（键盘输入走隐藏焦点代理）；几何与
+    /// owner 层级一律不动。收起时必须配对调用 `restore_desktop_band`。
+    pub fn raise_console(&self) {
+        self.with_foreground_lock(|| unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER,
+            );
+        });
+    }
+
+    /// 控制中心收起：把 overlay 插回 owner（WorkerW）**正上方**，落回桌面带。
+    ///
+    /// 与 `raise_console` 配对，恢复「栅栏属于桌面」的原有层级。注意 `SetWindowPos`
+    /// 的 `hWndInsertAfter` 语义是「被定位窗口插到该窗口**之下**」：直接传 owner 会把
+    /// overlay 插到 WorkerW 之下、壁纸之后（栅栏整体不可见不可点，已实测），因此锚点
+    /// 必须取「owner 当前正上方的窗口」——把 overlay 恰好放进 owner 之上刚空出的位置，
+    /// 与壁纸/图标/其它 WorkerW 的相对次序无关。owner 可能是子窗口（`SHELLDLL_DefView`），
+    /// 先 `GA_ROOT` 归一到顶层域再取其上一窗；owner 之上若无窗口（理论边界），跳过恢复
+    /// 保持现状（留在普通带优于误落到壁纸之后）。owner 若已销毁，所有权机制会连带销毁
+    /// overlay，本方法不会有悬空句柄的运行态；`SetWindowPos` 失败仅忽略（容错口径与
+    /// `resize` 一致）。
+    pub fn restore_desktop_band(&self) {
+        unsafe {
+            let root = GetAncestor(self.owner, GA_ROOT);
+            let Ok(anchor) = GetWindow(root, GW_HWNDPREV) else {
+                return;
+            };
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(anchor),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER,
+            );
+        }
     }
 
     /// 弹出菜单要用的 owner 窗口（可激活的焦点代理），并已把它提到前台。
@@ -665,6 +721,7 @@ impl OverlayWindow {
             y: vy,
             width: vw as u32,
             height: vh as u32,
+            owner: parent,
             state: state_ptr,
         })
     }
