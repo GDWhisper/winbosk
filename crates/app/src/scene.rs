@@ -2674,6 +2674,9 @@ mod tests {
     /// 于是"空路径 → 零命中区"那条断言恒真、从未执行（对抗性审查 P2-1）。
     #[test]
     fn storage_row_geometry_path_hit_hugs_text() {
+        // 自证覆盖：下面这个矩阵必须真的走到"被省略"这条分支。上一版正因为没有长路径输入，
+        // 让"截断后命中区仍贴字形"这条断言从未被检验过——所以这里显式数一次，不许靠运气。
+        let mut saw_elided = 0u32;
         for s in [1.0f32, 1.25, 1.5, 2.0] {
             for panel_w in [CONSOLE_W, CONSOLE_MIN_W] {
                 let theme = test_theme(s);
@@ -2681,7 +2684,14 @@ mod tests {
                 let font = theme.label.size * 0.72;
                 for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
                     for can_reset in [false, true] {
-                        for path in [r"D:\归档\资料库", ""] {
+                        // 三种输入各有分工：`短路径` = 原样显示；`长路径` = 会被 `elide_middle`
+                        // 省略（覆盖"截断后命中区仍贴字形"）；`空路径` = 必须退化为零命中区。
+                        // 上一版只有第一个输入，长路径与空路径两个分支从未执行。
+                        for path in [
+                            r"D:\归档\资料库",
+                            r"D:\归档\非常长的中文目录名称\另一个子目录\最后的文件夹",
+                            "",
+                        ] {
                             let row = storage_row_geometry(&d, 0.0, kind, can_reset, path, &theme);
                             let ctx = format!(
                                 "panel={panel_w} s={s} {kind:?} reset={can_reset} path={path:?}"
@@ -2719,21 +2729,27 @@ mod tests {
                             } else {
                                 let text_w =
                                     winbosk_core::text::estimate_width(&row.path_text, font);
+                                if row.path_text != path {
+                                    saw_elided += 1;
+                                }
                                 // 3) 命中区永不宽于字形——右侧空白不吞点击。
                                 assert!(
                                     row.path_hit.w <= text_w + 1e-3,
                                     "{ctx}: 命中区 {} 宽于字形 {text_w}（右侧空白也在吞点击）",
                                     row.path_hit.w
                                 );
-                                // 4) 要么**严丝合缝**贴住字形，要么是被绘制框钳住（文字已被截断、
-                                //    铺满整框）。两条路只允许二选一——若文字没截断却铺满整框，
-                                //    就是"看不见却能点"复发；若文字截断了却没铺满，就是白丢可点区域。
-                                let clamped = row.path_hit.w >= row.path.w - 1e-3;
-                                let truncated = row.path_text != path;
+                                // 4) 不能白丢可点区域：命中区宽度 == `min(字形宽, 绘制框宽)`。
+                                //    常规输入下字形永远装得进绘制框（`elide_middle` 保证省略结果
+                                //    ≤ 预算 < 框宽），所以实际走的是"严丝合缝贴字形"这一支；
+                                //    `min` 的另一支只在路径短到无法再省略、字形反而比框宽时才出现，
+                                //    此时钳到框宽是唯一正解——命中区绝不能伸到框外。
+                                //    （上一版把这一支写成 `truncated && clamped`，而 `truncated`
+                                //    为真时 `elide_middle` 必然已把字宽压到预算内、永远不钳位
+                                //    → 该断言恒假分支、不可证伪，已删。）
+                                let expected = text_w.min(row.path.w);
                                 assert!(
-                                    (row.path_hit.w - text_w).abs() < 1e-3
-                                        || (truncated && clamped),
-                                    "{ctx}: 命中区 {} 既没贴字形 {text_w}，也不是被截断后的满框 {}",
+                                    (row.path_hit.w - expected).abs() < 1e-3,
+                                    "{ctx}: 命中区 {} 应为 {expected}（字形 {text_w} / 绘制框 {}）",
                                     row.path_hit.w,
                                     row.path.w
                                 );
@@ -2748,6 +2764,11 @@ mod tests {
                 }
             }
         }
+        assert!(
+            saw_elided > 0,
+            "矩阵里没有任何输入触发 `elide_middle`——长路径用例失效了，\
+             「截断后命中区仍贴字形」这条断言等于没测"
+        );
     }
 
     /// 值行的命中表**有且只有**路径一个热区（`OpenStoragePath`），且矩形逐字段等于 `path_hit`。
