@@ -11,6 +11,10 @@
 
 ## 1. 目标与非目标 (Goals & Non-Goals)
 
+> **注（2026-09-13）**：本章是 **v1** 的规格。§8 做了一次设计修订——「打开」按钮被删除，
+> 改由**路径自身**承担 `OpenStoragePath`。下面凡提到 `打开` 按钮、或"路径取消命中"之处，
+> **都只对 v1 成立**；**现役（v2）契约见 §8**。原文保留以留下当初的目标与判据。
+
 ### Goals
 
 1. **列语义归位**：标签列只放标签，值放值，动作放动作。
@@ -20,6 +24,7 @@
    - 状态标签彻底去按钮化（灰底填充标签，无描边，**不参与命中**——保持不可点，但也不再像按钮）；
    - 路径文本**取消命中**（plan 04 曾把它整块设为 `ChangeStoragePath` 热区，本计划回退该决定）；
    - 新增 `打开` 按钮：路径旁给一个**看得见**、真正有用的动作（资源管理器打开目录）。
+   - *（v2 修订：按钮删除，路径本身成为 `OpenStoragePath` 热区；见 §8。）*
 3. **后果提示常显**：补上"在此删除会真删磁盘文件"这一条此前界面上一个字都没有的信息
    （两种模式的判定真源见 [`crates/app/src/file_ops.rs`](file:///g:/Codes/sylva/crates/app/src/file_ops.rs) `is_managed_path`）。
 4. **动作文案与风险对齐**：「更改位置…」→「更改文件位置…」（与行标签同名，动作对象无歧义），
@@ -359,8 +364,9 @@ owner 用 overlay 本体（**不是**离屏 1×1 的代理），默认焦点落�
 
 `cargo test -p winbosk-app` —— `scene::tests` 新增：
 
-- `storage_row_geometry_is_pairwise_disjoint`：在 `CONSOLE_W` / `CONSOLE_MIN_W` ×
-  `s ∈ {1.0, 1.5, 2.0}` × 两种模式 × `can_reset` 两种取值下，断言
+- `storage_row_geometry_is_pairwise_disjoint`：在四种（面板宽, DPI）组合
+  `(CONSOLE_W,1.0) / (CONSOLE_MIN_W,1.0) / (CONSOLE_W,1.5) / (CONSOLE_MIN_W,2.0)`
+  （`s ∈ {1.0, 1.5, 2.0}`，但**不是** 2×3 全交叉）× 两种模式 × `can_reset` 两种取值下，断言
   `tag / path / change / reset / hint` 五个**排布**矩形中所有非零矩形两两不重叠，且全部落在
   `[inner_left, inner_right]` 内；并断言 `tag` / `change` 永不为零、`path_hit` 永不为零
   （值行必须能显示"存在哪"且路径必须可点，动作按钮必须常驻）。
@@ -415,16 +421,17 @@ cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
 ```
 
-**实测（2026-09-13）** —— 第一轮 = §7.2 修复之后；第二轮 = §8 设计修订 + §7.4 复审修复之后：
+**实测（2026-09-13）** —— 第一轮 = §7.2 修复之后；第二轮 = §8 设计修订 + §7.4 复审修复之后；
+第三轮 = §7.5 复审修复之后（含用真 DWrite 实测的新单测）：
 
-| 门禁 | 第一轮 | 第二轮（现役） |
-| :--- | :--- | :--- |
-| `cargo build --workspace` | `Finished` dev profile，19.41s，零警告 | `Finished` dev profile，8.09s，**零警告** |
-| `cargo test --workspace` | 42 + 66 + 34 + 18 passed, 0 failed | **45 + 66 + 34 + 18 passed, 0 failed**（另 3 个 0 测试的 crate；+3 = 新增 `storage_zones_value_row_has_exactly_the_path` 等） |
-| `cargo clippy --workspace -- -D warnings` | `Finished`，6.36s，零警告 | `Finished`，4.22s，**零警告** |
-| `cargo fmt --all -- --check` | 干净（无 diff） | 干净（无 diff） |
+| 门禁 | 第一轮 | 第二轮 | 第三轮（现役） |
+| :--- | :--- | :--- | :--- |
+| `cargo build --workspace` | `Finished` 19.41s，零警告 | `Finished` 8.09s，零警告 | `Finished` 8.55s，**零警告** |
+| `cargo test --workspace` | 42 + 66 + 34 + 18 | 45 + 66 + 34 + 18 | **45 + 66 + 35 + 18 passed, 0 failed**（另 3 个 0 测试的 crate；render +1 = `measure_detail_is_tighter_than_estimate_for_ascii`） |
+| `cargo clippy --workspace -- -D warnings` | `Finished` 6.36s，零警告 | `Finished` 4.22s，零警告 | `Finished` 3.89s，**零警告** |
+| `cargo fmt --all -- --check` | 干净 | 干净 | 干净（无 diff） |
 
-（第二轮曾因新测试里两处超长行被 rustfmt 判 diff，`cargo fmt --all` 后复检干净。）
+（第二、三轮各因新代码里几处超长行被 rustfmt 判 diff，`cargo fmt --all` 后复检干净。）
 
 构建环境按 `.workbuddy-ai/skills/sylva-repo-ops/SKILL.md` §1 注入 MSVC（Git Bash 下
 `link.exe` 会被 coreutils 遮蔽），并设 `WINBOSK_WINSDK_ROOT` 绕开被沙箱屏蔽的 `reg.exe`——
@@ -611,6 +618,52 @@ v2 恰恰相反：路径**就是**唯一的打开热区。这类"注释反着写
 修法：在 `WM_MOUSELEAVE` 里，若镜像为 `Some` 则**先 emit 清除事件再置空**。
 这是 v2 之前就存在的缺陷，只是 v2 让路径热区的宽度随面板变化，更容易被看见。
 
+### 7.5 第三轮对抗性审查（2026-09-13）
+
+再派发一个**无对话历史**子代理复审上面三个提交。**无 P0**；1 个 P1 + 4 个 P2，全部已处置。
+
+**P1 — 命中区/下划线并没有"贴实际字形"（已修）**
+
+本轮自定的核心不变量是"画出来的范围 = 能点的范围"，但命中区与下划线宽度都取自
+`estimate_width`——而它**对 ASCII 偏大 24.5%**（见 §8.1 补记）。默认库路径上实测：
+估算 214.27 / 真实 172.05，下划线因此戳出文字 **42 DIP**，默认面板宽下被省略的路径更会
+留出约 **49 DIP** 的空白被划线——正是本轮要消灭的那个毛病，只是缩小了。
+
+修法不是去调 `estimate_width`（它是全 App 共用口径，动它会影响所有布局，须单独立 plan）：
+- **新增** `TextFormats::measure_detail(text) -> Option<(w, h)>`，用真 DWrite
+  `CreateTextLayout` + `GetMetrics` 实测；`TextFormats` 自持一份 `IDWriteFactory`
+  （布局层拿不到工厂，所以"画的人"自己留一份）；
+- **下划线改用实测宽与实测行高**，命中区**保持**用估算宽——命中区偏宽是**故意**的：
+  路径右侧留白也能点，无害且更宽容（值行右端没有别的控件可抢，动作又是可逆的"打开"）。
+  即"能点的可以比画出来的大，画出来的必须等于字形"；
+- 实测失败时退回估算值照常画，**不因为量不出来就不给 hover 反馈**；
+- 用单测钉住（含 CJK 应≈估算、空串应为 `(0,0)` 而非"实测失败"）。
+
+**P2-1 — 悬停只在 `WM_MOUSELEAVE` 清了，拖拽开始时没清（已修）**
+
+`WM_MOUSEMOVE` 的悬停更新被 `if state.drag.is_none()` 门禁，`ConsoleMove` / `ConsoleResize` /
+拖图标期间 `rt.console_hover` 不更新 → 拖面板时进入拖拽那一刻鼠标下的控件（多半是路径）
+全程亮着高亮与下划线。已在 `else` 分支补"镜像为 `Some` 则 emit 清除"。
+另在 App 侧唯一的 `set_console_open` 写入点无条件清 `rt.console_hover`——面板凭空出现/消失
+时（热键、托盘）光标位置未知，overlay 的两条通路覆盖不到。
+
+**P2-2 — 新测试里有一条恒假分支（已修）**
+
+`truncated && clamped` 恒假：`truncated` 为真意味着 `elide_middle` 已把字宽压到预算内
+（预算 = 框宽 − 2·s），于是永远不钳位。已改成 `min(字形宽, 框宽)`，并把**长路径**加进输入矩阵
+（上一版只有短路径与空路径，"被省略"这条分支从未执行）。
+
+**P2-3 — 下划线仍悬空（已随 P1 一并修）**
+
+锚点用的是估算行高 1.6 em，而实测行高只有 **1.27 em** → 下划线落在字形下方约 0.33 em。
+改用实测 `m.height` + 0.06 em 间隙。
+
+**P2-4 — 两处小假（已修）**
+
+`render/src/scene.rs` 称"绘制层不再二次截断"，但 `draw_text` 仍走 `truncate_to_fit`
+（App 预留 2·s 所以平时不触发，但那是兜底不是保证）；§6.1 把 4 组（面板宽, DPI）组合
+写成了"2 宽 × 3 DPI"全交叉。
+
 ---
 
 ## 8. 设计修订：移除「打开」按钮，改由路径承担（2026-09-13）
@@ -628,8 +681,23 @@ v2 恰恰相反：路径**就是**唯一的打开热区。这类"注释反着写
 | `G://…//data//library` | 110.42 | 82.07 | **+34.5%**（ASCII 按 0.62 em，实际 ≈0.5） |
 
 **结论：估算器全线偏保守（偏大），没有一处偏小** → 不会挤字、不会裁字。
-（顺带一个可选的后续项：ASCII 系数 0.62 比实测宽 ~24%，会让 ASCII 为主的路径被**过度**省略；
-但它是全 App 共用的口径，改动影响所有布局，须单独立 plan + 审查，本次不动。）
+
+**补记（第三轮审查后，用 DirectWrite 复核）**：Pillow 的数是外部工具量的，为排除"量错"，
+后来在 `TextFormats::measure_detail` 里用**真 DWrite `CreateTextLayout` + `GetMetrics`**
+复核了同一条路径，并用单测钉住（`crates/render/src/draw.rs`：
+`measure_detail_is_tighter_than_estimate_for_ascii`）：
+
+| 口径 | `G:\Codes\sylva\target\debug\data\library` @ 8.64 DIP |
+| :--- | ---: |
+| `estimate_width`（估算） | 214.27 |
+| DWrite `GetMetrics`（实测） | **172.05** |
+| Pillow `getlength`（实测，交叉验证） | 172.67 |
+
+两种独立实测吻合到 **0.4%**，估算则偏大 **24.5%**。**实测行高 10.97 = 1.27 em**（不是 1.6 em）。
+
+于是立下一条口径规则：**预算用估算（宁大勿小，保证永不裁字），贴字形的绘制用实测。**
+顺带一个可选的后续项：ASCII 系数 0.62 比实测宽 ~24%，会让 ASCII 为主的路径被**过度**省略；
+但它是全 App 共用的口径，改动影响所有布局，须单独立 plan + 审查，本次不动。
 
 ### 8.2 发现的问题
 
