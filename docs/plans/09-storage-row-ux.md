@@ -338,6 +338,13 @@ owner 用 overlay 本体（**不是**离屏 1×1 的代理），默认焦点落�
 - `storage_row_geometry_reset_absent_is_zero_rect`：`can_reset == false` 时 `reset` 为零矩形
   （`h <= 0.0`）；`can_reset == true` 时它排在「更改文件位置…」左侧且不重叠；
   少了它提示预算应变宽。
+- `storage_row_geometry_shares_one_text_top`：值行内三段 detail 字号文字**共用唯一顶线**——
+  断言 `path.y == text_top`、动作行提示语与值行文字用**同一偏移**、且整行文字
+  （行高 = `1.6 × detail 字号`）不溢出值行带。覆盖 `s ∈ {1.0, 1.25, 1.5, 2.0}` × 两种模式
+  × `can_reset` 两种取值。
+  *（这条是**审查后补的**：`storage_text_top` 字段是修 P2 时新增的，补测试前它没有任何断言保护。
+  已用 A/B 证明非空转——把 `path_rect.y` / `hint.y` 临时改回写死偏移，该测试立刻
+  `FAILED: 路径未落在共用顶线上`；改回即通过。）*
 
 ### 6.2 幂等与零输入
 
@@ -359,7 +366,7 @@ cargo fmt --all -- --check
 | 门禁 | 结果 |
 | :--- | :--- |
 | `cargo build --workspace` | `Finished` dev profile，19.41s，**零警告** |
-| `cargo test --workspace` | **41 + 66 + 34 + 18 passed, 0 failed**（另 3 个 0 测试的 crate） |
+| `cargo test --workspace` | **42 + 66 + 34 + 18 passed, 0 failed**（另 3 个 0 测试的 crate） |
 | `cargo clippy --workspace -- -D warnings` | `Finished`，6.36s，**零警告** |
 | `cargo fmt --all -- --check` | 干净（无 diff） |
 
@@ -383,10 +390,26 @@ cargo fmt --all -- --check
 6. 把面板拖到最小宽（`CONSOLE_MIN_W`）→ 无重叠、无越界；`外部文件夹` 模式下提示语整体消失；
 7. 125% / 150% DPI 下无挤字、无重叠。
 
-> **本次未做 GUI 实跑**：本机有用户既有实例在跑（旧名 `sylva.exe`，PID 35700），它持有单实例
-> 互斥 `WinBosk.Desktop.Fences`，新进程会静默自退；按 SKILL.md §4 不杀用户实例。且 2s 的
-> autostop 跑**覆盖不到控制中心面板**（默认不展开，SKILL.md §4c）。故上述 1~7 项**仍待人工
-> 按 `Ctrl+Alt+T` 走查**；几何正确性由纯函数单测（§6.1）覆盖，其余靠 §7.2 的静态审查。
+> **本次未做 GUI 实跑**，理由如下（**注意：不是「互斥被占用」**）：
+> 本机在跑的是**更名前的旧二进制** `sylva.exe`（PID 35700），它持有的是**旧互斥名
+> `Sylva.Desktop.Fences`**；而 `main.rs` 现在用的是 `WinBosk.Desktop.Fences`。
+> 已用 `OpenMutexW` 实测：`Sylva.Desktop.Fences` 存在、`WinBosk.Desktop.Fences` **不存在**——
+> 也就是说新构建**不会**因单实例而自退，旧实例并不能挡住新实例。
+>
+> 之所以仍然不跑，是另外两条理由：
+> 1. **数据目录会撞车**：`<exe_parent>/data` 是硬约定（`AGENTS.md` 第 7 条），而旧实例也在
+>    `target\debug\` 下，两个进程会**同时读写同一份 `data\`（配置与内部库）**，
+>    4s 心跳落盘交错有损坏用户栅栏配置的实际风险；
+> 2. **不该打扰用户的活桌面**：起第二个 overlay 会在用户桌面上叠出第二套栅栏、并二次
+>    `SW_HIDE` 真实桌面图标，退出时又无条件 `SW_SHOW`（与旧实例的隐藏状态打架）。
+>    抓屏还会拍到用户桌面的私人内容。
+>
+> 结论：**留待用户关闭旧实例后人工走查**。若要在不碰用户配置的前提下自行验证，可行做法是把
+> `winbosk.exe` 复制到临时目录（`<exe_parent>/data` 随之落在临时目录、配置全新）再
+> `WINBOSK_AUTOSTOP_MS=60000` + `run_in_background` 启动、用 `PostMessageW` 投
+> `WM_HOTKEY` 唤出面板抓屏——本次未采用，因为仍会在用户桌面上叠第二套栅栏。
+>
+> 几何正确性由纯函数单测（§6.1）覆盖，其余靠 §7.2 的静态审查。
 > 另：控制中心的热键与面板渲染路径本次未改动，风险面集中在存储行的几何与文案。
 
 ### 6.5 独立上下文子代理审查
@@ -464,4 +487,6 @@ cargo fmt --all -- --check
 5. 四道门禁的静态判断无法替代实跑（子代理按要求未跑 cargo）。
 
 上述 1、2 需人工按 `Ctrl+Alt+T` 展开面板走查；3、4 需实机触发删除确认与「打开」。
-本次因单实例互斥被用户既有实例占用，未做 GUI 实跑（详见 §6.4）。
+本次未做 GUI 实跑——**原因不是单实例互斥被占用**（旧实例持有的是旧互斥名
+`Sylva.Desktop.Fences`，挡不住新构建），而是「两个进程会同时读写同一份
+`<exe_parent>/data`」与「不该在用户的活桌面上叠第二套栅栏」，详见 §6.4。

@@ -2576,4 +2576,61 @@ mod tests {
             "少了「恢复默认」，提示语预算应变宽"
         );
     }
+
+    /// 值行内三段 detail 字号文字（行标签 / 状态标签 / 路径）**必须共用唯一顶线**，
+    /// 且该顶线让整行文字落在值行带内。
+    ///
+    /// 这条断言是「整行看着歪」那个病的回归保险：曾经行标签写死 `+2·s`、状态标签就地按
+    /// `label.size × 1.6` 估行高居中（字号其实是 `detail`，估出来的行高比标签框还高、
+    /// 文字被顶出框）、路径写死 `+4·s`——三段同字号却落在三条基线上。
+    /// 行标签与状态标签的绘制顶线都取自 `row.text_top`，路径取 `row.path.y`，
+    /// 故只要 `path.y == text_top` 就等价于三者同源（绘制层不再有任何自带偏移）。
+    #[test]
+    fn storage_row_geometry_shares_one_text_top() {
+        // 覆盖本机实际会遇到的两档缩放 + 两个整数档（`apply_theme_scale` 是线性乘法，
+        // 非整数档不会引入新的分支，取 1.25 作为代表即可）。
+        for s in [1.0f32, 1.25, 1.5, 2.0] {
+            for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                for can_reset in [false, true] {
+                    let theme = test_theme(s);
+                    let d = test_detail_rect(CONSOLE_W, s);
+                    let row_y = 100.0 * s;
+                    let row = storage_row_geometry(
+                        &d,
+                        row_y,
+                        kind,
+                        can_reset,
+                        "C:\\Users\\x\\Desktop",
+                        &theme,
+                    );
+
+                    // 1) 路径文本区顶 == 共用顶线（等价于行标签/状态标签/路径同基线）。
+                    assert!(
+                        (row.path.y - row.text_top).abs() < 1e-3,
+                        "s={s} {kind:?} can_reset={can_reset}: 路径未落在共用顶线上"
+                    );
+                    // 2) 动作行提示语与值行文字用**同一偏移**（各自的行带起点不同）。
+                    if row.hint.h > 0.0 {
+                        let dy_value = row.text_top - row.value_row.y;
+                        let dy_action = row.hint.y - row.change.y; // change.y == 动作行行带顶
+                        assert!(
+                            (dy_value - dy_action).abs() < 1e-3,
+                            "s={s} {kind:?} can_reset={can_reset}: 动作行提示语偏移与值行不一致"
+                        );
+                    }
+                    // 3) 顶线本身落在值行带内，且一整行文字（行高 = 1.6 × detail 字号）
+                    //    不会溢出到下一行——溢出就会被行带的裁剪吃掉。
+                    let line_h = theme.label.size * 0.72 * 1.6;
+                    assert!(
+                        row.text_top > row.value_row.y,
+                        "s={s}: 顶线跑到值行带上方了"
+                    );
+                    assert!(
+                        row.text_top + line_h <= row.value_row.y + row.value_row.h + 1e-3,
+                        "s={s} {kind:?}: 一行文字（{line_h}）溢出了值行带"
+                    );
+                }
+            }
+        }
+    }
 }
