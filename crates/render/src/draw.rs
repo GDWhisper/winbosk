@@ -23,7 +23,8 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory, IDWriteTextFormat, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_METRICS,
+    DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
@@ -99,6 +100,10 @@ pub struct TextFormats {
     pub edit: IDWriteTextFormat,
     /// 待办副行（详细信息）用小一号字号。
     pub detail: IDWriteTextFormat,
+    /// 自持一份 DirectWrite 工厂：凡是要**贴着字形**的绘制（下划线、高亮底）都必须**实测**
+    /// 宽度，而实测要 `CreateTextLayout`、它又需要工厂。工厂由渲染设备持有、布局层拿不到，
+    /// 所以"画的人"自己留一份。克隆 `IDWriteFactory` 只是加一次 COM 引用，开销可忽略。
+    dwrite: IDWriteFactory,
 }
 
 impl TextFormats {
@@ -126,7 +131,36 @@ impl TextFormats {
             label,
             edit,
             detail,
+            dwrite: dwrite.clone(),
         })
+    }
+
+    /// 用 DirectWrite **实测**一段 `detail` 字号文字的真实 `(宽, 高)`（DIP）。
+    ///
+    /// 布局宽度出自 `winbosk_core::text::estimate_width`，它是**刻意保守**的估算：ASCII 按
+    /// 0.62 em，而 Microsoft YaHei UI 的 ASCII 实测约 0.5 em——偏大 25%~33%
+    /// （实测表见 `docs/plans/09-storage-row-ux.md` §8.1）。
+    ///
+    /// 于是规则是：
+    /// - **做预算**（"这段文字放得下吗"、控件该多宽）→ 用估算，**宁大勿小**，保证永不裁字；
+    /// - **贴字形绘制**（下划线、hover 高亮底）→ 用**实测**。拿估算值给下划线定宽，
+    ///   默认面板宽下会让下划线戳出一整段空白（实测约 49·s），看着像画错了。
+    ///
+    /// 返回 `None` = 实测失败；调用方**必须退回估算值照常画**，不能因为量不出来就不画。
+    pub fn measure_detail(&self, text: &str) -> Option<(f32, f32)> {
+        if text.is_empty() {
+            return Some((0.0, 0.0));
+        }
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        // 1e6 而不是 f32::MAX：给一个有限但足够大的约束，避免任何实现把 MAX 当异常值。
+        let layout = unsafe {
+            self.dwrite
+                .CreateTextLayout(&utf16, &self.detail, 1.0e6, 1.0e6)
+                .ok()?
+        };
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe { layout.GetMetrics(&mut m).ok()? };
+        Some((m.width, m.height))
     }
 }
 
@@ -791,23 +825,32 @@ fn draw_fence_detail(
             tr,
             &path_brush,
         );
-        // 下划线只铺在**命中区**（贴字形的宽度）上，让"能点的范围"和"画出来的范围"完全一致。
+        // 下划线：宽度与位置都按**实测**字形来（见 `TextFormats::measure_detail`）。
+        // 命中区 `storage_path_hit.w` 用的是**保守估算**（ASCII 偏大 25%~33%）——那是故意的：
+        // 路径右侧留白也能点，无害且更宽容（值行右端没有别的控件可抢，动作又是可逆的"打开"）。
+        // 但**画出来的范围必须等于字形**——否则默认宽下会有一整段空白被划上线，看着像画错了。
+        // 实测失败时退回命中区宽度照常画，不能因为量不出来就不给 hover 反馈。
         if path_hover && d.storage_path_hit.w > 0.0 {
-            // 锚在**文字行盒底**（`text_top + 1.6 × detail 字号`），不是值行带底：值行带高 24·s，
-            // 而一行 detail 文字只有 ≈13.8·s，锚到带底会让下划线悬在字形下方约 3·s
-            // （还会低于状态标签底边），读起来像一根悬空横杠。高 DPI 下更明显。
             let detail_font = unsafe { formats.detail.GetFontSize() };
-            let uy = d.storage_text_top + detail_font * 1.6;
-            let ul = D2D_RECT_F {
-                left: d.storage_path_hit.x,
-                top: uy,
-                right: d.storage_path_hit.x + d.storage_path_hit.w,
-                bottom: uy + 1.0 * s,
-            };
-            if let Ok(b) = unsafe {
-                target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.75 * full_t]), None)
-            } {
-                unsafe { target.FillRectangle(&ul, &b) };
+            let (text_w, text_h) = formats
+                .measure_detail(&d.storage_path_text)
+                .unwrap_or((d.storage_path_hit.w, detail_font * 1.6));
+            // 锚在实测文字盒底 + 一个下划线间隙（约 0.06 em），不是值行带底，也不是估算行高
+            // 1.6 em —— 后者会让下划线悬在字形下方约 3·s，读起来像一根悬空横杠，高 DPI 更明显。
+            let uy = d.storage_text_top + text_h + detail_font * 0.06;
+            let uw = text_w.min(d.storage_path_hit.w).min(d.storage_path_rect.w);
+            if uw > 0.0 {
+                let ul = D2D_RECT_F {
+                    left: d.storage_path_hit.x,
+                    top: uy,
+                    right: d.storage_path_hit.x + uw,
+                    bottom: uy + 1.0 * s,
+                };
+                if let Ok(b) = unsafe {
+                    target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.75 * full_t]), None)
+                } {
+                    unsafe { target.FillRectangle(&ul, &b) };
+                }
             }
         }
     }
@@ -2087,6 +2130,57 @@ mod tests {
         store.next_id = 5;
         // 没有 GPU 时 insert 会失败，这里只测纯逻辑路径
         let _ = &mut store;
+    }
+
+    /// `measure_detail` 是「贴字形的绘制必须**实测**」这条契约的地基，必须用真 DWrite 钉住。
+    ///
+    /// 关键断言：**实测宽度 < 估算宽度**（ASCII 路径上小 20%~30%）。这正是
+    /// `docs/plans/09-storage-row-ux.md` §8.1 用 Pillow 量出的偏差，也是下划线一度戳出
+    /// 字形一大截的根因。若哪天有人把 `estimate_width` 的 ASCII 系数调准了，这条断言会失败
+    /// ——那时应当回头确认下划线是否还需要实测，而不是直接放宽区间。
+    #[test]
+    fn measure_detail_is_tighter_than_estimate_for_ascii() {
+        use windows::Win32::Graphics::DirectWrite::{
+            DWriteCreateFactory, DWRITE_FACTORY_TYPE_ISOLATED,
+        };
+        let dwrite: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }.expect("建 DWrite 工厂");
+        let theme = crate::theme::Theme::default();
+        let formats = TextFormats::new(&dwrite, &theme).expect("建文本格式");
+        let font = theme.label.size * 0.72;
+
+        // ASCII 路径：估算按 0.62 em/字，YaHei UI 实测约 0.5 em → 实测应明显小于估算。
+        let ascii = r"G:\Codes\sylva\target\debug\data\library";
+        let (w, h) = formats.measure_detail(ascii).expect("实测失败");
+        let est = winbosk_core::text::estimate_width(ascii, font);
+        assert!(
+            w > 0.0 && w < est,
+            "ASCII 路径实测 {w:.2} 应小于估算 {est:.2}（估算器对 ASCII 刻意保守）"
+        );
+        // 偏差量级：Pillow 实测约 −24%，区间放宽到 0.60~0.90 以免换字体/换机器就翻车。
+        let ratio = w / est;
+        assert!(
+            (0.60..0.90).contains(&ratio),
+            "实测/估算 = {ratio:.3}，偏离 §8.1 记录的范围（0.60~0.90）"
+        );
+        // 行高必须是有限正数且小于估算行高 1.6 em（下划线锚在它下面，不能离谱）
+        assert!(
+            h > 0.0 && h < font * 1.6,
+            "实测行高 {h:.2} 不合理（字号 {font:.2}）"
+        );
+
+        // CJK：估算 1.0 em/字，YaHei UI 的 CJK 正好 1.0 em → 两者应几乎相等。
+        let cjk = "资料库归档";
+        let (cw, _) = formats.measure_detail(cjk).expect("实测失败");
+        let cest = winbosk_core::text::estimate_width(cjk, font);
+        assert!(
+            (cw - cest).abs() / cest < 0.05,
+            "CJK 实测 {cw:.2} 与估算 {cest:.2} 应几乎相等（偏差 {:.1}%）",
+            100.0 * (cw - cest).abs() / cest
+        );
+
+        // 空串：零宽零高，且**不能**是实测失败（否则下划线会退回估算宽度、白留一段空白）。
+        assert_eq!(formats.measure_detail(""), Some((0.0, 0.0)));
     }
 
     #[test]

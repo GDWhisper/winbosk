@@ -195,7 +195,11 @@ pub struct SceneFenceDetail {
     pub storage_value_row: RectF,
     /// 当前落地模式（状态标签文案与配色）。
     pub storage_kind: StorageKind,
-    /// 中段省略后的真实落地路径（App 层按当前 DPI 预算预计算，绘制层不再二次截断）。
+    /// 中段省略后的真实落地路径（App 层按当前 DPI 预算预计算）。
+    ///
+    /// 绘制层**仍会**二次截断（`draw_text` 的 `truncate_to_fit`）——App 层刻意预留了 2·s 余量
+    /// 所以平时不会触发，但那只是兜底，别把它当保证：一旦预算改紧，超出的字会被静默换成「…」。
+    /// 因此 `storage_path_hit` 的宽度**不能**取自这里字串的估算宽（见 `TextFormats::measure_detail`）。
     pub storage_path_text: String,
     /// 路径文本区（值行；**仅绘制**——决定省略预算与裁剪框，不参与命中）。
     pub storage_path_rect: RectF,
