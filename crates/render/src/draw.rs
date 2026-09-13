@@ -739,11 +739,12 @@ fn draw_fence_detail(
     }
 
     // 文件位置行（始终显示，占两行；**不可再增行**，见 app 层 `detail_visible_rows` 的行预算）：
-    //   值行 = 标签 + 状态标签（模式）+ 真实落地路径 + 「打开」
+    //   值行 = 标签 + 状态标签（模式）+ 真实落地路径（**零按钮**）
     //   动作行 = 后果提示（左）+ 「更改文件位置…」「恢复默认」（右端对齐）
     // 该行是用户唯一能得知"文件到底存在哪 / 删除是删副本还是删真身"的入口，故常显不可折叠。
-    // **关键契约**：值行里的状态标签与路径都**不是按钮**（都不在命中表内），
-    // 动作只有三个按钮——保证"看着能点的都能点、能点的都看得见"。
+    // **关键契约**：值行里**只有路径**是热区（点击 = 打开落地目录，hover 提亮 + 下划线把它画出来），
+    // 状态标签**不是**热区（它是状态不是按钮）；破坏性的「更改文件位置…」只存在于动作行。
+    // 这样才守住"看着能点的都能点、能点的都看得见"。
     let vr = d.storage_value_row;
     if vr.h > 0.0 {
         // 顶线与状态标签、路径同源（`storage_text_top`）：三段同字号，各写各的偏移就会
@@ -756,7 +757,8 @@ fn draw_fence_detail(
         };
         draw_text(target, "文件位置", &formats.detail, lr5, &label_brush);
     }
-    // 值行：状态标签 + 路径（次要信息，恒为灰字，不与任何按钮共用 hover 高亮）
+    // 值行：状态标签 + 路径。**值行零按钮**：路径本身就是「打开」的热区
+    // （见 `SceneFenceDetail::storage_path_hit`），hover 时提亮 + 加下划线把"可点"画出来。
     if d.storage_chip.h > 0.0 {
         draw_storage_chip(
             target,
@@ -769,8 +771,13 @@ fn draw_fence_detail(
         );
     }
     if d.storage_path_rect.h > 0.0 {
-        let path_brush =
-            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.55 * full_t]), None)? };
+        let path_hover = matches!(c.hover_zone, Some(ConsoleZone::OpenStoragePath));
+        // 常态是次级灰（0.55）；hover 提到 0.92 并加下划线——这是本行唯一的"可点"提示，
+        // 必须够明显，否则又会退回"看着是灰字、其实能点"的老毛病。
+        let path_alpha = if path_hover { 0.92 } else { 0.55 };
+        let path_brush = unsafe {
+            target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, path_alpha * full_t]), None)?
+        };
         let tr = D2D_RECT_F {
             left: d.storage_path_rect.x,
             top: d.storage_path_rect.y,
@@ -784,16 +791,25 @@ fn draw_fence_detail(
             tr,
             &path_brush,
         );
-    }
-    if d.storage_open.h > 0.0 {
-        draw_ghost_button(
-            target,
-            theme,
-            d.storage_open,
-            "打开",
-            matches!(c.hover_zone, Some(ConsoleZone::OpenStoragePath)),
-            formats,
-        );
+        // 下划线只铺在**命中区**（贴字形的宽度）上，让"能点的范围"和"画出来的范围"完全一致。
+        if path_hover && d.storage_path_hit.w > 0.0 {
+            // 锚在**文字行盒底**（`text_top + 1.6 × detail 字号`），不是值行带底：值行带高 24·s，
+            // 而一行 detail 文字只有 ≈13.8·s，锚到带底会让下划线悬在字形下方约 3·s
+            // （还会低于状态标签底边），读起来像一根悬空横杠。高 DPI 下更明显。
+            let detail_font = unsafe { formats.detail.GetFontSize() };
+            let uy = d.storage_text_top + detail_font * 1.6;
+            let ul = D2D_RECT_F {
+                left: d.storage_path_hit.x,
+                top: uy,
+                right: d.storage_path_hit.x + d.storage_path_hit.w,
+                bottom: uy + 1.0 * s,
+            };
+            if let Ok(b) = unsafe {
+                target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.75 * full_t]), None)
+            } {
+                unsafe { target.FillRectangle(&ul, &b) };
+            }
+        }
     }
     // 动作行：左 = 后果提示（宽度放不下时 App 层给空串，整条不画），右端 = 两个动作按钮
     if d.storage_hint_rect.h > 0.0 && !d.storage_hint_text.is_empty() {
@@ -1041,56 +1057,6 @@ fn draw_storage_chip(
         unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, text_alpha]), None) }
     {
         draw_text_centered(target, kind.badge(), &formats.detail, lr, &b);
-    }
-}
-
-/// 幽灵按钮：**不填底色**，只有细描边 + 次级文字（用于「打开」这类就地次要动作）。
-///
-/// 与 [`draw_segmented_button`] 的区别正是"没有底色"：面板里带底色的胶囊代表"可选项/当前值"，
-/// 幽灵按钮代表"就地做一件小事"。混用会让用户分不清哪些是状态、哪些是动作。
-fn draw_ghost_button(
-    target: &ID2D1RenderTarget,
-    theme: &Theme,
-    rect: RectF,
-    label: &str,
-    hover: bool,
-    formats: &TextFormats,
-) {
-    if rect.w <= 0.0 || rect.h <= 0.0 {
-        return;
-    }
-    let s = theme.scale;
-    let rr = D2D1_ROUNDED_RECT {
-        rect: D2D_RECT_F {
-            left: rect.x,
-            top: rect.y,
-            right: rect.x + rect.w,
-            bottom: rect.y + rect.h,
-        },
-        radiusX: 7.0 * s,
-        radiusY: 7.0 * s,
-    };
-    let (fill, stroke, text) = if hover {
-        ([1.0, 1.0, 1.0, 0.14], [1.0, 1.0, 1.0, 0.34], 0.95)
-    } else {
-        ([1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 0.22], 0.75)
-    };
-    if fill[3] > 0.0 {
-        if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(fill), None) } {
-            unsafe { target.FillRoundedRectangle(&rr, &b) };
-        }
-    }
-    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(stroke), None) } {
-        unsafe { target.DrawRoundedRectangle(&rr, &b, 1.0 * s, None) };
-    }
-    let lr = D2D_RECT_F {
-        left: rect.x,
-        top: rect.y + (rect.h - theme.label.size * 1.6) / 2.0,
-        right: rect.x + rect.w,
-        bottom: rect.y + rect.h,
-    };
-    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, text]), None) } {
-        draw_text_centered(target, label, &formats.label, lr, &b);
     }
 }
 

@@ -441,7 +441,7 @@ fn detail_visible_rows(desk: &Desk, selected: usize, s: f32) -> f32 {
     if style != FenceStyle::Blur {
         n += 1; // 背景色调（模糊时隐藏）
     }
-    n += 2; // 文件位置：值行（标签+状态标签+真实路径+「打开」）+ 动作行（后果提示+动作按钮）
+    n += 2; // 文件位置：值行（标签+状态标签+真实路径，零按钮）+ 动作行（后果提示+动作按钮）
     if layout == FenceLayout::Sidebar {
         n += 1; // 侧边栏位置（仅侧边栏）
     }
@@ -546,18 +546,24 @@ pub(crate) fn adjust_selected_fence_on_delete(
 /// 「文件位置」两行几何（值行 + 动作行）。
 ///
 /// 字段语义与 `SceneFenceDetail` 一一对应，且**逐条写死可点性**：
-/// 值行里的 `tag` / `path` 都是"看的东西"，动作只有 `open` / `change` / `reset` 三个按钮。
+/// `tag` 是"看的东西"（状态，不是按钮）；值行里只有 `path_hit` 可点（= 打开落地目录）；
+/// `change` / `reset` 是动作行的两个按钮。命中表由 [`storage_zones`] 构造，见其文档。
 pub(crate) struct StorageRow {
     /// 值行整行矩形（仅作标签列锚点，不参与命中）。
     pub value_row: RectF,
     /// 值行：状态标签（模式）。
     pub tag: RectF,
-    /// 值行：路径文本区（仅绘制）。
+    /// 值行：路径文本区（仅绘制，决定省略预算与裁剪框）。
     pub path: RectF,
     /// 值行：中段省略后的路径文本。
     pub path_text: String,
-    /// 值行：「打开」按钮。
-    pub open: RectF,
+    /// 值行：**路径文本的命中区**（贴着实际字形，不是整段预算）——点它 = 在资源管理器里打开。
+    ///
+    /// 刻意**不**给「打开」按钮：本行的路径预算是 `d.w − 105.2·s`（约 190·s），一个 40·s 的按钮会
+    /// 吃掉它的 1/4（实测默认宽下库路径从"完整显示"退化成 23/40 字）。让路径自己承担这个动作，
+    /// 既回收了全部宽度，又让值行成为零按钮的纯信息行。
+    /// 命中区贴字形而非铺满整段，是为了守住"看着能点的都能点"——铺满会让文字右侧的空白也吞点击。
+    pub path_hit: RectF,
     /// 动作行：「更改文件位置…」按钮（右端对齐）。
     pub change: RectF,
     /// 动作行：「恢复默认」按钮（`h <= 0.0` = 不出现）。
@@ -583,7 +589,7 @@ const STORAGE_ROW_PITCH: f32 = 30.0;
 /// 计算「文件位置」两行几何（纯函数，可在内存中单测"空间互斥"）。
 ///
 /// 排版契约（用户能读懂的版本）：
-/// - 第一行（值行）：`文件位置 | [模式标签] 真实路径 … [打开]`
+/// - 第一行（值行）：`文件位置 | [模式标签] 真实路径`（**零按钮**；路径本身是「打开目录」的热区）
 /// - 第二行（动作行）：`后果提示 ……………… [更改文件位置…] [恢复默认]`
 ///
 /// 宽度**全部由文案实测宽度推出**（`estimate_width` + 常数 × s），不再硬编码，
@@ -627,16 +633,8 @@ pub(crate) fn storage_row_geometry(
         w: tag_w,
         h: STORAGE_TAG_H * s,
     };
-    let open_w =
-        winbosk_core::text::estimate_width("打开", label_font) + 2.0 * STORAGE_BTN_PAD_X * s;
-    let open = RectF {
-        x: inner_right - open_w,
-        y: row_y,
-        w: open_w,
-        h: btn_h,
-    };
     let path_x = tag.x + tag.w + STORAGE_TAG_GAP * s;
-    let path_w = (open.x - STORAGE_TAG_GAP * s - path_x).max(0.0);
+    let path_w = (inner_right - path_x).max(0.0);
     let path_rect = RectF {
         x: path_x,
         y: text_top,
@@ -645,6 +643,13 @@ pub(crate) fn storage_row_geometry(
     };
     let path_text =
         winbosk_core::storage::elide_middle(path, (path_w - 2.0 * s).max(0.0), detail_font);
+    // 命中区贴实际字形宽度（不超过绘制框）：短路径不会留出一片"看不见但能点"的空白。
+    let path_hit = RectF {
+        x: path_x,
+        y: text_top,
+        w: winbosk_core::text::estimate_width(&path_text, detail_font).min(path_w),
+        h: STORAGE_TAG_H * s,
+    };
 
     // —— 动作行（右端对齐；恢复默认在左，更改文件位置在右）——
     let action_y = row_y + STORAGE_ROW_PITCH * s;
@@ -693,13 +698,38 @@ pub(crate) fn storage_row_geometry(
         tag,
         path: path_rect,
         path_text,
-        open,
+        path_hit,
         change,
         reset,
         hint,
         hint_text: hint_text.to_string(),
         text_top,
     }
+}
+
+/// 「文件位置」行的命中区（值行路径 + 动作行两个按钮）。
+///
+/// 抽成纯函数是为了让单测能**直接断言命中表**——几何自洽（矩形不重叠、文字不溢出）
+/// 不等于"能点的正好是画出来的"：前者由 `storage_row_geometry_*` 覆盖，后者只能在这里断言。
+///
+/// 契约（改这一行的人请照做）：
+/// - 值行**只有**路径一个热区（`OpenStoragePath`）——状态标签是状态不是按钮，**不入表**；
+/// - 「更改文件位置…」常驻（破坏性动作只走它，且它必须始终可见）；
+/// - 「恢复默认」只在非零矩形时入表（零矩形 = 不出现，杜绝死按钮）。
+pub(crate) fn storage_zones(
+    path_hit: RectF,
+    change: RectF,
+    reset: RectF,
+) -> Vec<(ConsoleZone, RectF)> {
+    let mut zones = Vec::new();
+    if path_hit.w > 0.0 && path_hit.h > 0.0 {
+        zones.push((ConsoleZone::OpenStoragePath, path_hit));
+    }
+    zones.push((ConsoleZone::ChangeStoragePath, change));
+    if reset.w > 0.0 && reset.h > 0.0 {
+        zones.push((ConsoleZone::ResetStoragePath, reset));
+    }
+    zones
 }
 
 /// 构建控制中心面板场景（栅栏管理单页）。关闭后完全隐藏（无胶囊），
@@ -867,7 +897,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
             (RectF::default(), Vec::new())
         };
         // —— 文件位置行（占两行，**不可再增行**）——
-        // 值行：标签 + 状态标签（模式）+ 真实落地路径 + 「打开」
+        // 值行：标签 + 状态标签（模式）+ 真实落地路径（**零按钮**，路径自身是打开热区）
         // 动作行：后果提示（左）+ 「更改文件位置…」「恢复默认」（右端对齐）
         // 该行是用户唯一能得知"文件到底存在哪 / 删除是删副本还是删真身"的入口，故常显。
         // 几何全部由 `storage_row_geometry` 纯函数推出（含"放不下就不画提示语"的降级），
@@ -889,7 +919,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         let storage_chip = row_geo.tag;
         let storage_path_rect = row_geo.path;
         let storage_path_text = row_geo.path_text;
-        let storage_open = row_geo.open;
+        let storage_path_hit = row_geo.path_hit;
         let storage_hint_rect = row_geo.hint;
         let storage_hint_text = row_geo.hint_text;
         let storage_text_top = row_geo.text_top;
@@ -998,7 +1028,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
             storage_path_text,
             storage_path_rect,
             storage_chip,
-            storage_open,
+            storage_path_hit,
             storage_hint_text,
             storage_hint_rect,
             storage_text_top,
@@ -1846,17 +1876,17 @@ pub(crate) fn hit_model_from(theme: &Theme, scene: &Scene, _desk: &Desk) -> HitM
                 zones.push((ConsoleZone::FenceSelect(i), r.rect));
             }
             if let Some(d) = &c.fence_detail {
-                // 值行只有「打开」可点；**路径不是热区**（它是"看的东西"）。
+                // 值行只有路径可点（= 打开落地目录）；状态标签**不是热区**（它是"状态"不是按钮）。
                 // 此前把路径整块接成 `ChangeStoragePath`，导致"看着像灰字却能点、
                 // 看着像按钮的状态标签却点不动"这对反转，用户读不出哪个是动作。
-                if d.storage_open.h > 0.0 {
-                    zones.push((ConsoleZone::OpenStoragePath, d.storage_open));
-                }
-                zones.push((ConsoleZone::ChangeStoragePath, d.storage_btn));
-                // 「恢复默认」仅在外部文件夹模式出现；零矩形不入表，杜绝死按钮。
-                if d.storage_reset.h > 0.0 {
-                    zones.push((ConsoleZone::ResetStoragePath, d.storage_reset));
-                }
+                // 现在路径接的是**无害且可逆**的"打开目录"，且 hover 会提亮 + 下划线（见 draw 层），
+                // 所以"可点"这件事是看得见的——与破坏性的"更改文件位置…"彻底分开。
+                // 命中区构造抽在 `storage_zones`（纯函数，单测直接断言这张表）。
+                zones.extend(storage_zones(
+                    d.storage_path_hit,
+                    d.storage_btn,
+                    d.storage_reset,
+                ));
                 zones.push((ConsoleZone::FenceLayout(FenceLayout::Grid), d.layout_grid));
                 zones.push((ConsoleZone::FenceLayout(FenceLayout::List), d.layout_list));
                 zones.push((
@@ -2439,12 +2469,14 @@ mod tests {
         theme
     }
 
-    /// 「文件位置」行参与排布的全部矩形（`value_row` 是标签锚点、不绘制，故不计入）。
-    fn storage_rects(row: &StorageRow) -> [(&'static str, RectF); 6] {
+    /// 「文件位置」行**参与排布**的全部矩形（`value_row` 是标签锚点、不绘制，故不计入）。
+    ///
+    /// `path_hit` 刻意不在内：它是 `path` 的**子矩形**（同 x/y、宽度贴字形 ≤ `path.w`），
+    /// 天然与 `path` 重叠。它的契约由 `storage_row_geometry_path_hit_hugs_text` 单独覆盖。
+    fn storage_rects(row: &StorageRow) -> [(&'static str, RectF); 5] {
         [
             ("tag", row.tag),
             ("path", row.path),
-            ("open", row.open),
             ("change", row.change),
             ("reset", row.reset),
             ("hint", row.hint),
@@ -2460,7 +2492,8 @@ mod tests {
     }
 
     /// 空间互斥（指南 §4.1）：全宽/最小宽 × 三种 DPI × 两种模式 × `can_reset` 两种取值下，
-    /// 「文件位置」行的六个矩形两两不重叠，且全部落在详情区左右内缘之内。
+    /// 「文件位置」行的五个**排布**矩形两两不重叠，且全部落在详情区左右内缘之内。
+    /// （`path_hit` 不在内：它是 `path` 的子矩形，由 `..._path_hit_hugs_text` 单独覆盖。）
     /// 这条断言是"标签归标签、值归值、动作归动作"在几何上的最终保险。
     #[test]
     fn storage_row_geometry_is_pairwise_disjoint() {
@@ -2503,7 +2536,10 @@ mod tests {
                     }
                     // 路径与标签永不为零（值行必须能显示"存在哪"）
                     assert!(row.tag.w > 0.0 && row.tag.h > 0.0);
-                    assert!(row.open.w > 0.0, "「打开」必须始终可见");
+                    assert!(
+                        row.path_hit.w > 0.0,
+                        "路径必须可点（它是值行唯一的动作：打开落地目录）"
+                    );
                     assert!(row.change.w > 0.0, "「更改文件位置…」必须始终可见");
                 }
             }
@@ -2575,6 +2611,213 @@ mod tests {
             without.hint.w > with.hint.w,
             "少了「恢复默认」，提示语预算应变宽"
         );
+    }
+
+    /// 路径必须**吃满值行剩余宽度**——值行里不允许再出现任何占位控件。
+    ///
+    /// 这是「路径预算被按钮悄悄吃掉」的回归保险：曾经值行右端有一个 40·s 的「打开」幽灵按钮，
+    /// 实测让默认面板宽下的库路径从"完整显示（40 字）"退化成 `G:\…\debug\data\library`（23 字）。
+    /// 现在动作改由路径自身承担（点路径 = 打开目录），故路径右缘必须精确落在详情区内缘。
+    #[test]
+    fn storage_row_geometry_path_owns_rest_of_value_row() {
+        for s in [1.0f32, 1.25, 1.5, 2.0] {
+            for panel_w in [CONSOLE_W, CONSOLE_MIN_W] {
+                for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                    for can_reset in [false, true] {
+                        let theme = test_theme(s);
+                        let d = test_detail_rect(panel_w, s);
+                        let row = storage_row_geometry(
+                            &d,
+                            0.0,
+                            kind,
+                            can_reset,
+                            r"D:\归档\资料库",
+                            &theme,
+                        );
+                        let inner_right = d.x + d.w - 2.0 * s;
+                        assert!(
+                            (row.path.x + row.path.w - inner_right).abs() < 1e-3,
+                            "panel={panel_w} s={s} {kind:?} reset={can_reset}: 路径未吃满到内缘 \
+                             （右缘 {:.3}，内缘 {inner_right:.3}）——值行又被塞了占位控件？",
+                            row.path.x + row.path.w
+                        );
+                        // 状态标签必须仍与路径不重叠（吃满不能靠压住标签换）
+                        assert!(
+                            row.tag.x + row.tag.w <= row.path.x + 1e-3,
+                            "panel={panel_w} s={s}: 路径左端压住了状态标签"
+                        );
+                        // 路径左端必须**紧贴**标签、只隔一个固定间距——这是"吃满"的起点。
+                        // 若有人往标签与路径之间塞任何东西（图标、第二个标签、又一个按钮），
+                        // 这条等式会立刻失败，而不是悄悄把路径预算吃掉（本次就是被这样吃掉的）。
+                        assert!(
+                            (row.path.x - (row.tag.x + row.tag.w + STORAGE_TAG_GAP * s)).abs() < 1e-3,
+                            "panel={panel_w} s={s} {kind:?} reset={can_reset}: 标签与路径之间被塞了东西 \
+                             （实际间距 {:.3}，应为 {:.3}）",
+                            row.path.x - (row.tag.x + row.tag.w),
+                            STORAGE_TAG_GAP * s
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 路径命中区**贴实际字形**，且永不超出绘制框；空路径必须退化为零命中区。
+    ///
+    /// 三个方向都要卡住：
+    /// - 太宽（铺满整段预算）→ 文字右侧的空白也吞点击，"看不见却能点"的老毛病复发；
+    /// - 超出绘制框 → 命中区伸进状态标签或详情区外缘，点到不该点的地方；
+    /// - 没有文字却留着热区 → 一块看不见的死区，鼠标划过还会亮下划线。
+    ///
+    /// 覆盖全矩阵：两档面板宽 × 四种 DPI 缩放 × 两种存储模式 × `can_reset` 两种取值，
+    /// 外加**空路径**输入——上一版该测试的唯一输入是 `D:\归档\资料库`，永远非空，
+    /// 于是"空路径 → 零命中区"那条断言恒真、从未执行（对抗性审查 P2-1）。
+    #[test]
+    fn storage_row_geometry_path_hit_hugs_text() {
+        for s in [1.0f32, 1.25, 1.5, 2.0] {
+            for panel_w in [CONSOLE_W, CONSOLE_MIN_W] {
+                let theme = test_theme(s);
+                let d = test_detail_rect(panel_w, s);
+                let font = theme.label.size * 0.72;
+                for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                    for can_reset in [false, true] {
+                        for path in [r"D:\归档\资料库", ""] {
+                            let row = storage_row_geometry(&d, 0.0, kind, can_reset, path, &theme);
+                            let ctx = format!(
+                                "panel={panel_w} s={s} {kind:?} reset={can_reset} path={path:?}"
+                            );
+
+                            // 1) 命中区必须是绘制框的子矩形：同 x / 同 y / 同高 / 不宽于。
+                            assert!(
+                                (row.path_hit.x - row.path.x).abs() < 1e-3
+                                    && (row.path_hit.y - row.path.y).abs() < 1e-3
+                                    && (row.path_hit.h - row.path.h).abs() < 1e-3,
+                                "{ctx}: 命中区与绘制框不同源（hit={:?} draw={:?}）",
+                                row.path_hit,
+                                row.path
+                            );
+                            assert!(
+                                row.path_hit.w <= row.path.w + 1e-3,
+                                "{ctx}: 命中区 {} 超出了绘制框 {}",
+                                row.path_hit.w,
+                                row.path.w
+                            );
+
+                            if row.path_text.is_empty() {
+                                // 2) 空路径 → 零命中区，且不得入命中表（不留看不见的热区）。
+                                assert!(
+                                    row.path_hit.w <= 0.0,
+                                    "{ctx}: 没有文字却留着 {} 宽的命中区",
+                                    row.path_hit.w
+                                );
+                                assert!(
+                                    storage_zones(row.path_hit, row.change, row.reset)
+                                        .iter()
+                                        .all(|(z, _)| !matches!(z, ConsoleZone::OpenStoragePath)),
+                                    "{ctx}: 空路径仍把 OpenStoragePath 放进了命中表"
+                                );
+                            } else {
+                                let text_w =
+                                    winbosk_core::text::estimate_width(&row.path_text, font);
+                                // 3) 命中区永不宽于字形——右侧空白不吞点击。
+                                assert!(
+                                    row.path_hit.w <= text_w + 1e-3,
+                                    "{ctx}: 命中区 {} 宽于字形 {text_w}（右侧空白也在吞点击）",
+                                    row.path_hit.w
+                                );
+                                // 4) 要么**严丝合缝**贴住字形，要么是被绘制框钳住（文字已被截断、
+                                //    铺满整框）。两条路只允许二选一——若文字没截断却铺满整框，
+                                //    就是"看不见却能点"复发；若文字截断了却没铺满，就是白丢可点区域。
+                                let clamped = row.path_hit.w >= row.path.w - 1e-3;
+                                let truncated = row.path_text != path;
+                                assert!(
+                                    (row.path_hit.w - text_w).abs() < 1e-3
+                                        || (truncated && clamped),
+                                    "{ctx}: 命中区 {} 既没贴字形 {text_w}，也不是被截断后的满框 {}",
+                                    row.path_hit.w,
+                                    row.path.w
+                                );
+                                // 5) 命中区不得压住状态标签。
+                                assert!(
+                                    row.path_hit.x >= row.tag.x + row.tag.w - 1e-3,
+                                    "{ctx}: 命中区伸进了状态标签"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 值行的命中表**有且只有**路径一个热区（`OpenStoragePath`），且矩形逐字段等于 `path_hit`。
+    ///
+    /// 这是"看着像按钮的却点不动、看着像灰字的却能点"那个病的最终保险：几何自洽
+    /// （`storage_row_geometry_*`）只保证矩形互不重叠，管不住**映射**——值行里冒出第二个热区
+    /// （状态标签、或把整段预算接成 `ChangeStoragePath`）只有在这里才会失败。
+    #[test]
+    fn storage_zones_value_row_has_exactly_the_path() {
+        for s in [1.0f32, 2.0] {
+            let theme = test_theme(s);
+            let d = test_detail_rect(CONSOLE_W, s);
+            for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                for can_reset in [false, true] {
+                    let row =
+                        storage_row_geometry(&d, 0.0, kind, can_reset, r"D:\归档\资料库", &theme);
+                    let zones = storage_zones(row.path_hit, row.change, row.reset);
+                    let ctx = format!("s={s} {kind:?} reset={can_reset}");
+
+                    // 值行唯一热区 = 路径本身。
+                    let opens: Vec<RectF> = zones
+                        .iter()
+                        .filter(|(z, _)| matches!(z, ConsoleZone::OpenStoragePath))
+                        .map(|(_, r)| *r)
+                        .collect();
+                    assert_eq!(
+                        opens.len(),
+                        1,
+                        "{ctx}: 值行必须恰好有一个打开热区，实际命中表 {zones:?}"
+                    );
+                    assert!(
+                        (opens[0].x - row.path_hit.x).abs() < 1e-3
+                            && (opens[0].y - row.path_hit.y).abs() < 1e-3
+                            && (opens[0].w - row.path_hit.w).abs() < 1e-3
+                            && (opens[0].h - row.path_hit.h).abs() < 1e-3,
+                        "{ctx}: 打开热区与 path_hit 不一致（{:?} vs {:?}）",
+                        opens[0],
+                        row.path_hit
+                    );
+                    // 打开热区必须落在路径绘制框内，绝不覆盖状态标签。
+                    assert!(
+                        opens[0].x >= row.tag.x + row.tag.w - 1e-3
+                            && opens[0].x + opens[0].w <= row.path.x + row.path.w + 1e-3,
+                        "{ctx}: 打开热区越出路径绘制框 / 压住状态标签"
+                    );
+                    // 破坏性动作只走「更改文件位置…」，且它必须常驻。
+                    assert!(
+                        zones
+                            .iter()
+                            .any(|(z, _)| matches!(z, ConsoleZone::ChangeStoragePath)),
+                        "{ctx}: 「更改文件位置…」必须常驻命中表"
+                    );
+                    // 「恢复默认」入表 ⟺ 有非零矩形（零矩形 = 不出现，杜绝死按钮）。
+                    let has_reset = zones
+                        .iter()
+                        .any(|(z, _)| matches!(z, ConsoleZone::ResetStoragePath));
+                    assert_eq!(
+                        has_reset,
+                        row.reset.w > 0.0 && row.reset.h > 0.0,
+                        "{ctx}: 「恢复默认」入表与矩形在场必须一致"
+                    );
+                    // 值行里不允许出现任何其它热区（状态标签是状态，不是按钮）。
+                    assert_eq!(
+                        zones.len(),
+                        1 + 1 + usize::from(has_reset),
+                        "{ctx}: 命中表混入了额外热区 {zones:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// 值行内三段 detail 字号文字（行标签 / 状态标签 / 路径）**必须共用唯一顶线**，
