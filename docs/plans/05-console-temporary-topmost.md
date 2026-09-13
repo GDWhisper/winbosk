@@ -58,7 +58,7 @@ impl OverlayWindow {
   `raise_to_foreground`，二者职责不混）。
 - **`hWndInsertAfter` 方向语义（实测确立）**：被定位窗口插到锚点窗口**之下**。
   - `raise_console`：锚点 `HWND_TOP`（普通带顶部），且**必须**经 `with_foreground_lock`
-    （AttachThreadInput）——Sylva 是后台进程，裸调 `SetWindowPos(HWND_TOP)` 会被系统
+    （AttachThreadInput）——WinBosk 是后台进程，裸调 `SetWindowPos(HWND_TOP)` 会被系统
     静默拒绝（返回 TRUE 但 Z 序不动，已实测复现）；与 `raise_to_foreground` 同一套手法。
   - `restore_desktop_band`：目标位置是「owner **正上方**」，因此锚点取「owner 当前正上方
     的窗口」= `GetWindow(GetAncestor(owner, GA_ROOT), GW_HWNDPREV)`；直接传 owner 会把
@@ -177,7 +177,7 @@ cargo fmt --all -- --check
 运行冒烟：
 
 ```powershell
-$env:SYLVA_AUTOSTOP_MS="2000"; .\target\debug\sylva.exe
+$env:WINBOSK_AUTOSTOP_MS="2000"; .\target\debug\winbosk.exe
 ```
 
 手动用例矩阵（浏览器最大化作为遮挡参照）：

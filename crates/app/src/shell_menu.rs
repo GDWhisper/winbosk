@@ -2,7 +2,7 @@
 //!
 //! 通过 `SHCreateItemFromParsingName` + `IShellItem::BindToHandler(BHID_SFUIObject)`
 //! 拿到文件/文件夹/快捷方式的**标准 Shell 右键菜单**（打开/编辑/打印/剪切/复制/
-//! 删除/重命名/属性/发送到…），并在菜单顶部注入 Sylva 自己的「移出栅栏」「重命名」。
+//! 删除/重命名/属性/发送到…），并在菜单顶部注入 WinBosk 自己的「移出栅栏」「重命名」。
 //!
 //! ## 为什么必须用 IContextMenu2/3
 //!
@@ -53,7 +53,7 @@ use crate::Runtime;
 const SHELL_CMD_FIRST: u32 = 0x7000;
 const SHELL_CMD_LAST: u32 = 0x7FFF;
 
-/// 注入的 Sylva 命令 ID（在 Shell 区间之外，避免冲突）。
+/// 注入的 WinBosk 命令 ID（在 Shell 区间之外，避免冲突）。
 /// 「移出栅栏」= 0x8000，「重命名」= 0x8001。
 pub const CMD_REMOVE: usize = 0x8000;
 const CMD_RENAME: usize = 0x8001;
@@ -61,9 +61,9 @@ const CMD_RENAME: usize = 0x8001;
 /// 菜单动作结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellMenuResult {
-    /// 点击了 Sylva 注入的「移出栅栏」。
+    /// 点击了 WinBosk 注入的「移出栅栏」。
     Remove,
-    /// 点击了 Sylva 注入的「重命名」。
+    /// 点击了 WinBosk 注入的「重命名」。
     Rename,
     /// 点击了 Shell 真实命令（已通过 `InvokeCommand` 执行）。
     Invoked,
@@ -75,7 +75,7 @@ pub enum ShellMenuResult {
 
 /// 菜单宿主窗口类名（真实可激活的离屏顶层窗口，用于接收菜单 owner-draw 消息并作为
 /// `TrackPopupMenu` 的 owner；常驻复用，见 `MENU_HOST` / `acquire_menu_host`）。
-const MENU_HOST_CLASS: &str = "SylvaMenuHost";
+const MENU_HOST_CLASS: &str = "WinBoskMenuHost";
 
 // 菜单期间持有 Shell 菜单接口，供宿主窗口过程转发 owner-draw 消息。
 // 菜单全程在主线程模态运行（TrackPopupMenu 阻塞），无跨线程访问。
@@ -107,7 +107,7 @@ fn primed_set() -> std::sync::MutexGuard<'static, HashSet<String>> {
 
 /// 弹出 `path` 对应的真实 Shell 右键菜单并执行选中命令。
 ///
-/// `managed`：该项为 Sylva 管理项（库内项/链接镜像项，见 context_menu::handle_context_menu）。
+/// `managed`：该项为 WinBosk 管理项（库内项/链接镜像项，见 context_menu::handle_context_menu）。
 /// 链接栅栏即文件夹镜像，「移出栅栏」与 Shell「删除」等价（移出不删文件，镜像 ≤4s 就把
 /// 图标加回来），库内项移出同样只此一个意义，故不再注入「移出栅栏」，避免菜单重复。
 ///
@@ -135,9 +135,9 @@ pub fn prime_startup(paths: &[String]) {
     }
     let by_key: HashMap<String, String> = paths.iter().map(|p| (type_key(p), p.clone())).collect();
     let _ = std::thread::Builder::new()
-        .name("sylva-menu-prime".into())
+        .name("winbosk-menu-prime".into())
         .spawn(move || {
-            let _ = sylva_shell::com::init();
+            let _ = winbosk_shell::com::init();
             for key in &keys {
                 if let Some(path) = by_key.get(key) {
                     let _ = std::panic::catch_unwind(|| prime_one(path));
@@ -167,9 +167,9 @@ fn prime_path_async(path: &str, hwnd: HWND) -> Option<std::sync::mpsc::Receiver<
     let hwnd_usize = hwnd.0 as usize;
     let (tx, rx) = std::sync::mpsc::channel();
     let ok = std::thread::Builder::new()
-        .name("sylva-menu-prime".into())
+        .name("winbosk-menu-prime".into())
         .spawn(move || {
-            let _ = sylva_shell::com::init();
+            let _ = winbosk_shell::com::init();
             let _ = std::panic::catch_unwind(|| prime_one(&path));
             primed_set().insert(key);
             let _ = tx.send(());
@@ -341,8 +341,8 @@ fn run_menu(rt: &Runtime, path: &str, sx: i32, sy: i32, managed: bool) -> ShellM
         return ShellMenuResult::Failed;
     }
 
-    // 顶部注入 Sylva 命令 + 分隔线；Shell 真实项从其后位置开始追加。
-    // Sylva 管理项跳过「移出栅栏」（与「删除」等价，见 `show` 文档）。
+    // 顶部注入 WinBosk 命令 + 分隔线；Shell 真实项从其后位置开始追加。
+    // WinBosk 管理项跳过「移出栅栏」（与「删除」等价，见 `show` 文档）。
     unsafe {
         let mut pos = 0u32;
         if !managed {

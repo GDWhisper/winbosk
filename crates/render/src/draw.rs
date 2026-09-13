@@ -16,9 +16,9 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     ID2D1Bitmap, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-    D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_ELLIPSE, D2D1_LAYER_PARAMETERS, D2D1_LINE_JOIN_ROUND, D2D1_ROUNDED_RECT,
-    D2D1_STROKE_STYLE_PROPERTIES,
+    D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_CUSTOM,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_LAYER_PARAMETERS, D2D1_LINE_JOIN_ROUND,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
 };
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory, IDWriteTextFormat, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -27,9 +27,9 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
-use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
-use sylva_core::storage::StorageKind;
-use sylva_shell::icons::IconData;
+use winbosk_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
+use winbosk_core::storage::StorageKind;
+use winbosk_shell::icons::IconData;
 
 use crate::overlay::{ConsoleZone, RectF};
 use crate::scene::{
@@ -91,7 +91,7 @@ impl Default for IconStore {
 /// 跨帧缓存的 DWrite 文本格式（设备无关，可安全缓存）。
 pub struct TextFormats {
     pub title: IDWriteTextFormat,
-    /// 粗体标题（控制中心顶部「Sylva」）。
+    /// 粗体标题（控制中心顶部「WinBosk」）。
     pub title_bold: IDWriteTextFormat,
     pub label: IDWriteTextFormat,
     /// 就地编辑框文字：同 `label` 字号，但段落垂直居中——编辑框内字形上下留白均匀，
@@ -217,25 +217,37 @@ fn draw_reserved(target: &ID2D1RenderTarget, theme: &Theme, r: &SceneReserved) -
     Ok(())
 }
 
-/// 虚线描边样式：`4w 实 / 3w 虚`（`dashes` 的长度单位是**描边宽度的倍数**，D2D 约定）。
+/// 虚线花纹：`4w 实 / 3w 虚`（`dashes` 的长度单位是**描边宽度的倍数**，D2D 约定）。
 ///
-/// 每帧创建：拖动的每一帧本就会重建全部画笔（渲染目标每帧重建），同量级开销；
-/// 缓存它反而要引入设备无关资源的所有权管理，得不偿失。
-fn dashed_stroke_style(target: &ID2D1RenderTarget) -> Result<ID2D1StrokeStyle> {
-    let props = D2D1_STROKE_STYLE_PROPERTIES {
+/// 这个数组**只能**与 `D2D1_DASH_STYLE_CUSTOM` 搭配：D2D 的硬约束是「`dashes` 非空
+/// 则 `dashStyle` 必须是 CUSTOM」，否则 `CreateStrokeStyle` 直接返回 `E_INVALIDARG`
+/// （实测 0x80070057），`?` 一路冒泡中断整帧绘制。
+const DASHES: [f32; 2] = [4.0, 3.0];
+
+/// 虚线描边的样式参数。
+///
+/// 抽成纯函数是为了让单测能拿它**真调一次 D2D 的 `CreateStrokeStyle`** 做参数自洽
+/// 校验（见 `dash_stroke_style_parameters_are_accepted_by_d2d`）——这类参数错误在
+/// 编译期完全看不出来，只有运行时才会炸。
+fn dashed_props() -> D2D1_STROKE_STYLE_PROPERTIES {
+    D2D1_STROKE_STYLE_PROPERTIES {
         startCap: D2D1_CAP_STYLE_FLAT,
         endCap: D2D1_CAP_STYLE_FLAT,
         dashCap: D2D1_CAP_STYLE_FLAT,
         lineJoin: D2D1_LINE_JOIN_ROUND,
         miterLimit: 1.0,
-        dashStyle: D2D1_DASH_STYLE_DASH,
+        dashStyle: D2D1_DASH_STYLE_CUSTOM,
         dashOffset: 0.0,
-    };
-    let dashes = [4.0f32, 3.0f32];
+    }
+}
+
+/// 每帧创建：拖动的每一帧本就会重建全部画笔（渲染目标每帧重建），同量级开销；
+/// 缓存它反而要引入设备无关资源的所有权管理，得不偿失。
+fn dashed_stroke_style(target: &ID2D1RenderTarget) -> Result<ID2D1StrokeStyle> {
     unsafe {
         target
             .GetFactory()?
-            .CreateStrokeStyle(&props, Some(&dashes))
+            .CreateStrokeStyle(&dashed_props(), Some(&DASHES))
     }
 }
 
@@ -317,7 +329,7 @@ fn draw_console_content(
 ) -> Result<()> {
     let s = theme.scale;
 
-    // 标题「Sylva」：居中、粗体
+    // 标题「WinBosk」：居中、粗体
     let title_h = c.title_h.max(34.0 * s);
     let title_lr = D2D_RECT_F {
         left: c.x,
@@ -327,7 +339,7 @@ fn draw_console_content(
     };
     draw_text_centered(
         target,
-        "Sylva",
+        "WinBosk",
         &formats.title_bold,
         title_lr,
         &brushes.title,
@@ -1592,7 +1604,7 @@ fn draw_scrollbar(target: &ID2D1RenderTarget, theme: &Theme, fence: &SceneFence,
     unsafe { target.FillRoundedRectangle(&sb, &brush) };
 }
 
-/// Sylva 控制台：深色圆角面板 + 标题 + 新建栅栏按钮 + 每栅栏一行（模式切换）。
+/// WinBosk 控制台：深色圆角面板 + 标题 + 新建栅栏按钮 + 每栅栏一行（模式切换）。
 /// 画单行文本。格式已设为 NO_WRAP（不会换行）；超出矩形宽度时按 Windows 风格
 /// 截断为「…」，并把完整文本留给悬停工具提示（`draw_fence`）。
 fn draw_text(
@@ -1927,9 +1939,9 @@ fn draw_tooltip(
     draw_text(target, text, &formats.label, tr, brush);
 }
 
-/// 粗略估算文本像素宽度，用于居中/对齐（口径见 `sylva_core::text::estimate_width`）。
+/// 粗略估算文本像素宽度，用于居中/对齐（口径见 `winbosk_core::text::estimate_width`）。
 fn text_estimate_width(text: &str, font_size: f32) -> f32 {
-    sylva_core::text::estimate_width(text, font_size)
+    winbosk_core::text::estimate_width(text, font_size)
 }
 
 /// [f32;4]（直通 alpha）→ D2D 颜色。
@@ -2073,5 +2085,130 @@ mod tests {
     fn wrap_two_lines_empty_or_zero_width() {
         assert_eq!(wrap_two_lines("", 72.0, 12.0), "");
         assert_eq!(wrap_two_lines("内容", 0.0, 12.0), "");
+    }
+
+    /// 虚线描边的参数必须能被 D2D 接受。
+    ///
+    /// 这条测试**真调** `ID2D1Factory::CreateStrokeStyle`（不是 mock）：虚线花纹
+    /// `DASHES` 非空时 `dashStyle` 必须是 `CUSTOM`，否则返回 `E_INVALIDARG`
+    /// (0x80070057)。曾因写成 `D2D1_DASH_STYLE_DASH` + `dashes` 导致拖动收起栅栏
+    /// 期间每帧重绘失败、日志刷屏且界面冻死（参数错误 + `Frame` 漏 `EndDraw` 叠加）。
+    /// 工厂是设备无关资源，无需 GPU/窗口即可创建。
+    #[test]
+    fn dash_stroke_style_parameters_are_accepted_by_d2d() {
+        use windows::Win32::Graphics::Direct2D::{
+            D2D1CreateFactory, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        };
+        let props = dashed_props();
+        assert!(
+            props.dashStyle == D2D1_DASH_STYLE_CUSTOM,
+            "dashes 非空时 dashStyle 必须是 CUSTOM（D2D 硬约束）"
+        );
+        let factory: ID2D1Factory =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
+                .expect("D2D 工厂应可创建");
+        let style = unsafe { factory.CreateStrokeStyle(&props, Some(&DASHES)) };
+        assert!(style.is_ok(), "虚线样式参数被 D2D 拒绝: {:?}", style.err());
+    }
+
+    /// 含占位框的场景必须能**真的画出来**——本仓库唯一覆盖「绘制调用返回值」的测试。
+    ///
+    /// D2D 的参数错误编译期完全看不出来：虚线样式若把非空 `dashes` 配在非 CUSTOM 的
+    /// `dashStyle` 上，`CreateStrokeStyle` 直接返回 E_INVALIDARG，`draw_scene` 于是每帧
+    /// 失败（拖动收起栅栏 → 日志刷屏、界面冻死）。这里用**内存 DIB + DC 渲染目标**把
+    /// 整条绘制路径真跑一遍：无需 GPU、窗口、桌面接管，可在 CI 上稳定执行。
+    #[test]
+    fn draw_scene_with_reserved_frame_succeeds() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct2D::{
+            D2D1CreateFactory, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
+            D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+        };
+        use windows::Win32::Graphics::DirectWrite::{
+            DWriteCreateFactory, DWRITE_FACTORY_TYPE_ISOLATED,
+        };
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
+            BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
+        };
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+
+        const W: i32 = 640;
+        const H: i32 = 480;
+        // 与真实运行一致：STA COM（DWrite 工厂创建依赖它）
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
+        }
+        let theme = Theme::default();
+
+        // 内存 DC 必须选入 **DIB**（设备相关位图会让 D2D 的 BeginDraw 失败）
+        let mem_dc = unsafe { CreateCompatibleDC(None) };
+        let mut bmi: BITMAPINFO = unsafe { core::mem::zeroed() };
+        bmi.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = W;
+        bmi.bmiHeader.biHeight = -H; // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32; // biCompression = 0 = BI_RGB
+        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+        let dib: HBITMAP =
+            unsafe { CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) }
+                .expect("DIB 应可创建");
+        let old = unsafe { SelectObject(mem_dc, HGDIOBJ(dib.0)) };
+
+        let factory: ID2D1Factory =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
+                .expect("D2D 工厂应可创建");
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            usage: D2D1_RENDER_TARGET_USAGE_NONE,
+            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        let dc_target =
+            unsafe { factory.CreateDCRenderTarget(&props) }.expect("DC 渲染目标应可创建");
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: W,
+            bottom: H,
+        };
+        unsafe { dc_target.BindDC(mem_dc, &rect) }.expect("绑定 DC 应成功");
+
+        let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+            .expect("DWrite 工厂应可创建");
+        let formats = TextFormats::new(&dwrite, &theme).expect("文本格式应可创建");
+
+        // 场景：只有一个「收起栅栏的原大小占位框」（拖动期间的形态）
+        let mut scene = Scene::new(W as f32, H as f32);
+        scene.reserved.push(SceneReserved {
+            rect: RectF {
+                x: 40.0,
+                y: 60.0,
+                w: 320.0,
+                h: 240.0,
+            },
+            fence: 0,
+            stroke_color: [0.23, 0.51, 0.96, 0.55],
+            fill_color: Some([0.23, 0.51, 0.96, 0.07]),
+        });
+
+        let target: &ID2D1RenderTarget = &dc_target;
+        unsafe { target.BeginDraw() };
+        let drawn = draw_scene(target, &theme, &scene, &IconStore::new(), &formats);
+        let ended = unsafe { target.EndDraw(None, None) };
+
+        unsafe {
+            let _ = SelectObject(mem_dc, old);
+            let _ = DeleteObject(HGDIOBJ(dib.0));
+            let _ = DeleteDC(mem_dc);
+        }
+        ended.expect("EndDraw 应成功");
+        drawn.expect("含占位框的场景必须绘制成功（这是拖动收起栅栏的必经路径）");
     }
 }

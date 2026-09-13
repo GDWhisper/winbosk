@@ -1,4 +1,4 @@
-# Sylva 桌面栅栏待办事项与重构实施计划
+# WinBosk 桌面栅栏待办事项与重构实施计划
 
 本待办事项文档针对近期收集的 4 项交互与功能缺陷进行系统性建模、架构推演与分层方案设计。
 
@@ -50,7 +50,7 @@
 
 #### 方案设计
 1. **统一事件归集点**：
-   在 [`crates/app/src/main.rs`](file:///g:/Codes/sylva/crates/app/src/main.rs) 的主事件循环中，针对所有带有 `fence: usize` 的交互事件：
+   在 [`crates/app/src/main.rs`](file:///g:/Codes/winbosk/crates/app/src/main.rs) 的主事件循环中，针对所有带有 `fence: usize` 的交互事件：
    - `OverlayEvent::IconClicked { fence, .. }`
    - `OverlayEvent::SelectDrag { fence, .. }`
    - `OverlayEvent::FenceMove { fence, .. }`
@@ -66,14 +66,14 @@
    }
    ```
 2. **纯点击栅栏标题与空白时的通知**：
-   在 [`crates/render/src/overlay.rs`](file:///g:/Codes/sylva/crates/render/src/overlay.rs) 中，当 `DragKind::Move` 未超过阈值（单纯点击标题栏或栅栏主体空白处）时，同样派发明确包含 `fence` 索引的事件（或 `FenceDragEnd`），使主状态机感知用户选中了该栅栏。
+   在 [`crates/render/src/overlay.rs`](file:///g:/Codes/winbosk/crates/render/src/overlay.rs) 中，当 `DragKind::Move` 未超过阈值（单纯点击标题栏或栅栏主体空白处）时，同样派发明确包含 `fence` 索引的事件（或 `FenceDragEnd`），使主状态机感知用户选中了该栅栏。
 
 ---
 
 ### Task #2: 控制中心【切换桌面】更名为【恢复桌面】
 
 #### 现状根因分析
-- 在 [`crates/render/src/draw.rs:385-389`](file:///g:/Codes/sylva/crates/render/src/draw.rs#L385-L389)，按钮文本被硬编码为：
+- 在 [`crates/render/src/draw.rs:385-389`](file:///g:/Codes/winbosk/crates/render/src/draw.rs#L385-L389)，按钮文本被硬编码为：
   ```rust
   let toggle_label = if c.desktop_mode {
       "回到栅栏"
@@ -138,7 +138,7 @@
 ### Task #4: 删除分类栅栏图标自动回归【桌面】栅栏
 
 #### 现状根因分析
-1. 当前在 [`crates/app/src/main.rs:1124-1126`](file:///g:/Codes/sylva/crates/app/src/main.rs#L1124-L1126) 及 [`crates/app/src/context_menu.rs:190-192`](file:///g:/Codes/sylva/crates/app/src/context_menu.rs#L190-L192) 中，删除栅栏逻辑为：
+1. 当前在 [`crates/app/src/main.rs:1124-1126`](file:///g:/Codes/winbosk/crates/app/src/main.rs#L1124-L1126) 及 [`crates/app/src/context_menu.rs:190-192`](file:///g:/Codes/winbosk/crates/app/src/context_menu.rs#L190-L192) 中，删除栅栏逻辑为：
    ```rust
    for id in ids {
        rt.desk.move_icon(&id, None);
@@ -148,7 +148,7 @@
    }
    ```
 2. `move_icon(&id, None)` 将图标移到了 `desk.free_icons`。
-3. Sylva 采用全盘桌面接管机制，底层的 Windows `SysListView32` 真实图标被隐藏（`IconGuard`），且 Sylva 只渲染 `desk.fences` 内的图标。
+3. WinBosk 采用全盘桌面接管机制，底层的 Windows `SysListView32` 真实图标被隐藏（`IconGuard`），且 WinBosk 只渲染 `desk.fences` 内的图标。
 4. `free_icons` 没有对应的界面容器，图标一旦进入该集合便从桌面上彻底不可见，导致用户产生“文件被删除了”的极大恐慌；只有重新点击「一键整理」时，`auto_organize_all` 将 `free_icons` 重新收纳为新栅栏，图标才再度出现。
 
 #### 期望方案与算法推演
@@ -210,30 +210,30 @@
 ## 5. 分层改动清单 (Implementation Steps)
 
 ### 一、领域模型层（`crates/core/`）
-- **[`crates/core/src/model.rs`](file:///g:/Codes/sylva/crates/core/src/model.rs)**：
+- **[`crates/core/src/model.rs`](file:///g:/Codes/winbosk/crates/core/src/model.rs)**：
   - `Fence` 添加 `#[serde(default)] pub collapsed: bool`；
   - 扩展单元测试：验证折叠状态字段在 JSON 序列化/反序列化中与旧配置的双向兼容性；
   - 增加纯函数测试：验证图标在栅栏删除后归流到指定栅栏的完整性。
 
 ### 二、渲染与穿透层（`crates/render/`）
-- **[`crates/render/src/draw.rs`](file:///g:/Codes/sylva/crates/render/src/draw.rs)**：
+- **[`crates/render/src/draw.rs`](file:///g:/Codes/winbosk/crates/render/src/draw.rs)**：
   - 将控制中心内的 `"切换桌面"` 文案替换为 `"恢复桌面"`；
   - 在 `draw_fence` 中适配折叠绘制：当 `f.collapsed` 时仅绘制标题栏与收展符号（`▸`/`▾`），跳过主体图标与滚动条；
-- **[`crates/render/src/scene.rs`](file:///g:/Codes/sylva/crates/render/src/scene.rs)**：
+- **[`crates/render/src/scene.rs`](file:///g:/Codes/winbosk/crates/render/src/scene.rs)**：
   - `SceneFence` 增加收展指示器几何矩形 `collapse_toggle: Option<RectF>` 与 `collapsed: bool` 标记。
-- **[`crates/render/src/overlay.rs`](file:///g:/Codes/sylva/crates/render/src/overlay.rs)**：
+- **[`crates/render/src/overlay.rs`](file:///g:/Codes/winbosk/crates/render/src/overlay.rs)**：
   - 增加标题栏收展按钮命中判定；
   - 增加标题栏双击切换收展判定。
 
 ### 三、应用组装与交互层（`crates/app/`）
-- **[`crates/app/src/main.rs`](file:///g:/Codes/sylva/crates/app/src/main.rs)**：
+- **[`crates/app/src/main.rs`](file:///g:/Codes/winbosk/crates/app/src/main.rs)**：
   - 在事件分发逻辑中为桌面栅栏交互注入 `rt.selected_fence` 联动更新逻辑；
   - 提炼公共的 `delete_fence_and_reclaim_icons` 函数，统一控制中心 `ConsoleZone::RemoveFence` 的删除归流行为；
   - 确保删除栅栏时同步移除 `rt.last_layout_h` 对应项。
-- **[`crates/app/src/scene.rs`](file:///g:/Codes/sylva/crates/app/src/scene.rs)**：
+- **[`crates/app/src/scene.rs`](file:///g:/Codes/winbosk/crates/app/src/scene.rs)**：
   - 在 `build_scene` 中为折叠栅栏计算高度 `title_h`，隐藏折叠栅栏内的所有图标项；
   - 在 `hit_model_from` 中确保折叠栅栏的 `body` 仅包含标题高度，使外部区域完全穿透。
-- **[`crates/app/src/context_menu.rs`](file:///g:/Codes/sylva/crates/app/src/context_menu.rs)**：
+- **[`crates/app/src/context_menu.rs`](file:///g:/Codes/winbosk/crates/app/src/context_menu.rs)**：
   - 栅栏右键菜单增加「收起栅栏」/「展开栅栏」菜单项；
   - 栅栏右键菜单的「删除栅栏」迁移至 `delete_fence_and_reclaim_icons`。
 
@@ -244,7 +244,7 @@
 ### 自动化验证
 ```powershell
 # 1. 核心模型测试（必须瞬时通过）
-cargo test -p sylva-core
+cargo test -p winbosk-core
 
 # 2. 全工作区测试
 cargo test --workspace

@@ -1,6 +1,6 @@
 //! 应用级设置与持久化。
 //!
-//! 数据目录由上层注入（Windows 上为 `%APPDATA%\Sylva`），
+//! 数据目录由上层注入（Windows 上为 `%APPDATA%\WinBosk`），
 //! 核心层不感知平台路径，保持可测。
 
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,7 @@ mod tests {
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("sylva-core-test-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("winbosk-core-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

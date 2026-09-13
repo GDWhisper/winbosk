@@ -1,7 +1,7 @@
 //! 场景构建：从领域模型 + 主题排布出渲染场景（栅栏/侧边栏/控制台/命中模型）。
 
 use crate::*;
-use sylva_render::scene::{ReorderDrag, SceneReserved};
+use winbosk_render::scene::{ReorderDrag, SceneReserved};
 pub(crate) fn system_dark_mode() -> bool {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
     let subkey = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
@@ -367,7 +367,7 @@ pub(crate) fn reserved_frames(
         if !worth_marking(f, &rect, theme) {
             continue;
         }
-        if sylva_core::magnet::blocks_move(&hint.requested, &rect, FENCE_GAP) {
+        if winbosk_core::magnet::blocks_move(&hint.requested, &rect, FENCE_GAP) {
             out.push(reserved_frame(i, rect, a));
         }
     }
@@ -710,7 +710,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         // 第一行：标签 + 「更改位置…」+「恢复默认」（后者仅外部文件夹模式出现）。
         // 第二行：落地模式芯片 + 中段省略的真实路径。
         // 该行是用户唯一能得知"文件到底存在哪 / 删除是删副本还是删真身"的入口，故常显。
-        let storage = sylva_core::storage::describe(
+        let storage = winbosk_core::storage::describe(
             desk.fences[sel].storage_path.as_deref(),
             &rt.library.to_string_lossy(),
             rt.desktop_dir.as_deref(),
@@ -758,7 +758,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
             h: path_h,
         };
         // 省略预算与绘制层同源（`text::estimate_width`），留 4px 内边距避免贴边。
-        let storage_path_text = sylva_core::storage::elide_middle(
+        let storage_path_text = winbosk_core::storage::elide_middle(
             &storage.path,
             (storage_path_rect.w - 4.0 * s).max(0.0),
             rt.theme.label.size * 0.72,
@@ -1002,8 +1002,8 @@ pub(crate) fn layout_fence(
                     label,
                     bitmap,
                     i.type_label.clone(),
-                    sylva_shell::time::format_modified(i.modified_secs),
-                    sylva_core::details::format_size(i.size_bytes),
+                    winbosk_shell::time::format_modified(i.modified_secs),
+                    winbosk_core::details::format_size(i.size_bytes),
                 ),
                 None => (label, bitmap, String::new(), String::new(), String::new()),
             }
@@ -1565,7 +1565,7 @@ pub(crate) fn build_dock_magnify(rt: &mut Runtime, scene_fences: &mut [SceneFenc
 
 /// 估算文本物理宽度（委托 core 统一口径：CJK 按字号宽，ASCII 按 0.62 倍宽）。
 pub(crate) fn estimate_text_width(text: &str, font_size: f32) -> f32 {
-    sylva_core::text::estimate_width(text, font_size)
+    winbosk_core::text::estimate_width(text, font_size)
 }
 
 /// 侧边栏工具提示所需的屏幕/主题几何（虚拟屏尺寸、字号、缩放、停靠边），
@@ -1753,25 +1753,29 @@ pub(crate) fn hit_model_from(theme: &Theme, scene: &Scene, _desk: &Desk) -> HitM
                 }
                 zones.push((ConsoleZone::FenceRulePreset(None), d.rule_none));
                 zones.push((
-                    ConsoleZone::FenceRulePreset(Some(sylva_core::model::CategoryPreset::Apps)),
+                    ConsoleZone::FenceRulePreset(Some(winbosk_core::model::CategoryPreset::Apps)),
                     d.rule_apps,
                 ));
                 zones.push((
                     ConsoleZone::FenceRulePreset(Some(
-                        sylva_core::model::CategoryPreset::Documents,
+                        winbosk_core::model::CategoryPreset::Documents,
                     )),
                     d.rule_docs,
                 ));
                 zones.push((
-                    ConsoleZone::FenceRulePreset(Some(sylva_core::model::CategoryPreset::Media)),
+                    ConsoleZone::FenceRulePreset(Some(winbosk_core::model::CategoryPreset::Media)),
                     d.rule_media,
                 ));
                 zones.push((
-                    ConsoleZone::FenceRulePreset(Some(sylva_core::model::CategoryPreset::Archives)),
+                    ConsoleZone::FenceRulePreset(Some(
+                        winbosk_core::model::CategoryPreset::Archives,
+                    )),
                     d.rule_archives,
                 ));
                 zones.push((
-                    ConsoleZone::FenceRulePreset(Some(sylva_core::model::CategoryPreset::Folders)),
+                    ConsoleZone::FenceRulePreset(Some(
+                        winbosk_core::model::CategoryPreset::Folders,
+                    )),
                     d.rule_folders,
                 ));
             }
@@ -2031,7 +2035,7 @@ mod tests {
 
     #[test]
     fn resolve_desktop_fence_semantics() {
-        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
         let mut f_work = test_fence(FenceLayout::Grid);
         f_work.id = 1;
         f_work.title = Some("工作".into());
@@ -2078,7 +2082,7 @@ mod tests {
     /// 空桌面（无栅栏）下面板总高不超过屏幕一半（4K 屏 2160/2=1080）。
     #[test]
     fn console_full_height_no_bogus_bottom_padding() {
-        use sylva_core::{config::AppSettings, model::Desk};
+        use winbosk_core::{config::AppSettings, model::Desk};
         let desk = Desk::new(AppSettings::default());
         let s = 1.0_f32;
         let full = console_full_height(&desk, 0, s);
@@ -2111,11 +2115,14 @@ mod tests {
     ///   倍且面板底边不越屏；极小屏下面板高度不小于 `CONSOLE_MIN_H`。
     #[test]
     fn console_geometry_reveals_by_panel_progress() {
-        use sylva_core::{config::AppSettings, model::Desk};
-        use sylva_render::theme::Theme;
+        use winbosk_core::{config::AppSettings, model::Desk};
+        use winbosk_render::theme::Theme;
         let desk = Desk::new(AppSettings::default());
-        let mut theme = Theme::default();
-        theme.scale = 1.0;
+        // 用结构体更新语法而非 `Default::default()` 后再改字段（clippy::field_reassign_with_default）
+        let theme = Theme {
+            scale: 1.0,
+            ..Theme::default()
+        };
         let vw = 3840.0_f32;
         let vh = 2160.0_f32;
         let full_h = console_full_height(&desk, 0, 1.0);
@@ -2182,7 +2189,7 @@ mod tests {
     /// 几何必须等于碰撞矩形本身（同源），否则提示会与实际阻挡脱节。
     #[test]
     fn reserved_frames_follow_drag_and_blockers() {
-        use sylva_core::config::AppSettings;
+        use winbosk_core::config::AppSettings;
         let theme = Theme::default();
         let mut desk = Desk::new(AppSettings::default());
         desk.fences.push(collapsed_grid_fence(500.0, 200.0)); // 被拖的（原尺寸 300x400）
@@ -2234,7 +2241,7 @@ mod tests {
     ///（即便配置里残留了 collapsed 标记）。
     #[test]
     fn reserved_frames_skips_expanded_and_sidebar() {
-        use sylva_core::config::AppSettings;
+        use winbosk_core::config::AppSettings;
         let theme = Theme::default();
         let mut desk = Desk::new(AppSettings::default());
         let mut expanded = test_fence(FenceLayout::Grid);
@@ -2255,7 +2262,7 @@ mod tests {
     /// 原矩形与收起后的可见高度几乎一致时不画：那只是噪音，没有要解释的约束。
     #[test]
     fn reserved_frames_skips_negligible_height_gap() {
-        use sylva_core::config::AppSettings;
+        use winbosk_core::config::AppSettings;
         let theme = Theme::default();
         let mut desk = Desk::new(AppSettings::default());
         let mut f = test_fence(FenceLayout::Grid);

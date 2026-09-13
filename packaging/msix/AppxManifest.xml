@@ -22,7 +22,7 @@
     <rescap:Capability Name="runFullTrust" />
   </Capabilities>
   <Applications>
-    <Application Id="Sylva" Executable="sylva.exe" EntryPoint="Windows.FullTrustApplication">
+    <Application Id="WinBosk" Executable="winbosk.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
         DisplayName="{{DISPLAY_NAME}}"
         Description="桌面栅栏整理器"

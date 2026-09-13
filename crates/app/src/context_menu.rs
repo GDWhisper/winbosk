@@ -20,10 +20,10 @@ pub(crate) fn handle_tray_menu(rt: &mut Runtime) {
         let s = wide("⚡ 一键整理桌面");
         let _ = AppendMenuW(menu, MF_STRING, MENU_TRAY_ORGANIZE, PCWSTR(s.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let s = wide("显示 Sylva 控制中心");
+        let s = wide("显示 WinBosk 控制中心");
         let _ = AppendMenuW(menu, MF_STRING, MENU_TRAY_CONSOLE, PCWSTR(s.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let s = wide("退出 Sylva");
+        let s = wide("退出 WinBosk");
         let _ = AppendMenuW(menu, MF_STRING, MENU_TRAY_QUIT, PCWSTR(s.as_ptr()));
     }
     let (sx, sy) = cursor_screen();
@@ -77,7 +77,7 @@ pub(crate) fn handle_context_menu(
             .and_then(|f| f.icon_ids.get(ii))
             .and_then(|id| rt.desk.icons.get(id))
             .and_then(|ic| ic.path.clone());
-        // 该项是否由 Sylva 管理（库内项 / 链接镜像项 / 虚拟项，added=true）：
+        // 该项是否由 WinBosk 管理（库内项 / 链接镜像项 / 虚拟项，added=true）：
         // 栅栏内容与文件夹同步，「移出栅栏」与「删除」等价（镜像项移出即删文件、
         // 库内项移出即删引用），菜单不再重复提供「移出栅栏」，只留「删除」。
         // 真实桌面图标（added=false）不同：移出=回未分组区，删除=回收站，保留「移出」。
@@ -194,7 +194,7 @@ pub(crate) fn handle_context_menu(
     }
 }
 
-/// 图标右键菜单（简版回退）：打开 / 移出栅栏（Sylva 管理项不提供移出，见 `handle_context_menu`）。
+/// 图标右键菜单（简版回退）：打开 / 移出栅栏（WinBosk 管理项不提供移出，见 `handle_context_menu`）。
 pub(crate) fn icon_context_menu(
     rt: &Runtime,
     sx: i32,
@@ -233,7 +233,7 @@ pub(crate) enum MultiMenuAction {
 }
 
 /// 多选右键菜单：打开全部 / 复制 / 移出栅栏 / 删除。返回选中的动作。
-/// `managed`（右键项为 Sylva 管理项，见 `handle_context_menu`）：移出与「删除」等价，
+/// `managed`（右键项为 WinBosk 管理项，见 `handle_context_menu`）：移出与「删除」等价，
 /// 跳过「移出栅栏」，只留 打开/复制/删除。
 pub(crate) fn multi_icon_context_menu(
     rt: &Runtime,

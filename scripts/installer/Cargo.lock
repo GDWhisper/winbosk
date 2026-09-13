@@ -50,7 +50,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sylva-installer"
+name = "winbosk-installer"
 version = "0.1.0"
 dependencies = [
  "windows",

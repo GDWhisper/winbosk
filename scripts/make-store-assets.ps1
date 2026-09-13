@@ -1,10 +1,10 @@
 # Generate MSIX / Microsoft Store PNG assets:
-# extract the largest frame from assets/sylva.ico, scale to store sizes,
+# extract the largest frame from assets/winbosk.ico, scale to store sizes,
 # and sample a theme background color.
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\make-store-assets.ps1
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$icoPath = Join-Path $root 'assets\sylva.ico'
+$icoPath = Join-Path $root 'assets\winbosk.ico'
 $outDir = Join-Path $root 'packaging\msix\assets'
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 

@@ -158,18 +158,18 @@ ResetStoragePath,
 
 ### 4.1 核心层（`crates/core/`）
 
-- **[`crates/core/src/lib.rs`](file:///g:/Codes/sylva/crates/core/src/lib.rs)**：注册 `pub mod storage;`。
-- **[`crates/core/src/storage.rs`](file:///g:/Codes/sylva/crates/core/src/storage.rs)**（新增）：
+- **[`crates/core/src/lib.rs`](file:///g:/Codes/winbosk/crates/core/src/lib.rs)**：注册 `pub mod storage;`。
+- **[`crates/core/src/storage.rs`](file:///g:/Codes/winbosk/crates/core/src/storage.rs)**（新增）：
   `StorageKind` / `StorageInfo` / `describe` / `elide_middle` / `same_dir` + 单元测试
   （见 §6）。依赖 `crate::text::estimate_width`，零 Win32。
 
 ### 4.2 驱动/渲染层（`crates/render/`）
 
-- **[`crates/render/src/scene.rs`](file:///g:/Codes/sylva/crates/render/src/scene.rs)**：
+- **[`crates/render/src/scene.rs`](file:///g:/Codes/winbosk/crates/render/src/scene.rs)**：
   `SceneFenceDetail` 新增 4 个字段（§2.2），并更新 `storage_btn` 注释为「更改位置…」。
-- **[`crates/render/src/overlay.rs`](file:///g:/Codes/sylva/crates/render/src/overlay.rs)**：
+- **[`crates/render/src/overlay.rs`](file:///g:/Codes/winbosk/crates/render/src/overlay.rs)**：
   `ConsoleZone` 新增 `ResetStoragePath`（§2.3）。
-- **[`crates/render/src/draw.rs`](file:///g:/Codes/sylva/crates/render/src/draw.rs)**：
+- **[`crates/render/src/draw.rs`](file:///g:/Codes/winbosk/crates/render/src/draw.rs)**：
   - 行标签 `"存储"` → `"文件位置"`（`formats.detail` 下 4 个 CJK 字宽 34.6 DIP < `label_w` 40，
     无需改动 `label_w`，其余各行几何完全不动）；
   - 第一行：`更改位置…`（既有 120 × s）+ `恢复默认`（新增 84 × s，`h <= 0.0` 时跳过）；
@@ -180,18 +180,18 @@ ResetStoragePath,
 
 ### 4.3 组装/交互层（`crates/app/`）
 
-- **[`crates/app/src/main.rs`](file:///g:/Codes/sylva/crates/app/src/main.rs)**：
+- **[`crates/app/src/main.rs`](file:///g:/Codes/winbosk/crates/app/src/main.rs)**：
   - `CONSOLE_FENCE_DETAIL_H`：248.0 → 278.0；
   - `ConsoleClick` 分派新增 `ConsoleZone::ResetStoragePath` → `reset_fence_storage(rt, i)`。
-- **[`crates/app/src/scene.rs`](file:///g:/Codes/sylva/crates/app/src/scene.rs)**：
+- **[`crates/app/src/scene.rs`](file:///g:/Codes/winbosk/crates/app/src/scene.rs)**：
   - `detail_visible_rows` / `console_full_height` / `console_geometry` 增加 `selected: usize`
     入参，改按选中栅栏取 `layout` / `bg_style`（修正既有错配）；
   - `detail_visible_rows` 中「更改位置」由 `n += 1` 改为 `n += 2`；
   - `build_console` 的存储行改为两行布局（§2.4），并计算
-    `sylva_core::storage::describe(...)` 与 `elide_middle(...)`；
+    `winbosk_core::storage::describe(...)` 与 `elide_middle(...)`；
   - 命中区新增 `(ResetStoragePath, d.storage_reset)` 与
     `(ChangeStoragePath, d.storage_path_row)`；零矩形不入表。
-- **[`crates/app/src/file_ops.rs`](file:///g:/Codes/sylva/crates/app/src/file_ops.rs)**：
+- **[`crates/app/src/file_ops.rs`](file:///g:/Codes/winbosk/crates/app/src/file_ops.rs)**：
   - 新增 `reset_fence_storage(rt, fence_idx)`：解除外部链接（见下）；
   - `clear_stale_linked_items` 的 `new_path: &Path` 改为 `Option<&Path>`（`None` = 摘除该目录内全部成员）；
   - `change_fence_storage` 增加**防御守卫**：拒绝把存储位置设为内部库本身、其子目录或其祖先目录
@@ -210,7 +210,7 @@ ResetStoragePath,
 
 ### 4.4 文档
 
-- **[`AGENTS.md`](file:///g:/Codes/sylva/AGENTS.md)**：在「领域术语表」补充
+- **[`AGENTS.md`](file:///g:/Codes/winbosk/AGENTS.md)**：在「领域术语表」补充
   **Storage Mode（存储模式）** 条目（应用内部 / 外部文件夹）与「恢复默认」语义，
   使后续 Agent 不再把该字段误判为"磁盘容量"。
 
@@ -254,7 +254,7 @@ ResetStoragePath,
 
 ## 6. 验证与交付门禁 (Verification Gates)
 
-1. **单元测试（`cargo test -p sylva-core`）** —— `storage::tests`：
+1. **单元测试（`cargo test -p winbosk-core`）** —— `storage::tests`：
    - `describe_none_is_app_library`：`None` → `AppLibrary`，`path == library_dir`，`can_reset == false`；
    - `describe_some_is_external_and_resettable`：普通外部目录 → `ExternalFolder` + `can_reset == true`；
    - `describe_desktop_source_is_not_resettable`：路径等于 `desktop_dir` → `can_reset == false`；
@@ -271,7 +271,7 @@ ResetStoragePath,
    cargo clippy --workspace -- -D warnings
    cargo fmt --all -- --check
    ```
-4. **真实走查**：`$env:SYLVA_AUTOSTOP_MS="2000"; .\target\debug\sylva.exe`（干净退出，勿硬杀）。
+4. **真实走查**：`$env:WINBOSK_AUTOSTOP_MS="2000"; .\target\debug\winbosk.exe`（干净退出，勿硬杀）。
    逐项确认：
    - 默认桌面栅栏显示「外部文件夹」+ 真实桌面路径，且**无**「恢复默认」按钮；
    - 新建空白栅栏显示「应用内部」+ `…\data\library` 路径；

@@ -45,7 +45,7 @@
 
 | 线程 | 占比 | 入口（模块归位） | 归属 |
 | :-- | :-- | :-- | :-- |
-| `tid=65004`（窗口线程 = 主线程） | 54.9% | `sylva.exe+0x18DF50` | 我们的代码（全部是 4s 心跳） |
+| `tid=65004`（窗口线程 = 主线程） | 54.9% | `winbosk.exe+0x18DF50` | 我们的代码（全部是 4s 心跳） |
 | `tid=11276` | 36.9% | **`nvwgf2umx.dll+0xEB9EB0`** | **NVIDIA D3D11 用户态驱动**（同类线程 30+ 个） |
 | `tid=46760` | 7.0% | `uiautomationcore.dll+0x165AD0` | 第三方 Shell 扩展 |
 | `tid=37452` | 0.6% | `gdiplus.dll+0xD8AC0` | 第三方 Shell 扩展 |
@@ -162,7 +162,7 @@
 心跳之外，主线程每一桶都是 `0.000M`。消息循环是纯阻塞 `GetMessageW`，动画结束后
 `CancelWaitableTimer` + `ANIM_TIMER_ARMED = false`，没有任何周期性唤醒。这一层不需要改动。
 
-**建议把它固化成回归断言**（`SYLVA_AUTOSTOP_MS` 那套基础设施已经够用）：判据用
+**建议把它固化成回归断言**（`WINBOSK_AUTOSTOP_MS` 那套基础设施已经够用）：判据用
 `QueryThreadCycleTime` 看主线程分桶，非心跳桶必须精确 `0.000M`。否则下次谁顺手加个定时器，
 这条铁律会悄悄退化且无人察觉。
 
@@ -303,7 +303,7 @@
    `list_dir_entries` 改为返回 `DirEntry`、`should_mirror` 改读缓存属性）。
    门禁：`cargo test --workspace` 151 passed / 0 failed、`cargo clippy --workspace
    -- -D warnings` 零警告、`cargo fmt --all -- --check` 通过；`cargo build --workspace`
-   编译层干净，但当时最终链接 `deps\sylva.exe` 报 `LNK1104` —— 另一会话正在运行
+   编译层干净，但当时最终链接 `deps\winbosk.exe` 报 `LNK1104` —— 另一会话正在运行
    debug 实例占用输出文件，属环境占用。
    **实测效果（同配置 A/B）：心跳 21.0/23.5M → 6.7M 周期，约 3.2 倍**，详见 §3.2。
 3. **做 C2-b**（约半小时）：心跳条件化降频，顺带缓解 §1.3 的线性增长。
@@ -317,7 +317,7 @@
 
 ```bash
 # 周期级精度测单次心跳（.workbuddy-ai/，测完可删）
-SYLVA_AUTOSTOP_MS=70000 ./target/release/sylva.exe &
+WINBOSK_AUTOSTOP_MS=70000 ./target/release/winbosk.exe &
 sleep 12
 python .workbuddy-ai/sync_cost.py 120        # 250ms 分桶，输出各桶周期数
 
@@ -337,9 +337,9 @@ python .workbuddy-ai/running_build.py
 **两个必须知道的坑：**
 
 1. **单实例互斥会让上面的配方静默测错进程。** 互斥检查在 `crates/app/src/main.rs` 中
-   `CreateMutexW` 之后立即 `return`，**早于** `SYLVA_AUTOSTOP_MS` 的安装；而脚本用
-   `FindWindowW("SylvaOverlay")` 找窗口，会挂到**已在运行的那个实例**上。
-   本机常年有实例在跑（本次复核时是 `target/release/sylva.exe`），
+   `CreateMutexW` 之后立即 `return`，**早于** `WINBOSK_AUTOSTOP_MS` 的安装；而脚本用
+   `FindWindowW("WinBoskOverlay")` 找窗口，会挂到**已在运行的那个实例**上。
+   本机常年有实例在跑（本次复核时是 `target/release/winbosk.exe`），
    所以：**要么先干净退出已有实例，要么用 `running_build.py` 确认被测进程的身份并写进结论。**
 2. **这些脚本都在被 gitignore 的 `.workbuddy-ai/` 下**，clone 出来的仓库里没有它们。
    要让结论可复现，得把脚本收进 `scripts/perf/`，或把关键片段内联进本文。

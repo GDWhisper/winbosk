@@ -162,14 +162,14 @@ mod tests {
     #[test]
     fn enrich_fills_details_from_real_file() {
         let dir = std::env::temp_dir();
-        let path = dir.join("sylva_details_test.bin");
+        let path = dir.join("winbosk_details_test.bin");
         let _ = std::fs::write(&path, [1u8, 2, 3, 4, 5]);
         if !path.exists() {
             return;
         }
         let mut icon = Icon::new(
-            "sylva_details_test.bin".into(),
-            "sylva_details_test.bin".into(),
+            "winbosk_details_test.bin".into(),
+            "winbosk_details_test.bin".into(),
             ItemKind::Doc,
         );
         enrich(&mut icon, path.to_string_lossy().as_ref());

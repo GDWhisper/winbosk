@@ -156,7 +156,8 @@ pub struct HitModel {
   - 新增 `fn draw_reserved(target, theme, r: &SceneReserved) -> Result<()>`：
     - 填充：`D2D1_ROUNDED_RECT`（半径 `theme.fence_corner_radius`）先以极淡 `fill_color` 填充；
     - 描边：同形状走虚线 `ID2D1StrokeStyle`；
-    - 虚线实现优先级：① 在合成器初始化时用 `device.rs` 的 `ID2D1Factory` 创建一次 `ID2D1StrokeStyle`（`D2D1_STROKE_STYLE_PROPERTIES { dashStyle: D2D1_DASH_STYLE_DASH, dashCap: D2D1_DASH_CAP_FLAT, .. }`）并随 `TextFormats` 一起持有（设备无关资源）；② 绑定受限时退化为每帧 `CreateStrokeStyle`（仅拖动帧发生，开销可忽略）；③ 再不行则手绘短线段（零新 API）。
+    - 虚线实现优先级：① 在合成器初始化时用 `device.rs` 的 `ID2D1Factory` 创建一次 `ID2D1StrokeStyle`（`D2D1_STROKE_STYLE_PROPERTIES { dashStyle: D2D1_DASH_STYLE_CUSTOM, dashCap: D2D1_DASH_CAP_FLAT, .. }`）并随 `TextFormats` 一起持有（设备无关资源）；② 绑定受限时退化为每帧 `CreateStrokeStyle`（仅拖动帧发生，开销可忽略）；③ 再不行则手绘短线段（零新 API）。
+      **⚠️ 初稿此处写的是 `D2D1_DASH_STYLE_DASH`，是错的**：自定义 `dashes` 只能配 `CUSTOM`，否则 `CreateStrokeStyle` 返回 `E_INVALIDARG`——实现照抄了这个参数，直接导致 §7 的线上事故。方案里写具体 API 常量时必须写全「配对的另一半参数」，不能只写一半。
   - `draw_scene`（`draw.rs:138`）在**栅栏循环之前**绘制全部占位框，保证其位于所有栅栏之下。
   - 配色（实现定稿）：描边 = 与控制台 UI 同一强调色 `[0.23, 0.51, 0.96]`，alpha `0.55 × 场景 alpha`；填充 = 同色 alpha `0.07 × 场景 alpha`。
     **不采用**栅栏自身的 `border_color`：它随系统明暗主题在黑白之间切换（深色=白 42% / 浅色=黑 45%），在深色壁纸上会整个消失；蓝色虚线在明暗壁纸上都读得出"这是 UI 提示"而非真实栅栏边。
@@ -235,8 +236,8 @@ pub struct HitModel {
 ### 6.1 自动化
 
 ```powershell
-cargo test -p sylva-core                     # blocks_move 判定表
-cargo test -p sylva-render                   # content_rect / region / 命中不受影响
+cargo test -p winbosk-core                     # blocks_move 判定表
+cargo test -p winbosk-render                   # content_rect / region / 命中不受影响
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo fmt --all -- --check
@@ -254,7 +255,7 @@ cargo fmt --all -- --check
 | `drag_hint` 下标越界 | 返回空，不 panic |
 | 白名单漂移（新增事件变体） | `drag_hint_whitelist_covers_only_drag_events` 失败，强制作者显式决策 |
 
-本地跑 `sylva-app` 相关门禁时，若 `build.rs` 的 winres 被环境拦截，按项目既有做法临时门控跳过（跑完立即还原）。
+本地跑 `winbosk-app` 相关门禁时，若 `build.rs` 的 winres 被环境拦截，按项目既有做法临时门控跳过（跑完立即还原）。
 
 ### 6.2 真实走查
 
@@ -272,3 +273,44 @@ cargo fmt --all -- --check
 - 拖动自身口径改为 `fence_height` 后，自动高度栅栏的夹屏/避让是否引入越界或抖动？
 - `add_rect` 的 `i32` 截断在负坐标/超大虚拟屏下是否安全？
 - 是否出现写盘、定时器武装、或空闲重绘？
+
+---
+
+## 7. 上线后事故与修复（2026-09-13）
+
+占位框落地（`715222b`）后首次真机拖动收起栅栏即触发**每帧重绘失败 + 界面冻死**。两处缺陷叠加，
+第二处把第一处从「一处画错」放大成「整程序报废」。
+
+### 7.1 P0-A 虚线样式参数非法（每帧 `E_INVALIDARG`）
+
+- **现象**：`WARN winbosk: 重绘失败: 参数错误。 (0x80070057)`；拖动期间 3 秒 **1033 条**（≈340 次/秒）。
+- **根因**：`dashed_stroke_style` 用 `dashStyle: D2D1_DASH_STYLE_DASH` **同时**传了自定义 `dashes`。
+  D2D 的硬约束是「`dashes` 非空 ⇒ `dashStyle` 必须是 `D2D1_DASH_STYLE_CUSTOM`」，否则
+  `CreateStrokeStyle` 直接返回 `E_INVALIDARG`。真调 D2D 工厂实测四组参数：
+
+  | 参数组合 | 结果 |
+  | :--- | :--- |
+  | `DASH` + `dashes` | ❌ `E_INVALIDARG (0x80070057)` |
+  | `DASH` + 无 `dashes` | ✅ |
+  | `CUSTOM` + `dashes` | ✅ |
+  | `CUSTOM` + 空数组 | ❌ `E_INVALIDARG` |
+
+- **修复**：`dashed_props()` 改 `D2D1_DASH_STYLE_CUSTOM`。参数抽成纯函数，单测可**真调** D2D 校验。
+
+### 7.2 P0-B 失败路径漏 `EndDraw`（把「画错一帧」放大成「永久冻死」）
+
+- **现象**：前 710 帧报 `0x80070057`，之后错误码切换为 `0x80131509` 并**永不恢复**——拖动结束后
+  任何重绘都失败，屏幕定格，只能重启进程。
+- **根因**：`Frame` 只有 `finish()`、没有 `Drop`。`present()` 中 `draw_scene(...)?` 提前返回时
+  `frame` 被直接 drop，`ICompositionDrawingSurfaceInterop::EndDraw` **永不执行** → 绘制表面漏在
+  「已获取」态 → 后续每一帧都失败。
+- **修复**：`impl Drop for Frame` 在未结束时补 `EndDraw`（丢弃错误，唯一目的是归还表面）；
+  `finish` 先置位 `ended` 再调用，保证恰好一次。
+
+### 7.3 门禁补强（这类 bug 此前无人兜住）
+
+- `dash_stroke_style_parameters_are_accepted_by_d2d`：把生产用的 `dashed_props()` / `DASHES`
+  真喂给 D2D 工厂校验。**已做反向对照**：改回 `DASH` 时该测试与下一条同时变红。
+- `draw_scene_with_reserved_frame_succeeds`：用**内存 DIB + DC 渲染目标**（无 GPU / 无窗口 /
+  不接管桌面，CI 可稳定跑）真跑一遍含占位框的 `draw_scene`，覆盖「绘制调用返回值」这一整层。
+  仓库此前**没有任何测试覆盖绘制调用是否成功**，这正是缺陷能一路溜到线上的原因。

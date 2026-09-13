@@ -59,14 +59,26 @@ impl CompositionSurface {
         // 绘制表面来自合成图形设备，其设备上下文 DPI 跟随系统；显式 96 保证
         // 1 DIP = 1 物理像素（否则高 DPI 下物理像素布局会被目标 DPI 放大而超界）。
         unsafe { target.SetDpi(96.0, 96.0) };
-        Ok(Frame { interop, target })
+        Ok(Frame {
+            interop,
+            target,
+            ended: false,
+        })
     }
 }
 
 /// 一帧绘制会话。`finish` 提交 D2D 绘制并结束绘制表面。
+///
+/// **无论成功与否，绘制会话都必须 `EndDraw`**：`BeginDraw` 之后绘制表面处于「已获取」
+/// 状态，只有 `EndDraw` 会把它还回去。中途出错（如某个 D2D 调用返回 `E_INVALIDARG`）
+/// 时若直接 drop，表面就永久漏在已获取态——后续每一帧都失败且**无法自行恢复**，
+/// 界面彻底冻死，只能重启进程。这类"一次绘制参数错误 = 整程序报废"的放大效应比
+/// 原始错误本身严重得多，故由 `Drop` 兜底（见其实现注释）。
 pub struct Frame {
     interop: ICompositionDrawingSurfaceInterop,
     target: ID2D1DeviceContext,
+    /// 是否已结束绘制会话（`finish` 走过即置位），保证 `EndDraw` 恰好调用一次。
+    ended: bool,
 }
 
 impl Frame {
@@ -76,9 +88,21 @@ impl Frame {
     }
 
     /// 结束绘制并提交表面（随后调用方应 `RequestCommitAsync`）。
-    pub fn finish(self) -> Result<()> {
+    pub fn finish(mut self) -> Result<()> {
+        // 先置位再调用：`EndDraw` 即使返回错误，绘制会话也已结束（D2D 不会停在
+        // 绘制态），重复调用它反而是非法操作，所以错误路径下 `Drop` 不再重试。
+        self.ended = true;
         unsafe { self.interop.EndDraw()? };
         Ok(())
+    }
+}
+
+/// 失败路径兜底：绘制中途抛错时把表面还回去（错误本身已在调用方上报，这里丢弃）。
+impl Drop for Frame {
+    fn drop(&mut self) {
+        if !self.ended {
+            let _ = unsafe { self.interop.EndDraw() };
+        }
     }
 }
 

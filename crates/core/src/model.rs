@@ -1,7 +1,7 @@
 //! 领域模型：桌面、栅栏、图标等核心类型。
 //!
 //! 本模块只包含纯数据定义与默认值，不含任何平台相关逻辑，
-//! 以便 `sylva-core` 保持零 Win32 依赖、可完全单元测试。
+//! 以便 `winbosk-core` 保持零 Win32 依赖、可完全单元测试。
 
 use serde::{Deserialize, Serialize};
 
@@ -1420,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn sylva_appearance_serde_backward_compatible() {
+    fn winbosk_appearance_serde_backward_compatible() {
         // 旧版 desk.json 的栅栏外观（无 style / border_width / layout）应能加载并取默认值
         let old = r#"{"bg_color":[0.08,0.08,0.12,0.55],"corner_radius":12.0,"acrylic":true,"title_bar_height":32.0,"padding":12.0,"icon_size":48.0,"gap":10.0}"#;
         let a: FenceAppearance = serde_json::from_str(old).expect("旧配置应可反序列化");

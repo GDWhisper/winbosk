@@ -42,9 +42,9 @@ use windows::UI::Composition::{
 };
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
 
-use sylva_shell::icons::IconData;
+use winbosk_shell::icons::IconData;
 
-use sylva_core::model::FenceLayout;
+use winbosk_core::model::FenceLayout;
 
 use crate::device::RenderDevice;
 use crate::draw::{draw_scene, IconStore, TextFormats};

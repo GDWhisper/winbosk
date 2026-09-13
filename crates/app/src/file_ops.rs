@@ -82,7 +82,7 @@ pub(crate) fn register_fence_item(rt: &mut Runtime, fence: usize, path: &str) ->
     let id = if let Some(id) = existing_id {
         id
     } else {
-        let item = match sylva_shell::items::item_from_path(path) {
+        let item = match winbosk_shell::items::item_from_path(path) {
             Ok(it) => it,
             Err(e) => {
                 tracing::warn!(path, "无法创建图标项: {e}");
@@ -97,7 +97,7 @@ pub(crate) fn register_fence_item(rt: &mut Runtime, fence: usize, path: &str) ->
         let mut ic = Icon::new(item_id.clone(), item.display_name.clone(), item.kind);
         ic.path = Some(path.to_string());
         ic.added = true;
-        sylva_core::details::enrich(&mut ic, path);
+        winbosk_core::details::enrich(&mut ic, path);
         rt.desk.icons.insert(item_id.clone(), ic);
 
         let idx = rt.items.len();
@@ -105,7 +105,7 @@ pub(crate) fn register_fence_item(rt: &mut Runtime, fence: usize, path: &str) ->
         rt.item_index.insert(item_id.clone(), idx);
         rt.bitmap_ids.insert(item_id.clone(), new_bitmap);
 
-        match sylva_shell::icons::extract_icon(&rt.items[idx], ICON_EXTRACT_SIZE) {
+        match winbosk_shell::icons::extract_icon(&rt.items[idx], ICON_EXTRACT_SIZE) {
             Ok(data) => rt.pending_uploads.push((new_bitmap, data)),
             Err(e) => tracing::warn!(path, "图标提取失败: {e}"),
         }
@@ -767,13 +767,13 @@ pub(crate) fn is_linked_path(rt: &Runtime, path: &str) -> bool {
     })
 }
 
-/// 是否属于 Sylva 管理区：内部库或任一栅栏的链接存储文件夹。管理区内的文件删除
+/// 是否属于 WinBosk 管理区：内部库或任一栅栏的链接存储文件夹。管理区内的文件删除
 /// 会真实删到磁盘（删除/移出动作），管理区外（桌面源文件）只动引用不碰文件。
 pub(crate) fn is_managed_path(rt: &Runtime, path: &Path) -> bool {
     is_inside_library(rt, path) || is_linked_path(rt, &path.to_string_lossy())
 }
 
-/// 删除 Sylva 管理区内的磁盘文件/文件夹（内部库或链接文件夹）；不在管理区则不碰。
+/// 删除 WinBosk 管理区内的磁盘文件/文件夹（内部库或链接文件夹）；不在管理区则不碰。
 /// 供「删除」动作使用：管理区内删文件，桌面源文件保留。
 pub(crate) fn delete_managed_file(rt: &Runtime, id: &str) {
     let Some(p) = rt.desk.icons.get(id).and_then(|ic| ic.path.clone()) else {
@@ -843,7 +843,7 @@ pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 把一个图标从 Sylva 中整体移除（仅删引用，不碰磁盘文件）。
+/// 把一个图标从 WinBosk 中整体移除（仅删引用，不碰磁盘文件）。
 /// 用于「拖入/粘贴新增项」的移除——它们不属于真实桌面，移出栅栏即删除。
 pub(crate) fn remove_icon_entirely(rt: &mut Runtime, id: &str) {
     rt.desk.icons.remove(id);
@@ -948,7 +948,11 @@ mod tests {
     /// 登记一个图标：id 即小写路径（与 `item_id` 同口径）。
     fn desktop_icon(desk: &mut Desk, path: &str) {
         let id = path.to_ascii_lowercase();
-        let mut ic = Icon::new(id.clone(), id.clone(), sylva_core::model::ItemKind::Unknown);
+        let mut ic = Icon::new(
+            id.clone(),
+            id.clone(),
+            winbosk_core::model::ItemKind::Unknown,
+        );
         ic.path = Some(path.to_string());
         desk.icons.insert(id, ic);
     }
@@ -962,7 +966,7 @@ mod tests {
     /// 全被误判为已存在 → 桌面栅栏永远为空（图标全体消失）。
     #[test]
     fn desktop_existing_ignores_unowned_metadata_pool() {
-        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
         let f = test_fence(1, &[]);
         desk.fences.push(f);
         desktop_icon(&mut desk, r"C:\Users\me\Desktop\a.txt");
@@ -988,7 +992,7 @@ mod tests {
     /// 归属它栅栏（「一键整理」搬走）的桌面文件算已存在 → 不被镜像抢回。
     #[test]
     fn desktop_existing_covers_icons_owned_by_other_fences() {
-        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
         desk.fences.push(test_fence(1, &[]));
         desk.fences
             .push(test_fence(2, &[r"c:\users\me\desktop\doc.pdf"]));
@@ -1001,7 +1005,7 @@ mod tests {
     /// 公共桌面同样是「桌面」的一部分：归属判定不受 storage_path 只指向用户桌面的限制。
     #[test]
     fn desktop_existing_covers_public_desktop() {
-        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
         desk.fences
             .push(test_fence(1, &[r"c:\users\public\desktop\chrome.lnk"]));
         desktop_icon(&mut desk, r"C:\Users\Public\Desktop\Chrome.lnk");
@@ -1013,7 +1017,7 @@ mod tests {
     /// 未分组区（渲染层无绘制入口）**不算归属**：否则「移出栅栏」的桌面项会彻底消失。
     #[test]
     fn desktop_existing_ignores_free_icons() {
-        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
         desk.fences.push(test_fence(1, &[]));
         desktop_icon(&mut desk, r"C:\Users\me\Desktop\loose.txt");
         desk.free_icons
@@ -1025,7 +1029,7 @@ mod tests {
     /// 源目录之外的路径一律不进集合（例如库内项、桌面之外的分区）。
     #[test]
     fn desktop_existing_scopes_to_source_roots() {
-        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
         desk.fences
             .push(test_fence(1, &[r"c:\app\data\library\copy.txt"]));
         desktop_icon(&mut desk, r"C:\app\data\library\copy.txt");
@@ -1036,7 +1040,7 @@ mod tests {
     /// 普通目录镜像栅栏维持「本栅栏成员」口径：别的栅栏持有同一目录下的项不受影响。
     #[test]
     fn plain_mirror_existing_only_counts_own_members() {
-        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
         desk.fences.push(test_fence(1, &[r"c:\portal\mine.txt"]));
         desk.fences.push(test_fence(2, &[r"c:\portal\other.txt"]));
         desktop_icon(&mut desk, r"C:\portal\mine.txt");
@@ -1051,7 +1055,7 @@ mod tests {
     /// 若这条不成立，每 4s 的同步都会退化成全量注册 + 全量 `exists()` 探测。
     #[test]
     fn desktop_converged_holds_fast_path() {
-        let mut desk = Desk::new(sylva_core::config::AppSettings::default());
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
         let a = r"C:\Users\me\Desktop\a.txt";
         let b = r"C:\Users\Public\Desktop\b.lnk";
         desk.fences.push(test_fence(

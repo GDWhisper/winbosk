@@ -7,12 +7,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
-$msix = Join-Path $root 'dist\Sylva-0.1.3-x64.msix'
-$signed = Join-Path $root 'dist\Sylva-0.1.3-x64-signed.msix'
+$msix = Join-Path $root 'dist\WinBosk-0.1.3-x64.msix'
+$signed = Join-Path $root 'dist\WinBosk-0.1.3-x64-signed.msix'
 if (-not (Test-Path $msix)) { throw 'msix not found; run scripts\package-msix.ps1 first' }
-$asciiTmp = Join-Path $env:TEMP 'sylva-msix-test'
+$asciiTmp = Join-Path $env:TEMP 'winbosk-msix-test'
 New-Item -ItemType Directory -Force -Path $asciiTmp | Out-Null
-$signed = Join-Path $asciiTmp 'Sylva-signed.msix'
+$signed = Join-Path $asciiTmp 'WinBosk-signed.msix'
 Copy-Item $msix $signed -Force
 
 $kitBin = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter 'signtool.exe' -ErrorAction SilentlyContinue |
@@ -44,13 +44,13 @@ try {
     # 4) install
     Add-AppxPackage -Path $signed
     $installed = $true
-    Copy-Item $signed (Join-Path $root 'dist\Sylva-0.1.3-x64-signed.msix') -Force
-    $app = Get-AppxPackage -Name Theophania.Sylva
+    Copy-Item $signed (Join-Path $root 'dist\WinBosk-0.1.3-x64-signed.msix') -Force
+    $app = Get-AppxPackage -Name Theophania.WinBosk
     if (-not $app) { throw 'package not installed' }
     Write-Host "installed: $($app.PackageFullName)"
 
     # 5) launch
-    $exe = Join-Path $app.InstallLocation 'sylva.exe'
+    $exe = Join-Path $app.InstallLocation 'winbosk.exe'
     $p = Start-Process $exe -PassThru
     Start-Sleep -Seconds 5
     if ($p.HasExited) { throw 'app exited early during launch test' }
@@ -59,7 +59,7 @@ try {
 } finally {
     # 6) cleanup: remove package and cert
     if ($installed) {
-        $app = Get-AppxPackage -Name Theophania.Sylva -ErrorAction SilentlyContinue
+        $app = Get-AppxPackage -Name Theophania.WinBosk -ErrorAction SilentlyContinue
         if ($app) { Remove-AppxPackage -Package $app.PackageFullName }
     }
     $rootStore = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'CurrentUser')

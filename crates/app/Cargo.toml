@@ -1,13 +1,13 @@
 [package]
-name = "sylva-app"
+name = "winbosk-app"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
-sylva-core = { workspace = true }
-sylva-shell = { path = "../shell" }
-sylva-render = { path = "../render" }
+winbosk-core = { workspace = true }
+winbosk-shell = { path = "../shell" }
+winbosk-render = { path = "../render" }
 windows = { workspace = true }
 
 crossbeam-channel = { workspace = true }
@@ -18,9 +18,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [[bin]]
-name = "sylva"
+name = "winbosk"
 path = "src/main.rs"
 
 [build-dependencies]
-# 把 sylva.ico 编译进 exe 资源（资源 ID 1 = 主图标：Explorer/任务栏/文件属性都显示它）
+# 把 winbosk.ico 编译进 exe 资源（资源 ID 1 = 主图标：Explorer/任务栏/文件属性都显示它）
 winres = "0.1"

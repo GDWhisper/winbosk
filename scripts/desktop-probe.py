@@ -1,6 +1,6 @@
 """只读探测：打印「真实 Windows 桌面」当前显示的图标清单（ground truth）。
 
-为什么需要它：Sylva 用 overlay 接管桌面后，真实桌面图标被 `IconGuard` 隐藏，肉眼与截图都
+为什么需要它：WinBosk 用 overlay 接管桌面后，真实桌面图标被 `IconGuard` 隐藏，肉眼与截图都
 无法判断「桌面上原本应该有哪些图标」。这个脚本直接读 explorer 的桌面 `SysListView32`
 （`LVM_GETITEMCOUNT` + `LVM_GETITEMTEXTW`），拿到 Windows 认为的桌面项全集——**只读**，
 不发送任何修改类消息，也不触碰文件。

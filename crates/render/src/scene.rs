@@ -2,8 +2,8 @@
 //!
 //! 坐标全部为**物理像素**（虚拟屏幕坐标），与 overlay 窗口客户端坐标一致。
 
-use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
-use sylva_core::storage::StorageKind;
+use winbosk_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
+use winbosk_core::storage::StorageKind;
 
 use crate::overlay::{ConsoleZone, RectF};
 

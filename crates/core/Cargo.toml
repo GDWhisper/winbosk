@@ -1,5 +1,5 @@
 [package]
-name = "sylva-core"
+name = "winbosk-core"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

@@ -1,4 +1,4 @@
-// 仅 Windows：把 sylva.ico 编译进安装器 exe 资源，并内嵌 DPI 感知清单。
+// 仅 Windows：把 winbosk.ico 编译进安装器 exe 资源，并内嵌 DPI 感知清单。
 // 资源 ID 1 = 主图标（Explorer / 文件属性 / 安装窗口标题栏 / 任务栏都读它）。
 //
 // 关键：winres 默认**不**内嵌任何清单——没有 DPI 感知清单时，进程被 Windows 判定为
@@ -14,11 +14,11 @@ fn main() {
         .join("..")
         .join("..")
         .join("assets")
-        .join("sylva.ico");
+        .join("winbosk.ico");
     let mut res = winres::WindowsResource::new();
     res.set_icon(&icon.to_string_lossy());
-    res.set("ProductName", "Sylva 桌面栅栏整理器");
-    res.set("FileDescription", "Sylva 安装程序");
+    res.set("ProductName", "WinBosk 桌面栅栏整理器");
+    res.set("FileDescription", "WinBosk 安装程序");
     res.set_manifest(MANIFEST);
     match res.compile() {
         Ok(()) => {}
@@ -35,8 +35,8 @@ fn main() {
 /// `true/pm`（SMI/2005）供 Win8.1 回退，`PerMonitorV2`（SMI/2016）为 Win10 1703+ 主路径。
 const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Sylva.Setup" version="0.1.0.0" processorArchitecture="*"/>
-  <description>Sylva Desktop Fences Setup</description>
+  <assemblyIdentity type="win32" name="WinBosk.Setup" version="0.1.0.0" processorArchitecture="*"/>
+  <description>WinBosk Desktop Fences Setup</description>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>

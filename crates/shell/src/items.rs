@@ -19,7 +19,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-use sylva_core::model::{ItemId, ItemKind};
+use winbosk_core::model::{ItemId, ItemKind};
 
 // windows-rs 0.62 未自动生成的 shell 属性位（稳定文档值）。
 const SFGAO_LINK: u32 = 0x0001_0000;
@@ -338,7 +338,7 @@ mod tests {
             return;
         }
         let dir = std::env::temp_dir();
-        let path = dir.join("sylva_item_test.txt");
+        let path = dir.join("winbosk_item_test.txt");
         let _ = std::fs::write(&path, "hi");
         let ok = path.exists();
         if !ok {
@@ -348,9 +348,9 @@ mod tests {
         match item_from_path(&p) {
             Ok(item) => {
                 assert_eq!(item.path.as_deref(), Some(p.as_str()));
-                assert_eq!(item.display_name, "sylva_item_test.txt");
+                assert_eq!(item.display_name, "winbosk_item_test.txt");
                 // .txt 文件至少不应被归类为 Unknown
-                assert_ne!(item.kind, sylva_core::model::ItemKind::Unknown);
+                assert_ne!(item.kind, winbosk_core::model::ItemKind::Unknown);
                 // 图标提取不阻断添加，这里仅验证不 panic
                 let _ = crate::icons::extract_icon(&item, 32);
             }

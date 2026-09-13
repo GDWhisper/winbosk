@@ -198,53 +198,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
-name = "sylva-app"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "serde",
- "serde_json",
- "sylva-core",
- "sylva-render",
- "sylva-shell",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "windows",
- "winres",
-]
-
-[[package]]
-name = "sylva-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "sylva-render"
-version = "0.1.0"
-dependencies = [
- "sylva-core",
- "sylva-shell",
- "tracing",
- "windows",
- "windows-core",
- "windows-numerics",
-]
-
-[[package]]
-name = "sylva-shell"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "sylva-core",
- "windows",
-]
-
-[[package]]
 name = "symlink"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -425,6 +378,53 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "winbosk-app"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "winbosk-core",
+ "winbosk-render",
+ "winbosk-shell",
+ "windows",
+ "winres",
+]
+
+[[package]]
+name = "winbosk-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "winbosk-render"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "winbosk-core",
+ "winbosk-shell",
+ "windows",
+ "windows-core",
+ "windows-numerics",
+]
+
+[[package]]
+name = "winbosk-shell"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "winbosk-core",
+ "windows",
+]
 
 [[package]]
 name = "windows"

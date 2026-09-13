@@ -69,7 +69,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
-use sylva_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
+use winbosk_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
 
 /// 托盘左键单击去重用：上次派发 `TrayToggle` 的时刻（Unix 纪元毫秒）。
 ///
@@ -86,9 +86,9 @@ fn now_ms() -> u64 {
 }
 
 /// 窗口类名（全局唯一，单实例）。
-const CLASS_NAME: &str = "SylvaOverlay";
+const CLASS_NAME: &str = "WinBoskOverlay";
 /// 隐藏焦点代理窗口类名（独立顶层，离屏 1×1，DefWindowProc 处理即可）。
-const PROXY_CLASS: &str = "SylvaFocusProxy";
+const PROXY_CLASS: &str = "WinBoskFocusProxy";
 
 /// 外部通知主循环退出的消息（WM_APP + 1）。
 /// 由 `run_message_loop` 的调用方决定在退出前恢复现场（如恢复真实桌面图标）。
@@ -97,7 +97,7 @@ pub const WM_APP_QUIT: u32 = 0x8000 + 1;
 /// App 层注入一个 `OverlayEvent`（WM_APP + 2）。`lParam` 指向一个
 /// `Box<OverlayEvent>`（发送方 `Box::into_raw`，接收方 `Box::from_raw` 释放）。
 /// 用途：就地重命名提交后，绕过鼠标消息直接触发一次完整重绘 + 命中模型重建。
-pub const WM_SYLVA_INJECT: u32 = 0x8000 + 2;
+pub const WM_WINBOSK_INJECT: u32 = 0x8000 + 2;
 
 /// 托盘图标回调消息（WM_APP + 3）：`lParam` 为托盘鼠标消息（WM_RBUTTONUP 等）。
 pub const WM_TRAY: u32 = 0x8000 + 3;
@@ -505,7 +505,7 @@ impl OverlayWindow {
 
     /// 把本线程提到前台（前台交给隐藏焦点代理），供随后弹出的模态 UI 使用。
     ///
-    /// Sylva 常驻后台，进程通常不是前台进程；此时直接弹 `TrackPopupMenu` / `MessageBoxW`
+    /// WinBosk 常驻后台，进程通常不是前台进程；此时直接弹 `TrackPopupMenu` / `MessageBoxW`
     /// 会被系统拒绝前台化——菜单点外部不关闭，对话框不获焦、被前台窗口盖住。
     /// 任何需要「把某个窗口提到前台」的场景都必须走它。
     pub fn raise_to_foreground(&self) {
@@ -518,7 +518,7 @@ impl OverlayWindow {
     ///
     /// overlay 以 WorkerW 为 owner 锚在桌面带，默认永远低于普通应用窗口；用户显式唤出
     /// 控制中心时需要临时浮于其上（盖住浏览器等普通窗口，仍低于真正的 TOPMOST 窗口）。
-    /// 必须经 `with_foreground_lock`：Sylva 是后台进程，直接 `SetWindowPos(HWND_TOP)`
+    /// 必须经 `with_foreground_lock`：WinBosk 是后台进程，直接 `SetWindowPos(HWND_TOP)`
     /// 会被系统静默拒绝（返回 TRUE 但 Z 序纹丝不动，已实测）——与 `raise_to_foreground`
     /// 同一套 AttachThreadInput 手法。只动 Z 序：`SWP_NOACTIVATE` 不激活——激活会把
     /// 桌面壳层提到应用之上，且系统不接受激活（键盘输入走隐藏焦点代理）；几何与
@@ -640,14 +640,14 @@ impl OverlayWindow {
                 // `WS_EX_NOACTIVATE`：点击栅栏/小组件不激活窗口、不把桌面壳层提到
                 // 应用之上（桌面层级永远在正常应用下面）。键盘输入走隐藏焦点代理。
                 // `WS_EX_TOOLWINDOW`：不进任务栏/Alt+Tab——日常入口是托盘图标
-                // （默认折叠在通知区隐藏图标里），右键托盘即「Sylva 控制中心」。
+                // （默认折叠在通知区隐藏图标里），右键托盘即「WinBosk 控制中心」。
                 // `WS_EX_NOREDIRECTIONBITMAP`：无重定向位图——WinRT 合成器直连窗口
                 // （CreateDesktopWindowTarget 要求），且 BackdropBrush 才能采样到
                 // 窗口背后真实的桌面（真·实时模糊的前置）。
                 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
                 PCWSTR(wide(CLASS_NAME).as_ptr()),
-                // 窗口标题：任务栏按钮/悬停提示显示「Sylva」（留空会退回进程名 sylva.exe）
-                PCWSTR(wide("Sylva").as_ptr()),
+                // 窗口标题：任务栏按钮/悬停提示显示「WinBosk」（留空会退回进程名 winbosk.exe）
+                PCWSTR(wide("WinBosk").as_ptr()),
                 WS_POPUP,
                 vx,
                 vy,
@@ -662,7 +662,7 @@ impl OverlayWindow {
         // 创建完成、消息泵启动前写入状态，wnd_proc 从此刻起可安全读取
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
         OVERLAY_HWND.store(hwnd.0, Ordering::Relaxed);
-        // 显式设置任务栏/Alt+Tab 图标（大+小），确保运行中的任务栏按钮显示 Sylva 图标。
+        // 显式设置任务栏/Alt+Tab 图标（大+小），确保运行中的任务栏按钮显示 WinBosk 图标。
         // LoadIconW 返回共享句柄，无需释放；资源缺失时返回空图标，WM_SETICON 接受空值
         // 并退回默认图标，不会出错。
         let hicon = app_icon(hinstance);
@@ -690,7 +690,7 @@ impl OverlayWindow {
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
         nid.hIcon = hicon;
-        let tip = wide("Sylva 桌面栅栏");
+        let tip = wide("WinBosk 桌面栅栏");
         for (i, c) in tip.iter().take(127).enumerate() {
             nid.szTip[i] = *c;
         }
@@ -728,7 +728,7 @@ impl OverlayWindow {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 PCWSTR(wide(PROXY_CLASS).as_ptr()),
-                PCWSTR(wide("SylvaFocusProxy").as_ptr()),
+                PCWSTR(wide("WinBoskFocusProxy").as_ptr()),
                 WS_POPUP,
                 -32000,
                 -32000,
@@ -872,10 +872,10 @@ fn virtual_screen() -> (i32, i32, i32, i32) {
     }
 }
 
-/// 加载 exe 内嵌主图标（资源 ID 1 = sylva.ico）。`LoadIconW` 返回系统共享图标句柄，
+/// 加载 exe 内嵌主图标（资源 ID 1 = winbosk.ico）。`LoadIconW` 返回系统共享图标句柄，
 /// 不需要（也不能）手动 `DestroyIcon`；资源缺失时返回空图标，调用方回落默认图标。
 fn app_icon(hinstance: HINSTANCE) -> HICON {
-    // MAKEINTRESOURCE(1)：资源 ID 1 = sylva.ico（不是真正的指针，clippy 误报时放行）
+    // MAKEINTRESOURCE(1)：资源 ID 1 = winbosk.ico（不是真正的指针，clippy 误报时放行）
     #[allow(clippy::manual_dangling_ptr)]
     unsafe { LoadIconW(Some(hinstance), PCWSTR(1 as *const u16)) }.unwrap_or_default()
 }
@@ -891,7 +891,7 @@ fn ensure_class(hinstance: HINSTANCE) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance,
-            // 主图标 = exe 内嵌的 sylva.ico（资源 ID 1）。WNDCLASSW 无 hIconSm 字段，
+            // 主图标 = exe 内嵌的 winbosk.ico（资源 ID 1）。WNDCLASSW 无 hIconSm 字段，
             // 小图标在窗口创建后经 WM_SETICON(ICON_SMALL) 显式设置（任务栏按钮优先取它）。
             hIcon: app_icon(hinstance),
             hCursor: Default::default(),
@@ -1422,7 +1422,7 @@ unsafe extern "system" fn wnd_proc(
         }
         // App 注入事件：就地重命名提交后触发一次完整重绘 + 命中模型重建。
         // `lParam` 是一个 `Box<OverlayEvent>`（发送方 into_raw，这里 from_raw 并释放）。
-        WM_SYLVA_INJECT if lparam.0 != 0 => {
+        WM_WINBOSK_INJECT if lparam.0 != 0 => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if !ptr.is_null() {
                 let state = unsafe { &mut *ptr };

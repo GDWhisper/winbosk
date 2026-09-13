@@ -16,7 +16,7 @@ use windows::Win32::UI::Shell::{
     IShellItemImageFactory, SHCreateItemFromIDList, SIIGBF, SIIGBF_ICONONLY,
 };
 
-use sylva_core::model::ItemId;
+use winbosk_core::model::ItemId;
 
 use crate::items::DesktopItem;
 

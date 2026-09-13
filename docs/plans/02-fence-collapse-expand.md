@@ -98,27 +98,27 @@ pub enum OverlayEvent {
 ## 4. 分层改动清单 (Implementation Steps)
 
 ### 一、领域模型层（`crates/core/`）
-- **[`crates/core/src/model.rs`](file:///g:/Codes/sylva/crates/core/src/model.rs)**：
+- **[`crates/core/src/model.rs`](file:///g:/Codes/winbosk/crates/core/src/model.rs)**：
   - `Fence` 增加 `#[serde(default)] pub collapsed: bool`；
   - 在所有测试与辅助构造函数中补充 `collapsed: false`；
   - 编写单测验证含/不含 `collapsed` 字段的 JSON 反序列化向后兼容性。
 
 ### 二、渲染与穿透层（`crates/render/`）
-- **[`crates/render/src/scene.rs`](file:///g:/Codes/sylva/crates/render/src/scene.rs)**：
+- **[`crates/render/src/scene.rs`](file:///g:/Codes/winbosk/crates/render/src/scene.rs)**：
   - `SceneFence` 结构体增加 `pub collapsed: bool` 与 `pub collapse_btn: Option<RectF>`；
-- **[`crates/render/src/draw.rs`](file:///g:/Codes/sylva/crates/render/src/draw.rs)**：
+- **[`crates/render/src/draw.rs`](file:///g:/Codes/winbosk/crates/render/src/draw.rs)**：
   - 在 `draw_fence_inner` 中支持折叠渲染：
     - 绘制标题栏圆角矩形底色与描边（高度为 `fence.height == title_h`）；
     - 绘制栅栏标题；
     - 绘制折叠指示器（`▸` 表示收起态，`▾` 表示展开态）；
     - 若 `fence.collapsed` 为 `true`，跳过后续所有图标、列表表头、滚动条的绘制与图层裁剪。
-- **[`crates/render/src/overlay.rs`](file:///g:/Codes/sylva/crates/render/src/overlay.rs)**：
+- **[`crates/render/src/overlay.rs`](file:///g:/Codes/winbosk/crates/render/src/overlay.rs)**：
   - `FenceHit` 中记录折叠按钮矩形 `collapse_btn: Option<RectF>`；
   - 在 `on_button_down` 中优先判定点击是否命中 `collapse_btn`，若是则分发 `OverlayEvent::FenceCollapseToggle { fence }` 并返回；
   - 在 `on_double_click` 中，若未命中图标但命中了栅栏标题栏 `f.title`，分发 `OverlayEvent::FenceTitleDoubleClicked { fence }`。
 
 ### 三、应用组装与交互层（`crates/app/`）
-- **[`crates/app/src/scene.rs`](file:///g:/Codes/sylva/crates/app/src/scene.rs)**：
+- **[`crates/app/src/scene.rs`](file:///g:/Codes/winbosk/crates/app/src/scene.rs)**：
   - 在 `build_scene` 中：
     - 计算标题栏高度 `title_h = (theme.title.size * 1.6 + theme.title_padding_bottom + 2.0 * theme.fence_padding).round()`；
     - 若 `f.collapsed`：
@@ -130,7 +130,7 @@ pub enum OverlayEvent {
       - 计算并填充 `collapse_btn` 坐标矩形；
   - 在 `hit_model_from` 中：
     - 折叠栅栏的 `f.body` 尺寸以 `SceneFence.height`（即 `title_h`）为准；
-- **[`crates/app/src/main.rs`](file:///g:/Codes/sylva/crates/app/src/main.rs)**：
+- **[`crates/app/src/main.rs`](file:///g:/Codes/winbosk/crates/app/src/main.rs)**：
   - 在 `handle_event` 中处理 `OverlayEvent::FenceCollapseToggle { fence }` 和 `OverlayEvent::FenceTitleDoubleClicked { fence }`：
     ```rust
     if let Some(f) = rt.desk.fences.get_mut(fence) {
@@ -138,7 +138,7 @@ pub enum OverlayEvent {
         let _ = rt.store.save(&rt.desk);
     }
     ```
-- **[`crates/app/src/context_menu.rs`](file:///g:/Codes/sylva/crates/app/src/context_menu.rs)**：
+- **[`crates/app/src/context_menu.rs`](file:///g:/Codes/winbosk/crates/app/src/context_menu.rs)**：
   - 在 `fence_context_menu` 中增加收折菜单项：
     - 若 `f.collapsed` 则为「展开栅栏」；
     - 否则为「收起栅栏」；
@@ -158,7 +158,7 @@ pub enum OverlayEvent {
 
 1. **核心测试**：
    ```powershell
-   cargo test -p sylva-core
+   cargo test -p winbosk-core
    cargo test --workspace
    ```
 2. **代码质量**：

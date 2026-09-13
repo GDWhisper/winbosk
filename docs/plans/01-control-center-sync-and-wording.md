@@ -20,7 +20,7 @@
 ## 2. 状态契约与接口设计 (Contracts & Data Models)
 
 ### 2.1 视口滚动对齐函数（纯计算）
-在 [`crates/app/src/scene.rs`](file:///g:/Codes/sylva/crates/app/src/scene.rs) 中实现视口对齐计算：
+在 [`crates/app/src/scene.rs`](file:///g:/Codes/winbosk/crates/app/src/scene.rs) 中实现视口对齐计算：
 ```rust
 /// 确保当前选中的栅栏在控制中心列表中完全可见
 pub(crate) fn ensure_selected_fence_visible(rt: &mut Runtime) {
@@ -49,7 +49,7 @@ pub(crate) fn ensure_selected_fence_visible(rt: &mut Runtime) {
 ```
 
 ### 2.2 控制中心文案契约
-在 [`crates/render/src/draw.rs`](file:///g:/Codes/sylva/crates/render/src/draw.rs) 中：
+在 [`crates/render/src/draw.rs`](file:///g:/Codes/winbosk/crates/render/src/draw.rs) 中：
 ```rust
 let toggle_label = if c.desktop_mode {
     "回到栅栏"
@@ -76,16 +76,16 @@ let toggle_label = if c.desktop_mode {
 ## 4. 分层改动清单 (Implementation Steps)
 
 ### 一、渲染层（`crates/render/`）
-- **[`crates/render/src/draw.rs`](file:///g:/Codes/sylva/crates/render/src/draw.rs)**：
+- **[`crates/render/src/draw.rs`](file:///g:/Codes/winbosk/crates/render/src/draw.rs)**：
   - 将 `draw_console` 中按钮标签 `"切换桌面"` 改为 `"恢复桌面"`；
-- **[`crates/render/src/scene.rs`](file:///g:/Codes/sylva/crates/render/src/scene.rs)**：
+- **[`crates/render/src/scene.rs`](file:///g:/Codes/winbosk/crates/render/src/scene.rs)**：
   - 更新 `SceneConsole.desktop_toggle` 字段注释。
 
 ### 二、应用组装层（`crates/app/`）
-- **[`crates/app/src/scene.rs`](file:///g:/Codes/sylva/crates/app/src/scene.rs)**：
+- **[`crates/app/src/scene.rs`](file:///g:/Codes/winbosk/crates/app/src/scene.rs)**：
   - 新增 `ensure_selected_fence_visible` 纯函数；
   - 更新 `build_console` 中的注释。
-- **[`crates/app/src/main.rs`](file:///g:/Codes/sylva/crates/app/src/main.rs)**：
+- **[`crates/app/src/main.rs`](file:///g:/Codes/winbosk/crates/app/src/main.rs)**：
   - 在 `handle_event` 中建立统一联动拦截点：
     对于携带 `fence: usize` 的交互事件（`FenceMove`、`FenceResize`、`FenceDragEnd`、`IconClicked`、`IconDoubleClicked`、`SelectDrag`、`ContextMenu`）：
     ```rust

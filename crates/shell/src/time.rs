@@ -1,7 +1,7 @@
 //! 本地时间格式化：unix 秒 → 本地 "YYYY-MM-DD HH:MM"。
 //!
 //! unix 秒是 UTC 绝对时刻；这里用 `FileTimeToLocalFileTime` 换算成本地
-//! FILETIME 后还原回 unix 秒，再委托 `sylva_core::details::format_time_utc`
+//! FILETIME 后还原回 unix 秒，再委托 `winbosk_core::details::format_time_utc`
 //! 做纯 Rust 的历法格式化（算法可单测）。
 
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
@@ -29,11 +29,11 @@ pub fn format_local(unix: i64) -> String {
         if FileTimeToSystemTime(&utc, &mut st).is_ok()
             && FileTimeToLocalFileTime(&utc, &mut local).is_ok()
         {
-            return sylva_core::details::format_time_utc(filetime_to_unix(&local));
+            return winbosk_core::details::format_time_utc(filetime_to_unix(&local));
         }
     }
     // 兜底：直接按 UTC 显示（时区偏差，但格式正确、不崩溃）
-    sylva_core::details::format_time_utc(unix)
+    winbosk_core::details::format_time_utc(unix)
 }
 
 /// 已格式化短时间（列表列头用）。空字符串表示无该信息。

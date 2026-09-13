@@ -234,7 +234,7 @@ cargo fmt --all -- --check
 ### 7.1 实测证据（修复前）
 
 在 `advance_anim` 头部插入临时帧计数器（统计一次补间内 `AnimTick` 次数与相邻间隔），
-实跑 `target\debug\sylva.exe`，用 `PostMessageW(WM_HOTKEY)` 脚本触发开合：
+实跑 `target\debug\winbosk.exe`，用 `PostMessageW(WM_HOTKEY)` 脚本触发开合：
 
 ```
 [anim-probe] 面板补间结束 frames=9  elapsed_ms=216 dur=0.2  gaps_ms=[15,30,15,30,30,15,30,15]
@@ -345,7 +345,7 @@ C B + timeBeginPeriod(1)      : [16,16,16,16,16,16,16,...,16]       与 B 无异
 **分桶复验**（250ms 一桶采样 30s，`.workbuddy-ai/idle_buckets.py`）：非零桶只出现在
 约 4s 的整数倍处，**120 桶里 114 桶精确为 0.0ms**——不存在任何持续轮询，空闲期进程
 确实完全挂起。代码侧亦确认周期源只有 `SYNC_LIBRARY_TIMER` 一个（`main.rs` 里唯一的
-`thread::spawn` 是 `SYLVA_AUTOSTOP_MS` 测试钩子，一次性睡眠后投递退出）。
+`thread::spawn` 是 `WINBOSK_AUTOSTOP_MS` 测试钩子，一次性睡眠后投递退出）。
 
 注意 15.6ms 恰是 Windows CPU 计账的一个**时钟量子**：心跳实际只花 1~2ms，是否被记成
 一个量子取决于时钟中断是否正好落在它运行期间，所以不同轮次里"看得见的尖峰"数量会浮动

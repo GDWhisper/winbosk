@@ -1,4 +1,4 @@
-//! `sylva-render`：渲染层。
+//! `winbosk-render`：渲染层。
 //!
 //! 负责桌面 overlay 窗口与 WinRT `Windows.UI.Composition` / Direct2D / DirectWrite
 //! 绘制：
@@ -38,7 +38,7 @@ pub use device::RenderDevice;
 pub use draw::{draw_scene, IconStore, TextFormats};
 pub use overlay::{
     run_message_loop, ConsoleHit, ConsoleZone, FenceHit, HitModel, IconHit, OverlayEvent,
-    OverlayWindow, RectF, ResizeZone, GRIP_SIZE, WM_APP_QUIT, WM_SYLVA_INJECT,
+    OverlayWindow, RectF, ResizeZone, GRIP_SIZE, WM_APP_QUIT, WM_WINBOSK_INJECT,
 };
 pub use scene::{
     ListColumns, Scene, SceneConsole, SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow,

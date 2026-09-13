@@ -1,15 +1,15 @@
-# Package sylva.exe as MSIX. Unsigned by default (for Microsoft Store).
+# Package winbosk.exe as MSIX. Unsigned by default (for Microsoft Store).
 # Use -Sign for local sideload testing.
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\package-msix.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\package-msix.ps1 -Publisher "CN=YourPublisher" -Sign -CertPath cert.pfx -CertPassword xxx
 param(
-    [string]$Publisher = 'CN=Sylva',
-    [string]$PublisherDisplayName = 'Sylva',
-    [string]$PackageName = 'Sylva.DesktopFences',
-    [string]$DisplayName = 'Sylva',
+    [string]$Publisher = 'CN=WinBosk',
+    [string]$PublisherDisplayName = 'WinBosk',
+    [string]$PackageName = 'WinBosk.DesktopFences',
+    [string]$DisplayName = 'WinBosk',
     [string]$Version = '0.1.0',
-    [string]$OutName = 'Sylva-0.1.0-x64',
+    [string]$OutName = 'WinBosk-0.1.0-x64',
     [switch]$Sign,
     [string]$CertPath = '',
     [string]$CertPassword = ''
@@ -29,10 +29,10 @@ $build = Join-Path $root 'packaging\msix\build'
 $assets = Join-Path $root 'packaging\msix\assets'
 if (Test-Path $build) { Remove-Item -LiteralPath $build -Recurse -Force }
 New-Item -ItemType Directory -Force -Path (Join-Path $build 'assets') | Out-Null
-$exe = Join-Path $root 'dist\Sylva\sylva.exe'
-if (-not (Test-Path $exe)) { $exe = Join-Path $root 'dist\sylva.exe' }
-if (-not (Test-Path $exe)) { throw 'sylva.exe not found under dist' }
-Copy-Item $exe (Join-Path $build 'sylva.exe') -Force
+$exe = Join-Path $root 'dist\WinBosk\winbosk.exe'
+if (-not (Test-Path $exe)) { $exe = Join-Path $root 'dist\winbosk.exe' }
+if (-not (Test-Path $exe)) { throw 'winbosk.exe not found under dist' }
+Copy-Item $exe (Join-Path $build 'winbosk.exe') -Force
 Copy-Item (Join-Path $assets '*') (Join-Path $build 'assets') -Force
 
 # ---- 3) Render manifest (replace placeholders) ----

@@ -1,4 +1,4 @@
-//! Sylva 图形化安装/卸载程序：亮色窗口，可自选安装位置，按当前用户安装。
+//! WinBosk 图形化安装/卸载程序：亮色窗口，可自选安装位置，按当前用户安装。
 //!
 //! 双模式：无参数 = 安装；`--uninstall` = 图形化卸载（控制面板卸载项指向
 //! `uninstall.exe --uninstall`，复用同一二进制、同一套 GUI）。
@@ -6,17 +6,17 @@
 //! - **DPI**：内嵌 Per-Monitor v2 清单（见 build.rs）——高缩放下原生渲染不再模糊，
 //!   跨屏/改缩放在 `WM_DPICHANGED` 实时重排布局并重建字体（否则整窗被拉伸、文字错位）。
 //! - **安装位置**：路径编辑框 + 「浏览…」文件夹选择器（`IFileOpenDialog` + `FOS_PICKFOLDERS`）。
-//!   规范化成 `<所选地址>\sylva`：用户选 `D:\Program Files` 会自动补齐为
-//!   `D:\Program Files\sylva`，全部 Sylva 文件（主程序、卸载器、data 数据目录）都在其中。
-//! - **数据目录**：`sylva` 文件夹内建 `data` 子目录，作为后续用户数据与新建栅栏的
+//!   规范化成 `<所选地址>\winbosk`：用户选 `D:\Program Files` 会自动补齐为
+//!   `D:\Program Files\winbosk`，全部 WinBosk 文件（主程序、卸载器、data 数据目录）都在其中。
+//! - **数据目录**：`winbosk` 文件夹内建 `data` 子目录，作为后续用户数据与新建栅栏的
 //!   默认存储位置（应用侧以「主程序同目录下存在 data 文件夹」为准）。
-//! - **卸载**：检测到 sylva.exe 仍在运行时提示用户先手动关闭（**不代关、不强杀**）；
+//! - **卸载**：检测到 winbosk.exe 仍在运行时提示用户先手动关闭（**不代关、不强杀**）；
 //!   再兜底恢复被隐藏的桌面图标（`SysListView32` 直接显示回来防桌面空白）；
 //!   清注册表/快捷方式；可选保留用户数据（把 `data` 文件夹移到「文档」）；
-//!   删除安装目录内除自身外的全部文件并校验 sylva.exe 已删除，自身交给延迟清理进程
+//!   删除安装目录内除自身外的全部文件并校验 winbosk.exe 已删除，自身交给延迟清理进程
 //!   在本进程退出后删除；完成即自动关闭卸载窗口（不再弹「完成」对话框）。
 //! - **布局**：96 DIP 基准，运行时按 `dpi/96` 缩放；底部按钮按客户区右下角对齐。
-//! - 免管理员权限：默认装到 `%LOCALAPPDATA%\Programs\Sylva`，建桌面/开始菜单快捷方式，
+//! - 免管理员权限：默认装到 `%LOCALAPPDATA%\Programs\WinBosk`，建桌面/开始菜单快捷方式，
 //!   可选开机自启，注册控制面板卸载项，安装完成后自动启动。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -70,7 +70,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// 内嵌主程序（编译期打包，安装器独立分发）。
-const SYLVA_EXE: &[u8] = include_bytes!("../../../target/release/sylva.exe");
+const WINBOSK_EXE: &[u8] = include_bytes!("../../../target/release/winbosk.exe");
 
 // 控件 ID（WM_COMMAND 分发用）
 const ID_BTN_INSTALL: usize = 1001;
@@ -147,7 +147,7 @@ fn dl(dip: i32, dpi: u32) -> i32 {
     ((dip as f32) * (dpi as f32) / 96.0).round() as i32
 }
 
-/// 加载 exe 内嵌主图标（资源 ID 1 = build.rs 嵌入的 sylva.ico）。
+/// 加载 exe 内嵌主图标（资源 ID 1 = build.rs 嵌入的 winbosk.ico）。
 #[allow(clippy::manual_dangling_ptr)]
 fn app_icon(hinstance: HINSTANCE) -> HICON {
     unsafe { LoadIconW(Some(hinstance), PCWSTR(1 as *const u16)) }.unwrap_or_default()
@@ -271,27 +271,27 @@ fn shell_desktop_dir() -> Option<PathBuf> {
     }
 }
 
-/// 默认安装位置：%LOCALAPPDATA%\Programs\Sylva（本身即「sylva 文件夹」）。
+/// 默认安装位置：%LOCALAPPDATA%\Programs\WinBosk（本身即「winbosk 文件夹」）。
 fn default_path() -> String {
     env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir)
         .join("Programs")
-        .join("Sylva")
+        .join("WinBosk")
         .to_string_lossy()
         .into_owned()
 }
 
-/// 规范化安装目录：用户选/输入 `D:\Program Files` 时自动补成 `D:\Program Files\sylva`，
-/// 末段已是 `sylva`（不区分大小写，含默认路径）则原样保留。全部 Sylva 相关文件
-/// （主程序、卸载器、data 数据目录）都放进这个 `sylva` 文件夹。
+/// 规范化安装目录：用户选/输入 `D:\Program Files` 时自动补成 `D:\Program Files\winbosk`，
+/// 末段已是 `winbosk`（不区分大小写，含默认路径）则原样保留。全部 WinBosk 相关文件
+/// （主程序、卸载器、data 数据目录）都放进这个 `winbosk` 文件夹。
 fn normalize_dest(p: &str) -> PathBuf {
     let pb = PathBuf::from(p);
     let last = pb.file_name().map(|s| s.to_string_lossy().to_ascii_lowercase());
-    if last.as_deref() == Some("sylva") {
+    if last.as_deref() == Some("winbosk") {
         pb
     } else {
-        pb.join("sylva")
+        pb.join("winbosk")
     }
 }
 
@@ -350,8 +350,8 @@ fn pick_folder(owner: HWND, current: &str) -> Option<String> {
 }
 
 fn run_install(app: &mut Installer) -> bool {
-    // 读取用户选择/输入的安装目录；空则回退默认。规范化成 `...\sylva`：用户选
-    // `D:\Program Files` 会补齐为 `D:\Program Files\sylva`，全部 Sylva 文件都在其中。
+    // 读取用户选择/输入的安装目录；空则回退默认。规范化成 `...\winbosk`：用户选
+    // `D:\Program Files` 会补齐为 `D:\Program Files\winbosk`，全部 WinBosk 文件都在其中。
     let raw = get_path(app);
     let trimmed = raw.trim().to_string();
     let dest = if trimmed.is_empty() {
@@ -371,20 +371,20 @@ fn run_install(app: &mut Installer) -> bool {
         app.busy = false;
         set_status(app, "安装失败");
         msgbox(
-            "Sylva 安装",
+            "WinBosk 安装",
             &format!("无法创建安装目录：\n{}\n\n（{e}）", dest.display()),
             true,
         );
         return false;
     }
-    if let Err(e) = fs::write(dest.join("sylva.exe"), SYLVA_EXE) {
+    if let Err(e) = fs::write(dest.join("winbosk.exe"), WINBOSK_EXE) {
         app.busy = false;
         set_status(app, "安装失败");
         msgbox(
-            "Sylva 安装",
+            "WinBosk 安装",
             &format!(
                 "写入主程序失败：\n{}（{e}）",
-                dest.join("sylva.exe").display()
+                dest.join("winbosk.exe").display()
             ),
             true,
         );
@@ -392,13 +392,13 @@ fn run_install(app: &mut Installer) -> bool {
     }
     set_progress(app, 35);
 
-    // 数据目录：`sylva` 文件夹内建 `data` 子目录，存放后续用户数据，
+    // 数据目录：`winbosk` 文件夹内建 `data` 子目录，存放后续用户数据，
     // 应用侧新建栅栏的默认存储位置即「主程序同目录下的 data 文件夹」。
     if let Err(e) = fs::create_dir_all(dest.join("data")) {
         app.busy = false;
         set_status(app, "安装失败");
         msgbox(
-            "Sylva 安装",
+            "WinBosk 安装",
             &format!("无法创建数据目录：\n{}（{e}）", dest.join("data").display()),
             true,
         );
@@ -413,21 +413,21 @@ fn run_install(app: &mut Installer) -> bool {
 
     // 桌面 + 开始菜单快捷方式（PowerShell 编码命令，中文安全）
     let exe_ps = dest
-        .join("sylva.exe")
+        .join("winbosk.exe")
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('\'', "''");
     let script = format!(
         "$ws=New-Object -ComObject WScript.Shell; \
          $d='{exe}'; \
-         $l=$ws.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'Sylva.lnk')); \
+         $l=$ws.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'WinBosk.lnk')); \
          $l.TargetPath=$d; $l.WorkingDirectory=Split-Path $d; \
-         $l.Description='Sylva 桌面栅栏整理器'; $l.Save(); \
-         $m=Join-Path ([Environment]::GetFolderPath('Programs')) 'Sylva'; \
+         $l.Description='WinBosk 桌面栅栏整理器'; $l.Save(); \
+         $m=Join-Path ([Environment]::GetFolderPath('Programs')) 'WinBosk'; \
          New-Item -ItemType Directory -Force -Path $m|Out-Null; \
-         $l2=$ws.CreateShortcut((Join-Path $m 'Sylva.lnk')); \
+         $l2=$ws.CreateShortcut((Join-Path $m 'WinBosk.lnk')); \
          $l2.TargetPath=$d; $l2.WorkingDirectory=Split-Path $d; \
-         $l2.Description='Sylva 桌面栅栏整理器'; $l2.Save()",
+         $l2.Description='WinBosk 桌面栅栏整理器'; $l2.Save()",
         exe = exe_ps
     );
     let encoded = encode_command(&script);
@@ -447,7 +447,7 @@ fn run_install(app: &mut Installer) -> bool {
         app.busy = false;
         set_status(app, "安装失败");
         msgbox(
-            "Sylva 安装",
+            "WinBosk 安装",
             "创建快捷方式失败，请关闭安全软件后重试。",
             true,
         );
@@ -457,19 +457,19 @@ fn run_install(app: &mut Installer) -> bool {
 
     // 开机自启（仅勾选时）+ 卸载信息
     if autostart {
-        let exe_quoted = format!("\"{}\"", dest.join("sylva.exe").display());
+        let exe_quoted = format!("\"{}\"", dest.join("winbosk.exe").display());
         reg_add(
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "Sylva",
+            "WinBosk",
             &exe_quoted,
         );
     }
-    let unreg = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Sylva";
+    let unreg = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\WinBosk";
     let dest_disp = dest.to_string_lossy();
-    let exe_quoted = format!("\"{}\"", dest.join("sylva.exe").display());
-    reg_add(unreg, "DisplayName", "Sylva 桌面栅栏整理器");
+    let exe_quoted = format!("\"{}\"", dest.join("winbosk.exe").display());
+    reg_add(unreg, "DisplayName", "WinBosk 桌面栅栏整理器");
     reg_add(unreg, "DisplayVersion", "0.1.0");
-    reg_add(unreg, "Publisher", "Sylva");
+    reg_add(unreg, "Publisher", "WinBosk");
     reg_add(unreg, "InstallLocation", &dest_disp);
     reg_add(unreg, "DisplayIcon", &exe_quoted);
     reg_add(
@@ -482,24 +482,24 @@ fn run_install(app: &mut Installer) -> bool {
     set_progress(app, 90);
 
     // 启动
-    let _ = Command::new(dest.join("sylva.exe"))
+    let _ = Command::new(dest.join("winbosk.exe"))
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
-    set_status(app, "安装完成，Sylva 已启动。");
+    set_status(app, "安装完成，WinBosk 已启动。");
     set_progress(app, 100);
     true
 }
 
-/// sylva.exe 是否仍在运行（tasklist 轮询）。查询失败按已退出处理，避免无限等待。
-fn sylva_running() -> bool {
+/// winbosk.exe 是否仍在运行（tasklist 轮询）。查询失败按已退出处理，避免无限等待。
+fn winbosk_running() -> bool {
     match Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq sylva.exe", "/NH"])
+        .args(["/FI", "IMAGENAME eq winbosk.exe", "/NH"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
     {
         Ok(o) => String::from_utf8_lossy(&o.stdout)
             .to_ascii_lowercase()
-            .contains("sylva.exe"),
+            .contains("winbosk.exe"),
         Err(_) => false,
     }
 }
@@ -509,12 +509,12 @@ fn sylva_running() -> bool {
 fn detect_install_dir() -> Option<PathBuf> {
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
-            if dir.join("sylva.exe").is_file() {
+            if dir.join("winbosk.exe").is_file() {
                 return Some(dir.to_path_buf());
             }
         }
     }
-    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Sylva";
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\WinBosk";
     let out = Command::new("reg")
         .args(["query", key, "/v", "InstallLocation"])
         .creation_flags(CREATE_NO_WINDOW)
@@ -524,7 +524,7 @@ fn detect_install_dir() -> Option<PathBuf> {
     let line = text.lines().find(|l| l.contains("InstallLocation"))?;
     let idx = line.find("REG_SZ")?;
     let p = line[idx + "REG_SZ".len()..].trim();
-    if !p.is_empty() && Path::new(p).join("sylva.exe").is_file() {
+    if !p.is_empty() && Path::new(p).join("winbosk.exe").is_file() {
         return Some(PathBuf::from(p));
     }
     None
@@ -602,25 +602,25 @@ fn restore_desktop_icons() {
     }
 }
 
-/// 图形化卸载：不代关 Sylva（检测到运行先提示用户手动关闭）；兜底恢复桌面图标；
+/// 图形化卸载：不代关 WinBosk（检测到运行先提示用户手动关闭）；兜底恢复桌面图标；
 /// 清注册表 / 快捷方式；删除用户数据；删除安装目录内
-/// 除自身外的全部文件并校验 sylva.exe 已删除；自身由延迟清理进程在退出后删除。
+/// 除自身外的全部文件并校验 winbosk.exe 已删除；自身由延迟清理进程在退出后删除。
 /// 返回 true = 已卸载完成（调用方销毁窗口，自动关闭）。
 fn run_uninstall(app: &mut Installer) -> bool {
     let dest = detect_install_dir();
     let dest_str = dest.as_ref().map(|d| d.to_string_lossy().into_owned());
     app.busy = true;
 
-    // 1. 若 Sylva 仍在运行：提示用户先关闭，而不是代为关闭（不强杀、不 WM_CLOSE）。
-    //    窗口保持打开，用户手动关掉 Sylva 后可再次点击「卸载」。
-    set_status(app, "正在检查 Sylva 运行状态…");
+    // 1. 若 WinBosk 仍在运行：提示用户先关闭，而不是代为关闭（不强杀、不 WM_CLOSE）。
+    //    窗口保持打开，用户手动关掉 WinBosk 后可再次点击「卸载」。
+    set_status(app, "正在检查 WinBosk 运行状态…");
     set_progress(app, 8);
-    if sylva_running() {
+    if winbosk_running() {
         app.busy = false;
-        set_status(app, "请先关闭 Sylva 再卸载");
+        set_status(app, "请先关闭 WinBosk 再卸载");
         msgbox(
-            "Sylva 卸载",
-            "检测到 Sylva 正在运行。\n\n请先关闭 Sylva 窗口，再点击「卸载」。",
+            "WinBosk 卸载",
+            "检测到 WinBosk 正在运行。\n\n请先关闭 WinBosk 窗口，再点击「卸载」。",
             false,
         );
         return false;
@@ -636,10 +636,10 @@ fn run_uninstall(app: &mut Installer) -> bool {
     set_status(app, "正在清除注册表项…");
     reg_del(
         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-        Some("Sylva"),
+        Some("WinBosk"),
     );
     reg_del(
-        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Sylva",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\WinBosk",
         None,
     );
     set_progress(app, 55);
@@ -647,16 +647,16 @@ fn run_uninstall(app: &mut Installer) -> bool {
     // 4. 桌面 + 开始菜单快捷方式（用 Shell API 获取真实桌面路径，支持自定义桌面位置）
     set_status(app, "正在删除快捷方式…");
     if let Some(desktop) = shell_desktop_dir() {
-        let _ = fs::remove_file(desktop.join("Sylva.lnk"));
+        let _ = fs::remove_file(desktop.join("WinBosk.lnk"));
     }
     // 兜底：也尝试 USERPROFILE\Desktop（Shell API 失败时）
     if let Some(profile) = env::var_os("USERPROFILE").map(PathBuf::from) {
-        let _ = fs::remove_file(profile.join("Desktop").join("Sylva.lnk"));
+        let _ = fs::remove_file(profile.join("Desktop").join("WinBosk.lnk"));
     }
     // 开始菜单
     if let Some(profile) = env::var_os("USERPROFILE").map(PathBuf::from) {
         let _ = fs::remove_dir_all(
-            profile.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Sylva"),
+            profile.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\WinBosk"),
         );
     }
     set_progress(app, 70);
@@ -688,17 +688,17 @@ fn run_uninstall(app: &mut Installer) -> bool {
     // 校验主程序确已删除（「软件依然存在」的核心）
     let ok = dest
         .as_ref()
-        .map(|d| !d.join("sylva.exe").exists())
+        .map(|d| !d.join("winbosk.exe").exists())
         .unwrap_or(true);
 
     set_progress(app, 100);
     if !ok {
         app.busy = false;
-        set_status(app, "卸载未完成：sylva.exe 仍被占用");
+        set_status(app, "卸载未完成：winbosk.exe 仍被占用");
         msgbox(
-            "Sylva 卸载",
+            "WinBosk 卸载",
             &format!(
-                "无法删除主程序 sylva.exe，可能仍被其他程序占用。\n\n请关闭相关程序后重试：\n{}",
+                "无法删除主程序 winbosk.exe，可能仍被其他程序占用。\n\n请关闭相关程序后重试：\n{}",
                 dest_str.unwrap_or_default()
             ),
             true,
@@ -711,7 +711,7 @@ fn run_uninstall(app: &mut Installer) -> bool {
     if let Some(d) = &dest {
         spawn_delayed_cleanup(d, std::process::id());
     }
-    set_status(app, "Sylva 已卸载完成。");
+    set_status(app, "WinBosk 已卸载完成。");
     thread::sleep(Duration::from_millis(900));
     true
 }
@@ -947,7 +947,7 @@ unsafe extern "system" fn wnd_proc(
                         (Mode::Install, ID_BTN_BROWSE) if !app.busy => {
                             let cur = get_path(app);
                             if let Some(p) = pick_folder(hwnd, &cur) {
-                                // 规范化：选 `D:\Program Files` 补成 `D:\Program Files\sylva`
+                                // 规范化：选 `D:\Program Files` 补成 `D:\Program Files\winbosk`
                                 let norm = normalize_dest(&p);
                                 set_path(app, &norm.to_string_lossy());
                             }
@@ -1037,8 +1037,8 @@ fn main() {
         Mode::Install
     };
     let title = wide(match mode {
-        Mode::Install => "Sylva 安装程序",
-        Mode::Uninstall => "Sylva 卸载程序",
+        Mode::Install => "WinBosk 安装程序",
+        Mode::Uninstall => "WinBosk 卸载程序",
     });
 
     // 清单已声明 PerMonitorV2；此处再调一次作双保险（已有感知时返回 Err，忽略即可）。
@@ -1047,7 +1047,7 @@ fn main() {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
 
-    let class_name = w!("SylvaInstallerWnd");
+    let class_name = w!("WinBoskInstallerWnd");
     let hinstance = HINSTANCE(unsafe { GetModuleHandleW(None) }.unwrap().0);
     let wc = WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW,
@@ -1083,10 +1083,10 @@ fn main() {
         )
     };
     let Ok(hwnd) = hwnd else {
-        msgbox("Sylva 安装", "无法创建安装窗口。", true);
+        msgbox("WinBosk 安装", "无法创建安装窗口。", true);
         return;
     };
-    // 窗口图标（标题栏 / 任务栏 / Alt+Tab）用与主程序相同的 sylva 图标
+    // 窗口图标（标题栏 / 任务栏 / Alt+Tab）用与主程序相同的 winbosk 图标
     unsafe {
         let hicon = app_icon(hinstance);
         let _ = SendMessageW(
@@ -1177,7 +1177,7 @@ fn main() {
 
     app.htitle = mk(
         &wide("STATIC"),
-        &wide("Sylva 桌面栅栏整理器"),
+        &wide("WinBosk 桌面栅栏整理器"),
         st(WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0),
         Default::default(),
         idc,
@@ -1185,7 +1185,7 @@ fn main() {
     app.hsub = mk(
         &wide("STATIC"),
         &wide(if matches!(mode, Mode::Uninstall) {
-            "将卸载 Sylva，并恢复被隐藏的桌面图标。"
+            "将卸载 WinBosk，并恢复被隐藏的桌面图标。"
         } else {
             "桌面图标整理器 · Windows 10/11 · 免管理员权限"
         }),
@@ -1209,7 +1209,7 @@ fn main() {
         &wide(if matches!(mode, Mode::Uninstall) {
             "将删除快捷方式、注册表项及用户数据。"
         } else {
-            "将安装到所选文件夹，并创建桌面 / 开始菜单快捷方式，同时建立 sylva 数据目录。"
+            "将安装到所选文件夹，并创建桌面 / 开始菜单快捷方式，同时建立 winbosk 数据目录。"
         }),
         st(WS_CHILD.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0),
         Default::default(),
@@ -1241,7 +1241,7 @@ fn main() {
         &wide(if matches!(mode, Mode::Uninstall) {
             "保留用户数据（data 文件夹移到「文档」）"
         } else {
-            "开机时自动启动 Sylva"
+            "开机时自动启动 WinBosk"
         }),
         st(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_CLIPSIBLINGS.0 | (BS_AUTOCHECKBOX as u32)),
         Default::default(),
@@ -1292,7 +1292,7 @@ fn main() {
         // 卸载模式：显示检测到的安装目录（只读），隐藏「浏览…」按钮
         let dir = detect_install_dir()
             .map(|d| d.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "未找到 Sylva 安装目录".into());
+            .unwrap_or_else(|| "未找到 WinBosk 安装目录".into());
         set_path(&app, &dir);
         let _ = unsafe { ShowWindow(app.hbtn_browse, SW_HIDE) };
         unsafe {

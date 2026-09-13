@@ -1,4 +1,4 @@
-//! Sylva —— 桌面栅栏整理器入口。
+//! WinBosk —— 桌面栅栏整理器入口。
 //!
 // 发布版不弹终端窗口（双击直接运行，关掉启动它的 cmd 不影响本进程）；
 // 调试版保留控制台便于看日志。
@@ -66,21 +66,21 @@ pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY, TPM_RETURNCMD, WM_NULL,
 };
 
-pub(crate) use sylva_core::config::ConfigStore;
-pub(crate) use sylva_core::magnet::{settle_move, settle_resize, FreeSides, FENCE_GAP};
-pub(crate) use sylva_core::model::{
+pub(crate) use winbosk_core::config::ConfigStore;
+pub(crate) use winbosk_core::magnet::{settle_move, settle_resize, FreeSides, FENCE_GAP};
+pub(crate) use winbosk_core::model::{
     Desk, Fence, FenceAppearance, FenceLayout, FenceState, FenceStyle, Icon, Rect, SidebarPosition,
     Vec2,
 };
-pub(crate) use sylva_render::{
+pub(crate) use winbosk_render::{
     run_message_loop, Compositor, ConsoleHit, ConsoleZone, FenceHit, HitModel, IconHit,
     ListColumns, OverlayEvent, OverlayWindow, RectF, RenderDevice, ResizeZone, Scene, SceneConsole,
     SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow, SceneIcon, Theme, GRID_CAPTION_H_MULT,
-    GRIP_SIZE, WM_APP_QUIT, WM_SYLVA_INJECT,
+    GRIP_SIZE, WM_APP_QUIT, WM_WINBOSK_INJECT,
 };
-pub(crate) use sylva_shell::icons::IconData;
-pub(crate) use sylva_shell::items::DesktopItem;
-pub(crate) use sylva_shell::takeover::DesktopHierarchy;
+pub(crate) use winbosk_shell::icons::IconData;
+pub(crate) use winbosk_shell::items::DesktopItem;
+pub(crate) use winbosk_shell::takeover::DesktopHierarchy;
 
 use crate::anim::*;
 use crate::context_menu::*;
@@ -287,7 +287,7 @@ fn main() {
     // 单实例锁：防止重复启动导致多个全屏 overlay 叠层拦截输入（历史故障根因）。
     // 互斥名不带命名空间前缀 = 当前登录会话命名空间，无需管理员特权。
     // 句柄 `_mutex` 保持到 main 退出（进程生命周期），期间重复启动会立即在此退出。
-    let name: Vec<u16> = "Sylva.Desktop.Fences"
+    let name: Vec<u16> = "WinBosk.Desktop.Fences"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -299,7 +299,7 @@ fn main() {
         }
     };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        eprintln!("Sylva 已在运行，本次启动退出（单实例）");
+        eprintln!("WinBosk 已在运行，本次启动退出（单实例）");
         return;
     }
 
@@ -315,7 +315,7 @@ fn main() {
         }
     }
     // COM：图标枚举/提取需要（APARTMENTTHREADED）
-    let _com = sylva_shell::com::init();
+    let _com = winbosk_shell::com::init();
     // OLE 剪贴板：Shell 右键菜单的复制/剪切/粘贴依赖 OleInitialize
     // （IContextMenu::InvokeCommand 内部调用 OleSetClipboard，未初始化 OLE 时静默失败）
     let _ole = unsafe { OleInitialize(None) };
@@ -327,10 +327,10 @@ fn main() {
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("data");
-    // 从旧位置（%APPDATA%\Sylva）迁移：旧版数据不在 exe 同级时搬过来，一次完成。
+    // 从旧位置（%APPDATA%\WinBosk）迁移：旧版数据不在 exe 同级时搬过来，一次完成。
     if !data_dir.join("desk.json").exists() {
         if let Ok(appdata) = std::env::var("APPDATA") {
-            let old_dir = PathBuf::from(appdata).join("Sylva");
+            let old_dir = PathBuf::from(appdata).join("WinBosk");
             if old_dir.join("desk.json").exists() {
                 let _ = std::fs::create_dir_all(&data_dir);
                 // 逐文件迁移（跨卷 rename 会失败，fallback 到 copy）
@@ -364,7 +364,7 @@ fn main() {
     }
 }
 
-fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
+fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
     // M0 桌面状态：加载/校验/回写，确保配置目录就绪
     let store = ConfigStore::new(data_dir.to_path_buf());
     let mut desk = store.load()?;
@@ -384,14 +384,14 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
 
     // 1) 壳层接管：探测层级并隐藏真实图标（反冲突约束：不重挂/不销毁他人窗口）。
     //    守卫确保后续任何失败都会恢复图标。
-    let hierarchy = sylva_shell::takeover::probe()
-        .ok_or_else(|| sylva_core::CoreError::Shell("未找到桌面根窗口 Progman".into()))?;
+    let hierarchy = winbosk_shell::takeover::probe()
+        .ok_or_else(|| winbosk_core::CoreError::Shell("未找到桌面根窗口 Progman".into()))?;
     let _guard = IconGuard::new(hierarchy);
 
     // 2) GPU 上下文 + overlay + 合成器
-    let device = RenderDevice::new().map_err(|e| sylva_core::CoreError::Render(e.to_string()))?;
+    let device = RenderDevice::new().map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
     let overlay = OverlayWindow::create(hierarchy.overlay_parent())
-        .map_err(|e| sylva_core::CoreError::Render(e.to_string()))?;
+        .map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
     let (vw, vh) = (overlay.width, overlay.height);
     tracing::info!(vw, vh, "overlay 覆盖虚拟屏幕");
 
@@ -431,11 +431,11 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
         let _ = store.save(&desk);
     }
     let compositor = Compositor::new(device, overlay.hwnd, theme.clone())
-        .map_err(|e| sylva_core::CoreError::Render(e.to_string()))?;
+        .map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
 
     // 3) 枚举真实桌面图标（IShellFolder 枚举，不依赖 DefView）
-    let mut items = sylva_shell::items::enumerate_desktop_items()
-        .map_err(|e| sylva_core::CoreError::Shell(e.to_string()))?;
+    let mut items = winbosk_shell::items::enumerate_desktop_items()
+        .map_err(|e| winbosk_core::CoreError::Shell(e.to_string()))?;
     tracing::info!(count = items.len(), "桌面图标枚举完成");
 
     // 4) 首次运行：无栅栏布局时按稳定顺序创建演示栅栏并持久化。
@@ -456,7 +456,7 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
         ic.path = it.path.clone();
         ic.added = false;
         if let Some(p) = it.path.as_deref() {
-            sylva_core::details::enrich(ic, p);
+            winbosk_core::details::enrich(ic, p);
         }
     }
     let mut item_index: HashMap<String, usize> = items
@@ -470,7 +470,7 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
             continue;
         }
         if let Some(path) = ic.path.as_deref() {
-            if let Ok(dt) = sylva_shell::items::item_from_path(path) {
+            if let Ok(dt) = winbosk_shell::items::item_from_path(path) {
                 item_index.insert(dt.id.clone(), items.len());
                 items.push(dt);
                 restored += 1;
@@ -485,7 +485,7 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
     let mut bitmap_ids = HashMap::new();
     let mut uploads = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        match sylva_shell::icons::extract_icon(item, ICON_EXTRACT_SIZE) {
+        match winbosk_shell::icons::extract_icon(item, ICON_EXTRACT_SIZE) {
             Ok(data) => {
                 bitmap_ids.insert(item.id.clone(), i as u64);
                 uploads.push((i as u64, data));
@@ -566,12 +566,12 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
         scene = build_scene(&mut rt, Instant::now());
     }
     // 首帧上传：图标位图（新增项的位图在 build_scene 内推入 pending_uploads）
-    let mut upload_refs: Vec<(u64, &sylva_shell::icons::IconData)> =
+    let mut upload_refs: Vec<(u64, &winbosk_shell::icons::IconData)> =
         uploads.iter().map(|(id, d)| (*id, d)).collect();
     upload_refs.extend(rt.pending_uploads.iter().map(|(id, d)| (*id, d)));
     rt.compositor
         .present(&scene, &upload_refs)
-        .map_err(|e| sylva_core::CoreError::Render(e.to_string()))?;
+        .map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
     let model = hit_model_from(&rt.theme, &scene, &rt.desk);
     memory::report("首帧呈现后");
     // Shell 右键菜单预热：后台加载栅栏里文件类型的 Shell 扩展（百度网盘等扩展首次
@@ -612,8 +612,8 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
         let _ = SetConsoleCtrlHandler(Some(ctrl_handler), true);
     }
 
-    // 测试钩子：设置 SYLVA_AUTOSTOP_MS 后到点自动干净退出（CI/自动验证用）。
-    if let Some(ms) = std::env::var("SYLVA_AUTOSTOP_MS")
+    // 测试钩子：设置 WINBOSK_AUTOSTOP_MS 后到点自动干净退出（CI/自动验证用）。
+    if let Some(ms) = std::env::var("WINBOSK_AUTOSTOP_MS")
         .ok()
         .and_then(|v| v.parse().ok())
     {
@@ -629,10 +629,10 @@ fn run(data_dir: &std::path::Path) -> sylva_core::Result<()> {
                 );
             }
         });
-        tracing::info!(ms, "SYLVA_AUTOSTOP_MS 已设置，到点自动退出");
+        tracing::info!(ms, "WINBOSK_AUTOSTOP_MS 已设置，到点自动退出");
     }
 
-    tracing::info!("Sylva 已就绪：拖边缘/角缩放、标题栏拖动、双击打开、文件拖入/粘贴添加；Ctrl+Alt+T 控制中心，Ctrl+Shift+F10 退出");
+    tracing::info!("WinBosk 已就绪：拖边缘/角缩放、标题栏拖动、双击打开、文件拖入/粘贴添加；Ctrl+Alt+T 控制中心，Ctrl+Shift+F10 退出");
     run_message_loop();
 
     memory::report("退出前");

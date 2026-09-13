@@ -22,7 +22,7 @@
 ## 2. 状态契约与接口设计 (Contracts & Data Models)
 
 ### 2.1 语义定位目标栅栏函数
-在 [`crates/app/src/main.rs`](file:///g:/Codes/sylva/crates/app/src/main.rs) 中实现语义定位：
+在 [`crates/app/src/main.rs`](file:///g:/Codes/winbosk/crates/app/src/main.rs) 中实现语义定位：
 ```rust
 /// 在桌面上寻找用于受纳回流图标的目标「桌面」栅栏
 pub(crate) fn resolve_desktop_fence(desk: &Desk, exclude_id: Option<u64>) -> Option<u64> {
@@ -113,7 +113,7 @@ pub(crate) fn delete_fence_and_reclaim_icons(rt: &mut Runtime, fence_idx: usize)
 
 1. **孤儿状态回收律 (Orphan Invariant)**：
    - 过去调用 `rt.desk.move_icon(&id, None)` 会将图标放进 `free_icons`；
-   - 但因为 Sylva 接管桌面隐藏了 Explorer 的真实 `SysListView32`，导致进入 `free_icons` 的文件直接从视觉上“消失”；
+   - 但因为 WinBosk 接管桌面隐藏了 Explorer 的真实 `SysListView32`，导致进入 `free_icons` 的文件直接从视觉上“消失”；
    - 本方案强制把图标全部回流至 `IconLocation::Fence(desktop_fid)`，保证 100% 始终在某个可见栅栏中渲染，彻底杜绝孤儿项。
 2. **旁路数据对齐律 (Sidecar Invariant)**：
    - `rt.last_layout_h` 是按 `fence_idx` 下标与 `rt.desk.fences` 严格一一对应的旁路高度缓存；
@@ -127,10 +127,10 @@ pub(crate) fn delete_fence_and_reclaim_icons(rt: &mut Runtime, fence_idx: usize)
 ## 4. 分层改动清单 (Implementation Steps)
 
 ### 一、应用组装层（`crates/app/`）
-- **[`crates/app/src/main.rs`](file:///g:/Codes/sylva/crates/app/src/main.rs)**：
+- **[`crates/app/src/main.rs`](file:///g:/Codes/winbosk/crates/app/src/main.rs)**：
   - 实现 `resolve_desktop_fence` 与 `delete_fence_and_reclaim_icons`；
   - 重构 `ConsoleZone::RemoveFence` 分支，直接调用 `delete_fence_and_reclaim_icons(rt, i)`；
-- **[`crates/app/src/context_menu.rs`](file:///g:/Codes/sylva/crates/app/src/context_menu.rs)**：
+- **[`crates/app/src/context_menu.rs`](file:///g:/Codes/winbosk/crates/app/src/context_menu.rs)**：
   - 重构 `FenceMenuAction::Delete` 分支，直接调用 `delete_fence_and_reclaim_icons(rt, fence)`，彻底消除冗余重复代码。
 
 ### 二、测试与验证（`crates/app/` 或 `crates/core/`）

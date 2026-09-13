@@ -1,4 +1,4 @@
-# Sylva 桌面整理器：交互与分类体验重构计划
+# WinBosk 桌面整理器：交互与分类体验重构计划
 
 ## 1. 背景与核心痛点
 
@@ -39,7 +39,7 @@
 ## 3. 详细改动清单
 
 ### 一、领域模型层（`crates/core/`）
-- **[`crates/core/src/model.rs`](file:///g:/Codes/sylva/crates/core/src/model.rs)**：
+- **[`crates/core/src/model.rs`](file:///g:/Codes/winbosk/crates/core/src/model.rs)**：
   - 实现纯函数智能整理方法：
     ```rust
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,12 +64,12 @@
     - 已有分类栅栏时优先复用，不重复建栏。
 
 ### 二、应用组装与交互层（`crates/app/`）
-- **[`crates/app/src/main.rs`](file:///g:/Codes/sylva/crates/app/src/main.rs)**：
+- **[`crates/app/src/main.rs`](file:///g:/Codes/winbosk/crates/app/src/main.rs)**：
   - **重构 `ConsoleZone::AddFence`**：
     - 移除 `pick_folder`，点击直接生成 `storage_path: None` 的空白新栅栏，使用 `settle_move` 自动计算不重叠的合适位置，选中并持久化。
   - **升级 `ConsoleZone::AutoOrganize`**：
     - 接入 `desk.auto_organize_all`，调用屏幕工作区范围，一键完成智能建栏与全部分发，并触发场景重绘与持久化。
-- **[`crates/app/src/context_menu.rs`](file:///g:/Codes/sylva/crates/app/src/context_menu.rs)**：
+- **[`crates/app/src/context_menu.rs`](file:///g:/Codes/winbosk/crates/app/src/context_menu.rs)**：
   - 栅栏右键菜单和托盘右键菜单的「⚡ 一键整理桌面」同样接入 `desk.auto_organize_all`。
 
 ---
@@ -78,7 +78,7 @@
 
 1. **自动化单元测试**：
    ```powershell
-   cargo test -p sylva-core
+   cargo test -p winbosk-core
    cargo test --workspace
    ```
 2. **静态检查与代码格式**：

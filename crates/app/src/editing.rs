@@ -554,7 +554,7 @@ pub(crate) fn commit_icon_rename(
         return false;
     }
     // 重建 DesktopItem（新路径 → 新 id/显示名/类别），替换 items 池中的项
-    let new_item = match sylva_shell::items::item_from_path(&new_path_str) {
+    let new_item = match winbosk_shell::items::item_from_path(&new_path_str) {
         Ok(it) => it,
         Err(e) => {
             tracing::warn!(new_path = %new_path_str, "重建图标项失败（文件已改名，重启后重新识别）: {e}");
@@ -572,7 +572,7 @@ pub(crate) fn commit_icon_rename(
         ic.id = new_id.clone();
         ic.display_name = new_display;
         ic.path = Some(new_path_str.clone());
-        sylva_core::details::enrich(&mut ic, &new_path_str);
+        winbosk_core::details::enrich(&mut ic, &new_path_str);
         rt.desk.icons.insert(new_id.clone(), ic);
     }
     // 替换栅栏成员与自由区引用
@@ -588,7 +588,7 @@ pub(crate) fn commit_icon_rename(
     rt.bitmap_ids.remove(&id);
     let slot = rt.bitmap_ids.values().copied().max().unwrap_or(0) + 1;
     if let Some(idx) = rt.item_index.get(&new_id).copied() {
-        match sylva_shell::icons::extract_icon(&rt.items[idx], ICON_EXTRACT_SIZE) {
+        match winbosk_shell::icons::extract_icon(&rt.items[idx], ICON_EXTRACT_SIZE) {
             Ok(data) => {
                 rt.bitmap_ids.insert(new_id.clone(), slot);
                 rt.pending_uploads.push((slot, data));
@@ -607,7 +607,7 @@ pub(crate) fn inject_rebuild(rt: &mut Runtime) {
     unsafe {
         let _ = PostMessageW(
             Some(rt.hwnd),
-            WM_SYLVA_INJECT,
+            WM_WINBOSK_INJECT,
             WPARAM(0),
             LPARAM(Box::into_raw(ev) as isize),
         );
