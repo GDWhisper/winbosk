@@ -1188,8 +1188,15 @@ unsafe extern "system" fn wnd_proc(
             let state = unsafe { &mut *ptr };
             // 清空悬停 + 光标（清除 Dock 放大）
             state.hovered = None;
-            state.console_hovered = None;
             state.last_cursor = None;
+            // 控制台悬停必须**上报**清除，不能只把本地镜像置空：App 层的 `rt.console_hover`
+            // 才是绘制高亮的唯一来源，而光标已离开窗口、不会再有 `WM_MOUSEMOVE` 来纠正它，
+            // 于是离开前那个控件的下划线 / 高亮会一直「粘」着不灭。
+            // （`HoverLeave` / `CursorLeave` 都只管图标悬停与 Dock 放大，不清控制台悬停。）
+            if state.console_hovered.is_some() {
+                state.console_hovered = None;
+                emit_event(hwnd, state, OverlayEvent::ConsoleHover { zone: None });
+            }
             emit_event(hwnd, state, OverlayEvent::HoverLeave);
             emit_event(hwnd, state, OverlayEvent::CursorLeave);
             LRESULT(0)
