@@ -1171,6 +1171,13 @@ unsafe extern "system" fn wnd_proc(
                     state.console_hovered = cz;
                     emit_event(hwnd, state, OverlayEvent::ConsoleHover { zone: cz });
                 }
+            } else if state.console_hovered.is_some() {
+                // 拖拽期间不跟踪悬停（控制台热区会随面板宽度移动，逐帧重算没有意义），
+                // 但必须**清掉**进入拖拽前留下的那个：否则拖动面板 / 拖边改宽时，
+                // 进入拖拽那一刻鼠标下的控件（多半是路径）会全程亮着高亮与下划线。
+                // （`ConsoleMove` / `ConsoleResize` / 拖图标都会走到这个分支。）
+                state.console_hovered = None;
+                emit_event(hwnd, state, OverlayEvent::ConsoleHover { zone: None });
             }
             // 光标位置变化 → 连续 Dock 放大（位置未变不上报，避免无谓重绘）
             if state.last_cursor != Some((mx, my)) {

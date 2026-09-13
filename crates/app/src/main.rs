@@ -782,6 +782,11 @@ fn is_popup_dismiss_event(ev: &OverlayEvent) -> bool {
 /// 状态与 Z 序在同一函数内同步，杜绝「面板开着但仍在桌面带 / 关了却悬在普通带」的组合态。
 /// 提权仅存在于本会话显式唤出期间，不持久化（重启后 overlay 始终在桌面带）。
 pub(crate) fn set_console_open(rt: &mut Runtime, open: bool) {
+    // 开合都要清掉控制台悬停。收起时不清，重开（热键 / 托盘）后 `rt.console_hover` 仍留着
+    // 上次那个控件，而面板刚展开、光标未必动过 → 一条不该亮的路径下划线会亮到用户移动鼠标为止。
+    // 展开时也清：唤出那一刻光标位置未知，等第一次 `WM_MOUSEMOVE` 再建立才是对的。
+    // （overlay 侧只补了 `WM_MOUSEMOVE` 与 `WM_MOUSELEAVE` 两条通路，覆盖不到"面板凭空出现"。）
+    rt.console_hover = None;
     rt.desk.console_open = open;
     if let Err(e) = rt.store.save(&rt.desk) {
         tracing::warn!("控制台状态持久化失败: {e}");
