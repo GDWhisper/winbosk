@@ -316,47 +316,19 @@ pub(crate) fn set_clipboard_paths(paths: &[String]) {
     }
 }
 
-/// 打开原生选择器（`IFileOpenDialog` + `FOS_PICKFOLDERS`，多选文件夹），返回选中的
-/// 绝对路径列表。用户取消（`HRESULT 0x800704C7`）或失败返回 None。
+/// 选择单个文件夹（控制中心的「更改文件位置…」用）：弹出系统文件夹选择对话框，返回选中路径。
 ///
-/// 单一「添加…」入口：Windows 系统对话框不能文件 + 文件夹混选（硬平台限制），
-/// 这里用文件夹模式多选——能选中的（文件夹）直接添加进栅栏；单个/多个文件仍可
-/// 拖拽或粘贴进栅栏。
+/// 单选 + 标题明确，**不要**退化成多选：改存储位置只会指向**一个**目录，而多选版
+/// （曾经的 `pick_paths`，标题「添加到栅栏」）会让用户以为自己在往栅栏里加文件——
+/// 那正是本次要修掉的语义错位之一。用户取消返回 `None`。
 ///
 /// COM 已在启动早期以 STA 初始化。对话框运行在自己模态消息循环里，期间到达的
 /// overlay 事件会被重入守卫丢弃——与 `TrackPopupMenu` 同一套机制，不会破坏状态。
-pub(crate) fn pick_paths(owner: HWND) -> Option<Vec<String>> {
-    unsafe {
-        let dialog: IFileOpenDialog =
-            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        let title = PCWSTR(wide("添加到栅栏").as_ptr());
-        dialog.SetTitle(title).ok()?;
-        let opts = FOS_PICKFOLDERS | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM;
-        dialog.SetOptions(opts).ok()?;
-        if dialog.Show(Some(owner)).is_err() {
-            return None; // 取消或失败：都不添加
-        }
-        let items: IShellItemArray = dialog.GetResults().ok()?;
-        let count = items.GetCount().ok()?;
-        let mut paths = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let item: IShellItem = items.GetItemAt(i).ok()?;
-            let name: PWSTR = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-            // FOS_PICKFOLDERS + FOS_FORCEFILESYSTEM：返回的必是文件系统路径
-            let s = name.to_string().ok()?;
-            paths.push(s);
-        }
-        Some(paths)
-    }
-}
-
-/// 选择单个文件夹（新建栅栏时用）：弹出系统文件夹选择对话框，返回选中路径。
-#[allow(dead_code)]
 pub(crate) fn pick_folder(owner: HWND) -> Option<String> {
     unsafe {
         let dialog: IFileOpenDialog =
             CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        let title = PCWSTR(wide("选择栅栏链接的文件夹").as_ptr());
+        let title = PCWSTR(wide("选择栅栏的存储文件夹").as_ptr());
         dialog.SetTitle(title).ok()?;
         let opts = FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM;
         dialog.SetOptions(opts).ok()?;
@@ -476,29 +448,68 @@ pub(crate) fn confirm_delete_fence(rt: &Runtime, title: &str, icon_count: usize)
     let text = format!(
         "确定要删除栅栏「{title}」吗？\n\n其中的 {icon_count} 个图标会移回「桌面」栅栏，不会丢失。"
     );
+    let flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2; // 默认焦点落在「否」
+    modal_box(rt, "删除栅栏", &text, flags) == IDYES
+}
+
+/// 「更改文件位置…」前的二次确认。返回 `true` 表示用户确认搬移。
+///
+/// 该动作是**真搬文件**（复制到新目录 + 删除原位置的副本，见 `file_ops::change_fence_storage`），
+/// 不可撤销，故在确有文件要被搬动时收口做确认。
+///
+/// **只在 `count > 0` 时调用**：没有文件要搬就保持无模态，不给基础操作加摩擦。
+pub(crate) fn confirm_move_storage(rt: &Runtime, count: usize, dir: &str) -> bool {
+    let text = format!(
+        "确定更改该栅栏的文件位置吗？\n\n将把其中的 {count} 个文件移动到：\n{dir}\n\n\
+         原位置的副本会被删除，此操作不可撤销。"
+    );
+    let flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2; // 默认焦点落在「否」
+    modal_box(rt, "更改文件位置", &text, flags) == IDYES
+}
+
+/// 目标目录不可用时的告警框（只有一个「确定」）。
+///
+/// 此前这类拒绝只写一行日志：用户选完文件夹、界面毫无反应，无法分辨"没生效"还是"没点中"。
+pub(crate) fn warn_storage_reject(rt: &Runtime, reason: &str) {
+    let text = format!("无法把文件位置设置为该文件夹。\n\n原因：{reason}");
+    modal_box(rt, "更改文件位置", &text, MB_OK | MB_ICONWARNING);
+}
+
+/// 模态弹框的统一外壳：借焦点代理把本线程提到前台 → 弹框 → 把前台还给弹出前的窗口。
+///
+/// 常驻后台的进程直接弹框会被系统拒绝前台化（对话框不获焦、可能被前台窗口盖住），
+/// 故所有模态框都必须走这里——与 `track_popup_menu` 同一套手法。
+/// owner 用 overlay 本体而**不是**代理：代理是离屏 1×1，拿它当 owner 会把对话框
+/// 居中到 (-32000,-32000) 屏幕外。
+fn modal_box(
+    rt: &Runtime,
+    caption: &str,
+    text: &str,
+    flags: MESSAGEBOX_STYLE,
+) -> MESSAGEBOX_RESULT {
     unsafe {
-        // 常驻后台的进程直接弹框会被系统拒绝前台化：对话框不获焦、可能被前台窗口盖住。
-        // 先借隐藏焦点代理把本线程提到前台（与 `track_popup_menu` 同一套手法）。
-        // owner 用 overlay 本体而**不是**代理——代理是离屏 1×1，拿它当 owner 会把对话框
-        // 居中到 (-32000,-32000) 屏幕外。
+        // 顺序不能换：**先**记下弹出前的前台窗口，**再**提权。反过来的话提权已经把前台
+        // 交给了我们的隐藏代理，`prev` 会被记成代理，弹完就还原不回去了。
         let prev = GetForegroundWindow();
         let proxy = (*rt.overlay_ptr).menu_owner();
-        let text = wide(&text);
-        let caption = wide("删除栅栏");
-        let flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2; // 默认焦点落在「否」
-        let confirmed = MessageBoxW(
+        // 提权就发生在这里，**不要再挪回调用方**：本函数存在的唯一理由就是替所有模态框
+        // 做掉这一步，漏掉任何一处调用方就会重新出现「确认框不获焦、被盖住」的老问题。
+        (*rt.overlay_ptr).raise_to_foreground();
+        let text = wide(text);
+        let caption = wide(caption);
+        let result = MessageBoxW(
             Some(rt.hwnd),
             PCWSTR(text.as_ptr()),
             PCWSTR(caption.as_ptr()),
             flags,
-        ) == IDYES;
+        );
         // 与 `track_popup_menu` 一致：前台若仍停在我们自己的窗口上就还给弹出前的窗口，
         // 免得用户原先的窗口一直灰着；用户已经切到别处则不去抢。
         let fg = GetForegroundWindow();
         if !prev.is_invalid() && (fg == rt.hwnd || fg == proxy) {
             let _ = SetForegroundWindow(prev);
         }
-        confirmed
+        result
     }
 }
 

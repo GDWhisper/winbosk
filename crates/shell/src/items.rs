@@ -65,6 +65,29 @@ impl DesktopItem {
     }
 }
 
+/// 用系统默认动作打开一个目录（资源管理器）。与 `DesktopItem::launch` 同一套 `ShellExecuteW` 手法。
+///
+/// **只在用户显式点击时调用**（控制中心的「打开」按钮）——不要放进任何每帧/每重绘路径。
+/// 路径不存在时 Shell 会自行失败，本函数不预检、不重试、不阻塞。
+///
+/// 返回是否成功拉起。判据是 `ShellExecuteW` 的返回值 **> 32**——它的返回是 `HINSTANCE`
+/// 口径（错误码落在 0..=32），**不是** `GetLastError`，所以这里不看 `last_os_error`。
+/// 之所以要返回而不是丢弃：静默失败在 UI 上表现为「点了没反应」，调用方至少能留一行日志。
+pub fn open_folder(path: &str) -> bool {
+    let file = wide(path);
+    unsafe {
+        let r = ShellExecuteW(
+            None, // 无父窗口
+            None, // 默认动作（目录 → 在资源管理器中打开）
+            PCWSTR(file.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+        (r.0 as isize) > 32
+    }
+}
+
 /// 枚举桌面全部图标。
 pub fn enumerate_desktop_items() -> windows::core::Result<Vec<DesktopItem>> {
     let desktop: IShellFolder = unsafe { SHGetDesktopFolder()? };

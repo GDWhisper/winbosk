@@ -20,12 +20,51 @@ pub enum StorageKind {
 }
 
 impl StorageKind {
-    /// 控制中心状态芯片文案。
+    /// 控制中心状态标签文案。
+    ///
+    /// 「应用内部」→「应用内部库」：名词化，明确它指的是**一个库**（而不是"在应用里面"这种
+    /// 方位描述）；同时与「外部文件夹」同为 5 个 CJK 字，宽度天然对齐（见 `chip_width` 单测）。
     pub fn badge(self) -> &'static str {
         match self {
-            StorageKind::AppLibrary => "应用内部",
+            StorageKind::AppLibrary => "应用内部库",
             StorageKind::ExternalFolder => "外部文件夹",
         }
+    }
+
+    /// 动作行左侧的后果提示。
+    ///
+    /// **两种模式都必须回答同一个问题：在这里删会不会删到真文件。**
+    /// 判定真源是 App 层 `is_managed_path`（内部库 ∪ 任一栅栏的链接目录），两种模式都为真——
+    /// 此前界面上这条信息一个字都没有，用户只能靠猜。
+    ///
+    /// 文案长度受行内剩余宽度约束（见 [`hint_text`]）：`AppLibrary` 有更宽的预算，
+    /// 故额外说明"内部库是共享的"；`ExternalFolder` 预算被「恢复默认」按钮压缩，只留核心后果。
+    pub fn hint(self) -> &'static str {
+        match self {
+            StorageKind::AppLibrary => "所有栅栏共用 · 删除会真删文件",
+            StorageKind::ExternalFolder => "删除会真删磁盘文件",
+        }
+    }
+}
+
+/// 状态标签宽度：文案实测宽 + 两侧内边距。
+///
+/// `font_size` 与 `pad_x` **必须同单位**（均为物理像素）。取代此前硬编码的 `56.0 * s`——
+/// 硬编码与文案长度耦合，改一次文案就会挤字或留白。
+pub fn chip_width(badge: &str, font_size: f32, pad_x: f32) -> f32 {
+    estimate_width(badge, font_size) + 2.0 * pad_x
+}
+
+/// 动作行提示语：预算不足时返回空串（= 不绘制）。
+///
+/// **绝不返回被截断的半个字**——宁可整条不显示（面板被拖到最小宽时 `ExternalFolder`
+/// 会走到这一支），也不让提示语与动作按钮重叠。
+pub fn hint_text(kind: StorageKind, budget: f32, font_size: f32) -> &'static str {
+    let h = kind.hint();
+    if budget > 0.0 && estimate_width(h, font_size) <= budget {
+        h
+    } else {
+        ""
     }
 }
 
@@ -280,5 +319,51 @@ mod tests {
         assert!(!is_drive("\\\\server"));
         assert!(!is_drive("home"));
         assert!(!is_drive(""));
+    }
+
+    /// 两种模式的标签必须等宽：只改一侧文案就会让标签列宽窄不一，视觉上像两种不同控件。
+    #[test]
+    fn badge_texts_are_equal_width() {
+        let w_app = chip_width(StorageKind::AppLibrary.badge(), FONT, 6.0);
+        let w_ext = chip_width(StorageKind::ExternalFolder.badge(), FONT, 6.0);
+        assert!(
+            (w_app - w_ext).abs() < 1e-3,
+            "标签宽度不一致：应用内部库={w_app}, 外部文件夹={w_ext}"
+        );
+        assert!(w_app > 0.0);
+    }
+
+    /// 标签宽度随文案增长；空文案退化为纯内边距（零输入场景不 panic）。
+    #[test]
+    fn chip_width_grows_with_text() {
+        assert!(chip_width("外部文件夹", FONT, 6.0) > chip_width("外部", FONT, 6.0));
+        assert_eq!(chip_width("", FONT, 6.0), 12.0);
+        assert_eq!(chip_width("外部", FONT, 0.0), estimate_width("外部", FONT));
+    }
+
+    /// 预算不足时返回空串而不是截断的半个字——提示语与动作按钮绝不允许重叠。
+    #[test]
+    fn hint_text_drops_when_budget_short() {
+        for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+            let exact = estimate_width(kind.hint(), FONT);
+            assert_eq!(
+                hint_text(kind, exact, FONT),
+                kind.hint(),
+                "恰好放得下应常显"
+            );
+            assert_eq!(hint_text(kind, exact - 0.5, FONT), "", "略放不下应整条不画");
+            assert_eq!(hint_text(kind, 0.0, FONT), "");
+            assert_eq!(hint_text(kind, -10.0, FONT), "");
+        }
+    }
+
+    /// 把"两种模式都必须回答删除后果"这条契约钉进测试：将来谁改文案都不许把后果删掉。
+    #[test]
+    fn hints_mention_real_delete() {
+        for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+            let h = kind.hint();
+            assert!(!h.is_empty(), "{kind:?} 缺后果提示");
+            assert!(h.contains('删'), "{kind:?} 的提示未说明删除后果：{h}");
+        }
     }
 }

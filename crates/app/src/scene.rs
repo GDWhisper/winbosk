@@ -1,6 +1,7 @@
 //! 场景构建：从领域模型 + 主题排布出渲染场景（栅栏/侧边栏/控制台/命中模型）。
 
 use crate::*;
+use winbosk_core::storage::StorageKind;
 use winbosk_render::scene::{ReorderDrag, SceneReserved};
 pub(crate) fn system_dark_mode() -> bool {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
@@ -440,7 +441,7 @@ fn detail_visible_rows(desk: &Desk, selected: usize, s: f32) -> f32 {
     if style != FenceStyle::Blur {
         n += 1; // 背景色调（模糊时隐藏）
     }
-    n += 2; // 文件位置：第一行标签+操作按钮，第二行模式芯片+真实路径
+    n += 2; // 文件位置：值行（标签+状态标签+真实路径+「打开」）+ 动作行（后果提示+动作按钮）
     if layout == FenceLayout::Sidebar {
         n += 1; // 侧边栏位置（仅侧边栏）
     }
@@ -540,6 +541,165 @@ pub(crate) fn adjust_selected_fence_on_delete(
         res = res.saturating_sub(1);
     }
     res.min(total_after_delete.saturating_sub(1))
+}
+
+/// 「文件位置」两行几何（值行 + 动作行）。
+///
+/// 字段语义与 `SceneFenceDetail` 一一对应，且**逐条写死可点性**：
+/// 值行里的 `tag` / `path` 都是"看的东西"，动作只有 `open` / `change` / `reset` 三个按钮。
+pub(crate) struct StorageRow {
+    /// 值行整行矩形（仅作标签列锚点，不参与命中）。
+    pub value_row: RectF,
+    /// 值行：状态标签（模式）。
+    pub tag: RectF,
+    /// 值行：路径文本区（仅绘制）。
+    pub path: RectF,
+    /// 值行：中段省略后的路径文本。
+    pub path_text: String,
+    /// 值行：「打开」按钮。
+    pub open: RectF,
+    /// 动作行：「更改文件位置…」按钮（右端对齐）。
+    pub change: RectF,
+    /// 动作行：「恢复默认」按钮（`h <= 0.0` = 不出现）。
+    pub reset: RectF,
+    /// 动作行：后果提示文本区（`h <= 0.0` = 不绘制）。
+    pub hint: RectF,
+    /// 动作行：后果提示文案（空串 = 当前宽度放不下，整条不绘制）。
+    pub hint_text: String,
+    /// 值行内 detail 字号文字（行标签 / 状态标签 / 路径）的**共用顶线**（物理像素）。
+    pub text_top: f32,
+}
+
+/// 状态标签高（DIP）、标签内边距（DIP）、标签与路径间距（DIP）。
+const STORAGE_TAG_H: f32 = 18.0;
+const STORAGE_TAG_PAD_X: f32 = 6.0;
+const STORAGE_TAG_GAP: f32 = 6.0;
+/// 动作按钮的左右内边距（DIP）与按钮间距（DIP）。
+const STORAGE_BTN_PAD_X: f32 = 8.0;
+const STORAGE_BTN_GAP: f32 = 6.0;
+/// 详情区行距（物理像素口径 = 30 × s），与 `row_y` 同源。
+const STORAGE_ROW_PITCH: f32 = 30.0;
+
+/// 计算「文件位置」两行几何（纯函数，可在内存中单测"空间互斥"）。
+///
+/// 排版契约（用户能读懂的版本）：
+/// - 第一行（值行）：`文件位置 | [模式标签] 真实路径 … [打开]`
+/// - 第二行（动作行）：`后果提示 ……………… [更改文件位置…] [恢复默认]`
+///
+/// 宽度**全部由文案实测宽度推出**（`estimate_width` + 常数 × s），不再硬编码，
+/// 这样改文案或改 DPI 都不会挤字；放不下时按"提示语整条不画"优雅降级，绝不截半个字。
+///
+/// `detail_font` 口径 = `theme.label.size * 0.72`（与 `formats.detail` 同源，已按 DPI 缩放）。
+pub(crate) fn storage_row_geometry(
+    detail: &RectF,
+    row_y: f32,
+    kind: StorageKind,
+    can_reset: bool,
+    path: &str,
+    theme: &Theme,
+) -> StorageRow {
+    let s = theme.scale;
+    let btn_h = 24.0 * s;
+    let label_w = 40.0 * s;
+    let detail_font = theme.label.size * 0.72;
+    let label_font = theme.label.size;
+    let inner_left = detail.x + 2.0 * s;
+    let inner_right = detail.x + detail.w - 2.0 * s;
+    // 值行 / 动作行内所有 detail 字号文字的**共用顶线**：按「行高 = 1.6 × 字号」把一行文字
+    // 在 24·s 高的行带里垂直居中（1.6 与 `TextFormats` 造格式、`draw_segmented_button` 给
+    // label 字号居中的口径一致，只是这里字号换成 detail）。
+    // **必须同源**：行标签、状态标签、路径三段此前各自写死偏移，同字号却落在三条基线上，
+    // 整行看上去是歪的——这正是本次要修的病，不要再让任何一段自带偏移。
+    let text_dy = (btn_h - detail_font * 1.6) / 2.0;
+    let text_top = row_y + text_dy;
+
+    // —— 值行 ——
+    let value_row = RectF {
+        x: detail.x,
+        y: row_y,
+        w: detail.w,
+        h: btn_h,
+    };
+    let tag_w = winbosk_core::storage::chip_width(kind.badge(), detail_font, STORAGE_TAG_PAD_X * s);
+    let tag = RectF {
+        x: detail.x + label_w,
+        y: row_y + 3.0 * s,
+        w: tag_w,
+        h: STORAGE_TAG_H * s,
+    };
+    let open_w =
+        winbosk_core::text::estimate_width("打开", label_font) + 2.0 * STORAGE_BTN_PAD_X * s;
+    let open = RectF {
+        x: inner_right - open_w,
+        y: row_y,
+        w: open_w,
+        h: btn_h,
+    };
+    let path_x = tag.x + tag.w + STORAGE_TAG_GAP * s;
+    let path_w = (open.x - STORAGE_TAG_GAP * s - path_x).max(0.0);
+    let path_rect = RectF {
+        x: path_x,
+        y: text_top,
+        w: path_w,
+        h: STORAGE_TAG_H * s,
+    };
+    let path_text =
+        winbosk_core::storage::elide_middle(path, (path_w - 2.0 * s).max(0.0), detail_font);
+
+    // —— 动作行（右端对齐；恢复默认在左，更改文件位置在右）——
+    let action_y = row_y + STORAGE_ROW_PITCH * s;
+    let change_w = winbosk_core::text::estimate_width("更改文件位置…", label_font)
+        + 2.0 * STORAGE_BTN_PAD_X * s;
+    let change = RectF {
+        x: inner_right - change_w,
+        y: action_y,
+        w: change_w,
+        h: btn_h,
+    };
+    let reset_w =
+        winbosk_core::text::estimate_width("恢复默认", label_font) + 2.0 * STORAGE_BTN_PAD_X * s;
+    let reset = if can_reset {
+        let x = change.x - STORAGE_BTN_GAP * s - reset_w;
+        // 出现前先确认左端不与标签列打架；面板被拖到极限时宁可不出这个次要按钮。
+        if x >= inner_left + label_w + STORAGE_BTN_GAP * s {
+            RectF {
+                x,
+                y: action_y,
+                w: reset_w,
+                h: btn_h,
+            }
+        } else {
+            RectF::default()
+        }
+    } else {
+        RectF::default()
+    };
+    let actions_left = if reset.h > 0.0 { reset.x } else { change.x };
+    let hint_w = (actions_left - STORAGE_BTN_GAP * s - inner_left).max(0.0);
+    let hint_text = winbosk_core::storage::hint_text(kind, hint_w, detail_font);
+    let hint = if hint_text.is_empty() {
+        RectF::default()
+    } else {
+        RectF {
+            x: inner_left,
+            y: action_y + text_dy,
+            w: hint_w,
+            h: STORAGE_TAG_H * s,
+        }
+    };
+
+    StorageRow {
+        value_row,
+        tag,
+        path: path_rect,
+        path_text,
+        open,
+        change,
+        reset,
+        hint,
+        hint_text: hint_text.to_string(),
+        text_top,
+    }
 }
 
 /// 构建控制中心面板场景（栅栏管理单页）。关闭后完全隐藏（无胶囊），
@@ -706,63 +866,36 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         } else {
             (RectF::default(), Vec::new())
         };
-        // —— 文件位置行（占两行）——
-        // 第一行：标签 + 「更改位置…」+「恢复默认」（后者仅外部文件夹模式出现）。
-        // 第二行：落地模式芯片 + 中段省略的真实路径。
+        // —— 文件位置行（占两行，**不可再增行**）——
+        // 值行：标签 + 状态标签（模式）+ 真实落地路径 + 「打开」
+        // 动作行：后果提示（左）+ 「更改文件位置…」「恢复默认」（右端对齐）
         // 该行是用户唯一能得知"文件到底存在哪 / 删除是删副本还是删真身"的入口，故常显。
+        // 几何全部由 `storage_row_geometry` 纯函数推出（含"放不下就不画提示语"的降级），
+        // 以便在内存中单测空间互斥。
         let storage = winbosk_core::storage::describe(
             desk.fences[sel].storage_path.as_deref(),
             &rt.library.to_string_lossy(),
             rt.desktop_dir.as_deref(),
         );
-        let storage_btn = RectF {
-            x: d.x + label_w,
-            y: row_y(row),
-            w: 120.0 * s,
-            h: btn_h,
-        };
-        let storage_reset = if storage.can_reset {
-            // 宽度按可用空间收敛：面板被缩到最小宽（CONSOLE_MIN_W）时也不会顶出详情区右缘。
-            let reset_x = storage_btn.x + storage_btn.w + 6.0 * s;
-            let avail = (d.x + d.w - 2.0 * s - reset_x).max(0.0);
-            let reset_w = avail.min(84.0 * s);
-            if reset_w >= 40.0 * s {
-                RectF {
-                    x: reset_x,
-                    y: row_y(row),
-                    w: reset_w,
-                    h: btn_h,
-                }
-            } else {
-                RectF::default()
-            }
-        } else {
-            RectF::default()
-        };
-        row += 1;
-        let chip_w = 56.0 * s;
-        let path_gap = 6.0 * s;
-        let path_x = d.x + 2.0 * s + chip_w + path_gap;
-        let path_y = row_y(row) + 4.0 * s;
-        let path_h = 18.0 * s;
-        let storage_chip = RectF {
-            x: d.x + 2.0 * s,
-            y: path_y,
-            w: chip_w,
-            h: path_h,
-        };
-        let storage_path_rect = RectF {
-            x: path_x,
-            y: path_y,
-            w: (d.x + d.w - 2.0 * s - path_x).max(0.0),
-            h: path_h,
-        };
-        // 省略预算与绘制层同源（`text::estimate_width`），留 4px 内边距避免贴边。
-        let storage_path_text = winbosk_core::storage::elide_middle(
+        let row_geo = storage_row_geometry(
+            &d,
+            row_y(row),
+            storage.kind,
+            storage.can_reset,
             &storage.path,
-            (storage_path_rect.w - 4.0 * s).max(0.0),
-            rt.theme.label.size * 0.72,
+            &rt.theme,
         );
+        let storage_value_row = row_geo.value_row;
+        let storage_chip = row_geo.tag;
+        let storage_path_rect = row_geo.path;
+        let storage_path_text = row_geo.path_text;
+        let storage_open = row_geo.open;
+        let storage_hint_rect = row_geo.hint;
+        let storage_hint_text = row_geo.hint_text;
+        let storage_text_top = row_geo.text_top;
+        row += 1;
+        let storage_btn = row_geo.change;
+        let storage_reset = row_geo.reset;
         row += 1;
         // 侧边栏位置按钮（仅侧边栏布局有；网格/列表隐藏）
         let show_sidebar_pos = app.layout == FenceLayout::Sidebar;
@@ -860,10 +993,15 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
             tint_default,
             tints,
             storage_btn,
+            storage_value_row,
             storage_kind: storage.kind,
             storage_path_text,
             storage_path_rect,
             storage_chip,
+            storage_open,
+            storage_hint_text,
+            storage_hint_rect,
+            storage_text_top,
             storage_reset,
             sidebar_pos: app.sidebar_pos,
             sidebar_left,
@@ -1708,11 +1846,13 @@ pub(crate) fn hit_model_from(theme: &Theme, scene: &Scene, _desk: &Desk) -> HitM
                 zones.push((ConsoleZone::FenceSelect(i), r.rect));
             }
             if let Some(d) = &c.fence_detail {
-                zones.push((ConsoleZone::ChangeStoragePath, d.storage_btn));
-                // 路径行整块也可点（等价于「更改位置…」）；零矩形不入表。
-                if d.storage_path_rect.w > 0.0 && d.storage_path_rect.h > 0.0 {
-                    zones.push((ConsoleZone::ChangeStoragePath, d.storage_path_rect));
+                // 值行只有「打开」可点；**路径不是热区**（它是"看的东西"）。
+                // 此前把路径整块接成 `ChangeStoragePath`，导致"看着像灰字却能点、
+                // 看着像按钮的状态标签却点不动"这对反转，用户读不出哪个是动作。
+                if d.storage_open.h > 0.0 {
+                    zones.push((ConsoleZone::OpenStoragePath, d.storage_open));
                 }
+                zones.push((ConsoleZone::ChangeStoragePath, d.storage_btn));
                 // 「恢复默认」仅在外部文件夹模式出现；零矩形不入表，杜绝死按钮。
                 if d.storage_reset.h > 0.0 {
                     zones.push((ConsoleZone::ResetStoragePath, d.storage_reset));
@@ -2277,5 +2417,163 @@ mod tests {
             requested: Rect::new(100.0, 100.0, 300.0, h),
         };
         assert!(reserved_frames(&desk, &[h], Some(&hint), &theme, 1.0).is_empty());
+    }
+
+    /// 详情区矩形（与 `build_console` 同源口径）。
+    ///
+    /// 注意 `panel_w` 是**DIP 常量**（`CONSOLE_W` / `CONSOLE_MIN_W`），面板实际宽度是
+    /// `panel_w * s`——漏乘 `s` 会让高 DPI 下的测试用一条假想的窄面板去判定重叠。
+    fn test_detail_rect(panel_w: f32, s: f32) -> RectF {
+        RectF {
+            x: 100.0,
+            y: 200.0,
+            w: panel_w * s - 2.0 * CONSOLE_PAD * s,
+            h: CONSOLE_FENCE_DETAIL_H * s,
+        }
+    }
+
+    /// 按 DPI 缩放系数取主题（与 `main.rs` 的启动路径同一函数，保证口径同源）。
+    fn test_theme(s: f32) -> Theme {
+        let mut theme = Theme::default();
+        apply_theme_scale(&mut theme, s);
+        theme
+    }
+
+    /// 「文件位置」行参与排布的全部矩形（`value_row` 是标签锚点、不绘制，故不计入）。
+    fn storage_rects(row: &StorageRow) -> [(&'static str, RectF); 6] {
+        [
+            ("tag", row.tag),
+            ("path", row.path),
+            ("open", row.open),
+            ("change", row.change),
+            ("reset", row.reset),
+            ("hint", row.hint),
+        ]
+    }
+
+    /// 两个矩形是否真的相交（1e-3 容差，避免浮点擦边判成重叠）。
+    fn overlaps(a: &RectF, b: &RectF) -> bool {
+        a.x < b.x + b.w - 1e-3
+            && b.x < a.x + a.w - 1e-3
+            && a.y < b.y + b.h - 1e-3
+            && b.y < a.y + a.h - 1e-3
+    }
+
+    /// 空间互斥（指南 §4.1）：全宽/最小宽 × 三种 DPI × 两种模式 × `can_reset` 两种取值下，
+    /// 「文件位置」行的六个矩形两两不重叠，且全部落在详情区左右内缘之内。
+    /// 这条断言是"标签归标签、值归值、动作归动作"在几何上的最终保险。
+    #[test]
+    fn storage_row_geometry_is_pairwise_disjoint() {
+        let long_path = r"D:\归档\非常长的中文目录名称\另一个子目录\最后的文件夹";
+        for (panel_w, s) in [
+            (CONSOLE_W, 1.0_f32),
+            (CONSOLE_MIN_W, 1.0),
+            (CONSOLE_W, 1.5),
+            (CONSOLE_MIN_W, 2.0),
+        ] {
+            let theme = test_theme(s);
+            let d = test_detail_rect(panel_w, s);
+            let inner_left = d.x + 2.0 * s;
+            let inner_right = d.x + d.w - 2.0 * s;
+            for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                for can_reset in [false, true] {
+                    let row = storage_row_geometry(&d, 300.0, kind, can_reset, long_path, &theme);
+                    let rects = storage_rects(&row);
+                    for (i, (na, a)) in rects.iter().enumerate() {
+                        if a.w <= 0.0 || a.h <= 0.0 {
+                            continue; // 零矩形 = 不出现
+                        }
+                        assert!(
+                            a.x >= inner_left - 1e-3 && a.x + a.w <= inner_right + 1e-3,
+                            "panel={panel_w} s={s} {kind:?} reset={can_reset}: {na} 越出详情区 \
+                             [{inner_left}, {inner_right}]，实际 [{}, {}]",
+                            a.x,
+                            a.x + a.w
+                        );
+                        for (nb, b) in &rects[i + 1..] {
+                            if b.w <= 0.0 || b.h <= 0.0 {
+                                continue;
+                            }
+                            assert!(
+                                !overlaps(a, b),
+                                "panel={panel_w} s={s} {kind:?} reset={can_reset}: \
+                                 {na}{a:?} 与 {nb}{b:?} 重叠"
+                            );
+                        }
+                    }
+                    // 路径与标签永不为零（值行必须能显示"存在哪"）
+                    assert!(row.tag.w > 0.0 && row.tag.h > 0.0);
+                    assert!(row.open.w > 0.0, "「打开」必须始终可见");
+                    assert!(row.change.w > 0.0, "「更改文件位置…」必须始终可见");
+                }
+            }
+        }
+    }
+
+    /// 后果提示的显隐契约：
+    /// - **默认面板宽度**下两种模式都必须常显（这是本行的核心信息，不能靠 hover 才看见）；
+    /// - 面板被拖到最小宽时空间不足，允许整条不画（**有意的降级**——宁可不说，
+    ///   也不截半个字或压住动作按钮）；
+    /// - 任何宽度下"空文案 ⟺ 零矩形"必须成立，否则会画出空框或画出没有矩形的文字。
+    #[test]
+    fn storage_row_geometry_hint_visibility() {
+        let theme = test_theme(1.0);
+        let full = test_detail_rect(CONSOLE_W, 1.0);
+        let path = r"D:\归档";
+
+        for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+            let row = storage_row_geometry(
+                &full,
+                0.0,
+                kind,
+                kind == StorageKind::ExternalFolder,
+                path,
+                &theme,
+            );
+            assert!(
+                !row.hint_text.is_empty(),
+                "默认宽度下 {kind:?} 必须显示后果提示"
+            );
+            assert!(row.hint.h > 0.0 && row.hint.w > 0.0);
+        }
+
+        for panel_w in [CONSOLE_W, CONSOLE_MIN_W] {
+            let d = test_detail_rect(panel_w, 1.0);
+            for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                for can_reset in [false, true] {
+                    let row = storage_row_geometry(&d, 0.0, kind, can_reset, path, &theme);
+                    assert_eq!(
+                        row.hint_text.is_empty(),
+                        row.hint.h <= 0.0,
+                        "panel={panel_w} {kind:?} reset={can_reset}：文案与矩形必须同时在场或同时缺席"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 「恢复默认」缺席时必须是零矩形（应用内部库已是默认，无按钮可点），
+    /// 且此时动作行右侧只剩「更改文件位置…」——提示语预算因此更大。
+    #[test]
+    fn storage_row_geometry_reset_absent_is_zero_rect() {
+        let theme = test_theme(1.0);
+        let d = test_detail_rect(CONSOLE_W, 1.0);
+        let without =
+            storage_row_geometry(&d, 0.0, StorageKind::AppLibrary, false, "C:\\x", &theme);
+        assert!(
+            without.reset.h <= 0.0 && without.reset.w <= 0.0,
+            "不可回退时「恢复默认」必须是零矩形"
+        );
+        let with =
+            storage_row_geometry(&d, 0.0, StorageKind::ExternalFolder, true, "C:\\x", &theme);
+        assert!(with.reset.w > 0.0, "外部文件夹模式必须给出「恢复默认」");
+        assert!(
+            with.reset.x + with.reset.w < with.change.x,
+            "「恢复默认」必须排在「更改文件位置…」左侧且不重叠"
+        );
+        assert!(
+            without.hint.w > with.hint.w,
+            "少了「恢复默认」，提示语预算应变宽"
+        );
     }
 }

@@ -231,6 +231,8 @@ pub enum ConsoleZone {
     RemoveFence,
     /// 栅栏管理页：更改选中栅栏的存储位置（打开文件夹选择器）。
     ChangeStoragePath,
+    /// 栅栏管理页：在资源管理器中打开选中栅栏的真实落地目录。
+    OpenStoragePath,
     /// 栅栏管理页：把选中栅栏的存储位置恢复为应用内部库（解除外部文件夹链接）。
     ResetStoragePath,
     /// 栅栏管理页：设置选中栅栏的分类规则（预设模板；None = 无规则）。
@@ -1474,6 +1476,8 @@ fn console_resize_zone_at(c: &ConsoleHit, mx: f32, my: f32) -> Option<ResizeZone
 /// - `AddFence`：一次双击会多建一个栅栏；
 /// - `RemoveFence`：一次双击会连删两个栅栏（虽有确认弹窗，也不该被一次手势触发两次）；
 /// - `ChangeStoragePath`：会弹两次文件夹选择器（模态）；
+/// - `OpenStoragePath`：会拉起两个资源管理器窗口；
+/// - `ResetStoragePath`：解除外部链接本身幂等，但重复触发毫无收益，不给它开后门；
 /// - `AutoOrganize`：会跑两遍一键整理；
 /// - `DesktopToggle`：虽是纯状态翻转，但每次翻转都伴随 `restore_icons`/`hide_icons` 与
 ///   整屏淡入淡出补间，重复触发会出现「桌面闪一下又回来」的可见抖动；

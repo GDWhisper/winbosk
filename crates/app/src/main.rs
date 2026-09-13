@@ -55,14 +55,15 @@ pub(crate) use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RETURN, VK_RIGHT, VK_UP,
 };
 pub(crate) use windows::Win32::UI::Shell::{
-    DragQueryFileW, FileOpenDialog, IFileOpenDialog, IShellItem, IShellItemArray,
-    FOS_ALLOWMULTISELECT, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, HDROP, SIGDN_FILESYSPATH,
+    DragQueryFileW, FileOpenDialog, IFileOpenDialog, IShellItem, FOS_FORCEFILESYSTEM,
+    FOS_PICKFOLDERS, HDROP, SIGDN_FILESYSPATH,
 };
 pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
     MessageBoxW, PostMessageW, SetForegroundWindow, SetProcessDPIAware, SystemParametersInfoW,
-    TrackPopupMenu, HMENU, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MF_SEPARATOR, MF_STRING,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA,
+    TrackPopupMenu, HMENU, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_SEPARATOR, MF_STRING, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY, TPM_RETURNCMD, WM_NULL,
 };
 
@@ -1268,19 +1269,56 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 delete_fence_and_reclaim_icons(rt, i);
             }
             ConsoleZone::ChangeStoragePath => {
-                // 更改选中栅栏的存储位置：打开文件夹选择器，移动已有库内项到新路径
+                // 更改选中栅栏的存储位置：打开文件夹选择器，移动已有库内项到新路径。
+                // 顺序有意为之：先弹选择器（单选、标题明确）→ 再校验目标目录 → 确有文件要搬
+                // 才弹确认 → 最后才写盘。校验放在确认之前，避免"先问再拒绝"。
                 let i = rt
                     .selected_fence
                     .min(rt.desk.fences.len().saturating_sub(1));
-                // 常驻后台的进程直接弹系统模态对话框会被拒绝前台化（对话框不获焦、被前台
-                // 窗口盖住），先借焦点代理把本线程提到前台——与 `track_popup_menu`、
-                // `confirm_delete_fence` 同一套手法（见 overlay 的「任何需要把窗口提到
-                // 前台都必须走它」）。owner 仍用 overlay 本体，代理是离屏 1×1 不能当 owner。
+                // 这里提权是给下面的 `pick_folder`（`IFileDialog`）用的：它不走
+                // `modal_box`，不会自己提权。其后的确认框 / 告警框都在 `modal_box`
+                // 内部自行提权，不依赖这里。
                 unsafe { (*rt.overlay_ptr).raise_to_foreground() };
-                if let Some(paths) = pick_paths(rt.hwnd) {
-                    if let Some(new_dir) = paths.first() {
-                        change_fence_storage(rt, i, new_dir);
+                if let Some(new_dir) = pick_folder(rt.hwnd) {
+                    match validate_storage_dir(rt, &new_dir) {
+                        Err(reason) => warn_storage_reject(rt, reason.reason()),
+                        Ok(()) => {
+                            let n = count_movable_items(rt, i);
+                            if n == 0 || confirm_move_storage(rt, n, &new_dir) {
+                                if let Err(reason) = change_fence_storage(rt, i, &new_dir) {
+                                    warn_storage_reject(rt, reason.reason());
+                                }
+                            }
+                        }
                     }
+                }
+            }
+            ConsoleZone::OpenStoragePath => {
+                // 在资源管理器中打开选中栅栏的真实落地目录。
+                // 路径取自 `storage::describe`（与绘制同源），不在这里另写一份 match。
+                // `is_dir()` 只在此处（点击时）调用一次——**绝不放进绘制路径**。
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                let storage = winbosk_core::storage::describe(
+                    rt.desk
+                        .fences
+                        .get(i)
+                        .and_then(|f| f.storage_path.as_deref()),
+                    &rt.library.to_string_lossy(),
+                    rt.desktop_dir.as_deref(),
+                );
+                if std::path::Path::new(&storage.path).is_dir() {
+                    // 提权后再拉起资源管理器：本进程常驻后台，不提权的话新窗口可能
+                    // 不获焦、被前台窗口盖住（与模态框同一套手法）。
+                    unsafe { (*rt.overlay_ptr).raise_to_foreground() };
+                    if !winbosk_shell::items::open_folder(&storage.path) {
+                        tracing::warn!(path = %storage.path, "拉起资源管理器失败");
+                    }
+                } else {
+                    // 目录已被外部删除：不弹系统错误框（栅栏内容此时已被后台同步清空，
+                    // 用户看得到状态），只留日志。
+                    tracing::warn!(path = %storage.path, "落地目录不存在，忽略「打开」");
                 }
             }
             ConsoleZone::ResetStoragePath => {

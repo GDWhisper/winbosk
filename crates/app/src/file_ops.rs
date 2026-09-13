@@ -162,29 +162,61 @@ pub(crate) fn register_fence_item(rt: &mut Runtime, fence: usize, path: &str) ->
     true
 }
 
-/// 更改栅栏的存储位置：将栅栏内所有库内项移动到新目录，更新路径引用。
-/// 桌面枚举项（added=false）不受影响（它们的文件由系统管理）。
-pub(crate) fn change_fence_storage(rt: &mut Runtime, fence_idx: usize, new_dir: &str) {
-    let new_path = std::path::Path::new(new_dir);
-    if !new_path.is_dir() {
-        tracing::warn!(new_dir, "目标路径不是文件夹");
-        return;
+/// 目标目录不可作为栅栏存储位置的原因（具名结果，不用歧义布尔值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageReject {
+    /// 不是已存在的文件夹。
+    NotADirectory,
+    /// 与应用内部库重叠（库本身 / 其子目录 / 其祖先目录）。
+    InsideLibrary,
+    /// 栅栏下标越界（详情区已不在，防御分支）。
+    NoSuchFence,
+}
+
+impl StorageReject {
+    /// 面向用户的拒绝原因（告警框文案）。
+    ///
+    /// 与变体定义同处一地：将来新增变体会被 `match` 的穷尽性强制补文案，
+    /// 不会再出现"拒绝了但用户不知道"的静默失败。
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            StorageReject::NotADirectory => "所选路径不是已存在的文件夹。",
+            StorageReject::InsideLibrary => {
+                "不能选应用内部库本身、它的子目录或它的上级目录——否则这个栅栏会把\
+                 整个共享库（含其它栅栏的文件）镜像进来。"
+            }
+            StorageReject::NoSuchFence => "目标栅栏已不存在。",
+        }
     }
-    // 防御：拒绝把存储位置设为应用内部库本身、其子目录或其祖先目录。
+}
+
+/// 校验目标目录能否作为栅栏存储位置（**纯判定，无副作用**）。
+///
+/// 与 `change_fence_storage` 内部的守卫**共用同一真源**：控制中心在弹确认框之前先调它，
+/// 把此前"点了没反应、只有一行日志"的静默失败换成明确的告警框。
+pub(crate) fn validate_storage_dir(rt: &Runtime, new_dir: &str) -> Result<(), StorageReject> {
+    let new_path = Path::new(new_dir);
+    if !new_path.is_dir() {
+        return Err(StorageReject::NotADirectory);
+    }
+    // 拒绝把存储位置设为应用内部库本身、其子目录或其祖先目录。
     // 否则该栅栏会通过 `mirror_linked_fence` 把**整个共享库**（含其它栅栏的项）镜像进来，
     // 同一文件同时出现在多个栅栏；祖先目录还会连带镜像 desk.json 等内部文件。
     if is_inside_library(rt, new_path) || path_within(new_path, &rt.library) {
-        tracing::warn!(new_dir, "拒绝把存储位置设为应用内部库（或其父/子目录）");
-        return;
+        return Err(StorageReject::InsideLibrary);
     }
+    Ok(())
+}
+
+/// 需要随「更改文件位置…」搬走的库内项：`added == true`（栅栏自建的副本）且文件当前在内部库内。
+///
+/// 与 `change_fence_storage` 的实际搬移集合**同源**——控制中心用它决定"要不要弹确认框"：
+/// 数量为 0 时保持无模态（基础操作不加摩擦），> 0 时才提示"这些文件会被搬走"。
+pub(crate) fn movable_items(rt: &Runtime, fence_idx: usize) -> Vec<String> {
     let Some(fence) = rt.desk.fences.get(fence_idx) else {
-        return;
+        return Vec::new();
     };
-    let fence_id = fence.id;
-    // 旧链接文件夹：换链接后，旧文件夹里的镜像项不再是本栅栏成员（文件保留在磁盘）
-    let old_dir = fence.storage_path.clone();
-    // 收集需要移动的库内项（added=true 且路径在旧库内）
-    let items_to_move: Vec<String> = fence
+    fence
         .icon_ids
         .iter()
         .filter(|id| {
@@ -196,13 +228,38 @@ pub(crate) fn change_fence_storage(rt: &mut Runtime, fence_idx: usize, new_dir: 
                         && ic
                             .path
                             .as_ref()
-                            .map(|p| is_inside_library(rt, std::path::Path::new(p)))
+                            .map(|p| is_inside_library(rt, Path::new(p)))
                             .unwrap_or(false)
                 })
                 .unwrap_or(false)
         })
         .cloned()
-        .collect();
+        .collect()
+}
+
+/// [`movable_items`] 的数量（控制中心确认框只需计数）。
+pub(crate) fn count_movable_items(rt: &Runtime, fence_idx: usize) -> usize {
+    movable_items(rt, fence_idx).len()
+}
+
+/// 更改栅栏的存储位置：将栅栏内所有库内项移动到新目录，更新路径引用。
+/// 桌面枚举项（added=false）不受影响（它们的文件由系统管理）。
+///
+/// **这是真搬文件**（复制到新目录 + 删除旧副本），故控制中心在调用前会弹一次确认；
+/// 返回 `Err` 时**零副作用**——全部校验都前置于任何写入。
+pub(crate) fn change_fence_storage(
+    rt: &mut Runtime,
+    fence_idx: usize,
+    new_dir: &str,
+) -> Result<(), StorageReject> {
+    validate_storage_dir(rt, new_dir)?;
+    let new_path = Path::new(new_dir);
+    let (fence_id, old_dir) = match rt.desk.fences.get(fence_idx) {
+        Some(f) => (f.id, f.storage_path.clone()),
+        None => return Err(StorageReject::NoSuchFence),
+    };
+    // 收集需要移动的库内项（added=true 且路径在旧库内）
+    let items_to_move = movable_items(rt, fence_idx);
     if items_to_move.is_empty() {
         // 没有库内项需要移动，直接更新 storage_path
         if let Some(f) = rt.desk.fences.get_mut(fence_idx) {
@@ -218,7 +275,7 @@ pub(crate) fn change_fence_storage(rt: &mut Runtime, fence_idx: usize, new_dir: 
         }
         let _ = rt.store.save(&rt.desk);
         tracing::info!(fence = fence_id, new_dir, "无库内项需移动，仅更新存储路径");
-        return;
+        return Ok(());
     }
     // 确保目标目录存在
     let _ = std::fs::create_dir_all(new_path);
@@ -297,6 +354,7 @@ pub(crate) fn change_fence_storage(rt: &mut Runtime, fence_idx: usize, new_dir: 
         total = items_to_move.len(),
         "栅栏存储位置已更改"
     );
+    Ok(())
 }
 
 /// 换链接后清理旧链接文件夹里的残留镜像项：`added` 项路径在旧文件夹内、

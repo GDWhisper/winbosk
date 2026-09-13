@@ -738,58 +738,39 @@ fn draw_fence_detail(
         }
     }
 
-    // 文件位置行（始终显示，占两行）：第一行 = 标签 + 操作按钮，第二行 = 模式芯片 + 真实路径。
+    // 文件位置行（始终显示，占两行；**不可再增行**，见 app 层 `detail_visible_rows` 的行预算）：
+    //   值行 = 标签 + 状态标签（模式）+ 真实落地路径 + 「打开」
+    //   动作行 = 后果提示（左）+ 「更改文件位置…」「恢复默认」（右端对齐）
     // 该行是用户唯一能得知"文件到底存在哪 / 删除是删副本还是删真身"的入口，故常显不可折叠。
-    let r4 = d.storage_btn;
-    if r4.h > 0.0 {
+    // **关键契约**：值行里的状态标签与路径都**不是按钮**（都不在命中表内），
+    // 动作只有三个按钮——保证"看着能点的都能点、能点的都看得见"。
+    let vr = d.storage_value_row;
+    if vr.h > 0.0 {
+        // 顶线与状态标签、路径同源（`storage_text_top`）：三段同字号，各写各的偏移就会
+        // 读成「不在同一行」——那正是这一行此前让人看不懂的原因之一。
         let lr5 = D2D_RECT_F {
             left: label_x,
-            top: r4.y + 2.0 * s,
+            top: d.storage_text_top,
             right: label_x + label_w,
-            bottom: r4.y + 24.0 * s,
+            bottom: vr.y + 24.0 * s,
         };
         draw_text(target, "文件位置", &formats.detail, lr5, &label_brush);
     }
-    let storage_hover = matches!(c.hover_zone, Some(ConsoleZone::ChangeStoragePath));
-    draw_segmented_button(
-        target,
-        theme,
-        d.storage_btn,
-        "更改位置…",
-        false,
-        storage_hover,
-        formats,
-        accent,
-    );
-    // 「恢复默认」：仅外部文件夹模式出现（应用内部已是默认，无按钮可点）。
-    if d.storage_reset.h > 0.0 {
-        let reset_hover = matches!(c.hover_zone, Some(ConsoleZone::ResetStoragePath));
-        draw_segmented_button(
-            target,
-            theme,
-            d.storage_reset,
-            "恢复默认",
-            false,
-            reset_hover,
-            formats,
-            accent,
-        );
-    }
-    // 第二行：模式芯片 + 中段省略的真实路径（整块可点 = 更改位置…）。
-    if d.storage_path_rect.h > 0.0 {
+    // 值行：状态标签 + 路径（次要信息，恒为灰字，不与任何按钮共用 hover 高亮）
+    if d.storage_chip.h > 0.0 {
         draw_storage_chip(
             target,
             theme,
             d.storage_kind,
             d.storage_chip,
+            d.storage_text_top,
             formats,
             accent,
         );
-        let path_brush = unsafe {
-            // 悬停高亮：路径行与「更改位置…」是同一动作，共用 ChangeStoragePath 命中区。
-            let alpha = if storage_hover { 0.95 } else { 0.62 };
-            target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, alpha * full_t]), None)?
-        };
+    }
+    if d.storage_path_rect.h > 0.0 {
+        let path_brush =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.55 * full_t]), None)? };
         let tr = D2D_RECT_F {
             left: d.storage_path_rect.x,
             top: d.storage_path_rect.y,
@@ -802,6 +783,57 @@ fn draw_fence_detail(
             &formats.detail,
             tr,
             &path_brush,
+        );
+    }
+    if d.storage_open.h > 0.0 {
+        draw_ghost_button(
+            target,
+            theme,
+            d.storage_open,
+            "打开",
+            matches!(c.hover_zone, Some(ConsoleZone::OpenStoragePath)),
+            formats,
+        );
+    }
+    // 动作行：左 = 后果提示（宽度放不下时 App 层给空串，整条不画），右端 = 两个动作按钮
+    if d.storage_hint_rect.h > 0.0 && !d.storage_hint_text.is_empty() {
+        let hint_brush =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.40 * full_t]), None)? };
+        let hr = D2D_RECT_F {
+            left: d.storage_hint_rect.x,
+            top: d.storage_hint_rect.y,
+            right: d.storage_hint_rect.x + d.storage_hint_rect.w,
+            bottom: d.storage_hint_rect.y + d.storage_hint_rect.h,
+        };
+        draw_text(
+            target,
+            &d.storage_hint_text,
+            &formats.detail,
+            hr,
+            &hint_brush,
+        );
+    }
+    draw_segmented_button(
+        target,
+        theme,
+        d.storage_btn,
+        "更改文件位置…",
+        false,
+        matches!(c.hover_zone, Some(ConsoleZone::ChangeStoragePath)),
+        formats,
+        accent,
+    );
+    // 「恢复默认」：仅外部文件夹模式出现（应用内部库已是默认，无按钮可点）。
+    if d.storage_reset.h > 0.0 {
+        draw_segmented_button(
+            target,
+            theme,
+            d.storage_reset,
+            "恢复默认",
+            false,
+            matches!(c.hover_zone, Some(ConsoleZone::ResetStoragePath)),
+            formats,
+            accent,
         );
     }
 
@@ -958,16 +990,20 @@ fn draw_segmented_button(
     }
 }
 
-/// 文件位置模式芯片：胶囊描边小标签（「应用内部」/「外部文件夹」）。
+/// 文件位置模式标签：**灰底填充标签**（这是状态，不是按钮）。
 ///
 /// 两种落地模式是**机制差异**（索引副本库 vs 与目录双向镜像）而非程度差异，必须可辨：
-/// 外部文件夹用 accent 描边，提示"文件在你自己选的目录里"；应用内部用中性描边，
-/// 避免被误读为错误状态。
+/// 外部文件夹用 accent 底，提示"文件在你自己选的目录里"；应用内部库用中性底，避免被误读为错误状态。
+///
+/// **刻意不画描边、不用胶囊圆角**——此前画成与分段按钮同族的描边胶囊（圆角 = h/2 + 1px 描边），
+/// 而它并不在命中表内，用户会反复去点一个点不动的"按钮"。改为填充式标签后，
+/// "能点的长这样、不能点的长那样"这条视觉契约才成立。
 fn draw_storage_chip(
     target: &ID2D1RenderTarget,
     theme: &Theme,
     kind: StorageKind,
     rect: RectF,
+    text_top: f32,
     formats: &TextFormats,
     accent: [f32; 4],
 ) {
@@ -982,13 +1018,68 @@ fn draw_storage_chip(
             right: rect.x + rect.w,
             bottom: rect.y + rect.h,
         },
-        radiusX: rect.h / 2.0,
-        radiusY: rect.h / 2.0,
+        radiusX: 5.0 * s,
+        radiusY: 5.0 * s,
     };
-    let (stroke, text_alpha) = match kind {
-        StorageKind::ExternalFolder => ([accent[0], accent[1], accent[2], 0.85], 0.92),
-        StorageKind::AppLibrary => ([1.0, 1.0, 1.0, 0.32], 0.60),
+    let (fill, text_alpha) = match kind {
+        StorageKind::ExternalFolder => ([accent[0], accent[1], accent[2], 0.28], 0.95),
+        StorageKind::AppLibrary => ([1.0, 1.0, 1.0, 0.12], 0.82),
     };
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(fill), None) } {
+        unsafe { target.FillRoundedRectangle(&rr, &b) };
+    }
+    // 文字顶线由调用方传入（值行内三段同字号文字共用一条）。这里**不能**再按
+    // `theme.label.size * 1.6` 就地估算居中：本标签用的是 `detail` 字号（0.72 × label），
+    // 按 label 字号算出来的行高比标签框还高，文字会被顶到框外。
+    let lr = D2D_RECT_F {
+        left: rect.x,
+        top: text_top,
+        right: rect.x + rect.w,
+        bottom: rect.y + rect.h,
+    };
+    if let Ok(b) =
+        unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, text_alpha]), None) }
+    {
+        draw_text_centered(target, kind.badge(), &formats.detail, lr, &b);
+    }
+}
+
+/// 幽灵按钮：**不填底色**，只有细描边 + 次级文字（用于「打开」这类就地次要动作）。
+///
+/// 与 [`draw_segmented_button`] 的区别正是"没有底色"：面板里带底色的胶囊代表"可选项/当前值"，
+/// 幽灵按钮代表"就地做一件小事"。混用会让用户分不清哪些是状态、哪些是动作。
+fn draw_ghost_button(
+    target: &ID2D1RenderTarget,
+    theme: &Theme,
+    rect: RectF,
+    label: &str,
+    hover: bool,
+    formats: &TextFormats,
+) {
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return;
+    }
+    let s = theme.scale;
+    let rr = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: rect.x,
+            top: rect.y,
+            right: rect.x + rect.w,
+            bottom: rect.y + rect.h,
+        },
+        radiusX: 7.0 * s,
+        radiusY: 7.0 * s,
+    };
+    let (fill, stroke, text) = if hover {
+        ([1.0, 1.0, 1.0, 0.14], [1.0, 1.0, 1.0, 0.34], 0.95)
+    } else {
+        ([1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 0.22], 0.75)
+    };
+    if fill[3] > 0.0 {
+        if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(fill), None) } {
+            unsafe { target.FillRoundedRectangle(&rr, &b) };
+        }
+    }
     if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(stroke), None) } {
         unsafe { target.DrawRoundedRectangle(&rr, &b, 1.0 * s, None) };
     }
@@ -998,10 +1089,8 @@ fn draw_storage_chip(
         right: rect.x + rect.w,
         bottom: rect.y + rect.h,
     };
-    if let Ok(b) =
-        unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, text_alpha]), None) }
-    {
-        draw_text_centered(target, kind.badge(), &formats.detail, lr, &b);
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, text]), None) } {
+        draw_text_centered(target, label, &formats.label, lr, &b);
     }
 }
 
