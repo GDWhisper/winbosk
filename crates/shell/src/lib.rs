@@ -9,6 +9,7 @@
 //!
 //! 本 crate 是分层架构中最贴近系统的一层，API 以 `winbosk-core` 的领域类型为边界。
 
+pub mod autostart;
 pub mod com;
 pub mod icons;
 pub mod items;

@@ -2,11 +2,14 @@
 
 use crate::*;
 
-/// 内联编辑目标：栅栏内图标重命名 / 栅栏标题重命名。
+/// 内联编辑目标：栅栏内图标重命名 / 栅栏标题重命名 / 规则配置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditTarget {
     Item { fence: usize, icon: usize },
     FenceTitle { fence: usize },
+    RuleExtension { fence: usize },
+    RuleExcludeExtension { fence: usize },
+    RulePattern { fence: usize },
 }
 
 /// D2D 内联文本编辑：文本、光标与 IME 合成状态全在 App 层，绘制与输入同表面，
@@ -175,32 +178,143 @@ pub(crate) fn dismiss_edit(rt: &mut Runtime) {
                 inject_rebuild(rt);
             }
         }
+        target @ (EditTarget::RuleExtension { .. }
+        | EditTarget::RuleExcludeExtension { .. }
+        | EditTarget::RulePattern { .. }) => {
+            let text = edit.lines.join("");
+            apply_rule_input(rt, target, &text);
+        }
     }
 }
 
-/// 提交当前编辑（单行 Enter）：重命名提交并关闭。
+/// 提交当前编辑（单行 Enter）：重命名/规则提交并关闭。
 pub(crate) fn commit_edit(rt: &mut Runtime) {
     let Some((target, text)) = rt.edit.as_ref().map(|e| (e.target, e.lines.join(""))) else {
         return;
     };
+    rt.edit = None;
     match target {
-        target @ (EditTarget::FenceTitle { .. } | EditTarget::Item { .. }) => {
-            // 重命名：Enter = 提交并关闭
+        EditTarget::FenceTitle { fence } => {
             let text = text.trim().to_string();
-            rt.edit = None;
-            match target {
-                EditTarget::FenceTitle { fence } => {
-                    if apply_rename(rt, EditTarget::FenceTitle { fence }, &text) {
-                        inject_rebuild(rt);
+            if apply_rename(rt, EditTarget::FenceTitle { fence }, &text) {
+                inject_rebuild(rt);
+            }
+        }
+        EditTarget::Item { fence, icon } => {
+            let text = text.trim().to_string();
+            if apply_rename(rt, EditTarget::Item { fence, icon }, &text) {
+                inject_rebuild(rt);
+            }
+        }
+        target @ (EditTarget::RuleExtension { .. }
+        | EditTarget::RuleExcludeExtension { .. }
+        | EditTarget::RulePattern { .. }) => {
+            apply_rule_input(rt, target, &text);
+        }
+    }
+}
+
+/// 解析扩展名输入（支持英文逗号、中文逗号、空格、分号分隔，自动去点并转小写）
+pub(crate) fn parse_extension_tokens(text: &str) -> Vec<String> {
+    text.split([',', '，', ' ', ';'])
+        .map(|s| s.trim().trim_start_matches('.').to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 解析通配符模式输入（支持英文逗号、中文逗号、分号分隔，保留大小写与空格）
+pub(crate) fn parse_pattern_tokens(text: &str) -> Vec<String> {
+    text.split([',', '，', ';'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 应用规则输入（回车或失焦提交）：解析并写入对应栅栏的规则字段。
+pub(crate) fn apply_rule_input(rt: &mut Runtime, target: EditTarget, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    match target {
+        EditTarget::RuleExtension { fence } => {
+            let tokens = parse_extension_tokens(text);
+            if !tokens.is_empty() {
+                if let Some(f) = rt.desk.fences.get_mut(fence) {
+                    let mut rule = f.rule.clone().unwrap_or_default();
+                    rule.enabled = true;
+                    for t in tokens {
+                        if !rule.custom_extensions.contains(&t) {
+                            rule.custom_extensions.push(t);
+                        }
                     }
-                }
-                EditTarget::Item { fence, icon } => {
-                    apply_rename(rt, EditTarget::Item { fence, icon }, &text)
-                        .then(|| inject_rebuild(rt));
+                    f.rule = Some(rule);
+                    let _ = rt.store.save(&rt.desk);
+                    inject_rebuild(rt);
                 }
             }
         }
+        EditTarget::RuleExcludeExtension { fence } => {
+            let tokens = parse_extension_tokens(text);
+            if !tokens.is_empty() {
+                if let Some(f) = rt.desk.fences.get_mut(fence) {
+                    let mut rule = f.rule.clone().unwrap_or_default();
+                    rule.enabled = true;
+                    for t in tokens {
+                        if !rule.exclude_extensions.contains(&t) {
+                            rule.exclude_extensions.push(t);
+                        }
+                    }
+                    f.rule = Some(rule);
+                    let _ = rt.store.save(&rt.desk);
+                    inject_rebuild(rt);
+                }
+            }
+        }
+        EditTarget::RulePattern { fence } => {
+            let tokens = parse_pattern_tokens(text);
+            if !tokens.is_empty() {
+                if let Some(f) = rt.desk.fences.get_mut(fence) {
+                    let mut rule = f.rule.clone().unwrap_or_default();
+                    rule.enabled = true;
+                    for t in tokens {
+                        if !rule.name_patterns.contains(&t) {
+                            rule.name_patterns.push(t);
+                        }
+                    }
+                    f.rule = Some(rule);
+                    let _ = rt.store.save(&rt.desk);
+                    inject_rebuild(rt);
+                }
+            }
+        }
+        _ => {}
     }
+}
+
+/// 打开规则输入框（弹出 D2D 内联编辑）。
+pub(crate) fn open_rule_input(
+    rt: &mut Runtime,
+    target: EditTarget,
+    rect: RectF,
+    placeholder: &str,
+) {
+    rt.edit = Some(InlineEdit {
+        target,
+        rect,
+        lines: vec![String::new()],
+        line: 0,
+        col: 0,
+        placeholder: placeholder.to_string(),
+        single_line: true,
+        focused: true,
+        composing: false,
+        comp: String::new(),
+        committing: false,
+    });
+    focus_overlay(rt);
+    position_ime_window(rt);
+    tracing::info!(target = ?target, "打开规则输入框（D2D 内联）");
 }
 
 /// 键盘事件 → 内联编辑（光标/退格/删除/方向/Home/End/回车/Esc/Ctrl+V 粘贴）。
@@ -471,6 +585,7 @@ pub(crate) fn start_inplace_rename(rt: &mut Runtime, target: EditTarget) {
             };
             (name, fence_title_rect(rt, fence))
         }
+        _ => return,
     };
     rt.edit = Some(InlineEdit {
         target,
@@ -514,6 +629,7 @@ pub(crate) fn apply_rename(rt: &mut Runtime, target: EditTarget, new_name: &str)
             true
         }
         EditTarget::Item { fence, icon } => commit_icon_rename(rt, fence, icon, new_name),
+        _ => false,
     }
 }
 
@@ -745,5 +861,35 @@ pub(crate) fn fence_title_rect(rt: &Runtime, fence: usize) -> RectF {
         y: f.bounds.y + pad,
         w: (f.bounds.w - 2.0 * pad).max(1.0),
         h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_extension_tokens() {
+        let text = " .pdf, JPG，  .PNG ; txt  ,, ";
+        let tokens = parse_extension_tokens(text);
+        assert_eq!(tokens, vec!["pdf", "jpg", "png", "txt"]);
+
+        // 测试空输入
+        assert!(parse_extension_tokens("   ").is_empty());
+        assert!(parse_extension_tokens(",，;;").is_empty());
+    }
+
+    #[test]
+    fn test_parse_pattern_tokens() {
+        let text = " report* ,  *2024* ， draft?.docx ; test space ";
+        let tokens = parse_pattern_tokens(text);
+        assert_eq!(
+            tokens,
+            vec!["report*", "*2024*", "draft?.docx", "test space"]
+        );
+
+        // 测试空输入
+        assert!(parse_pattern_tokens("   ").is_empty());
+        assert!(parse_pattern_tokens(",，;;").is_empty());
     }
 }

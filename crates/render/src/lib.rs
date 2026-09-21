@@ -42,7 +42,7 @@ pub use overlay::{
 };
 pub use scene::{
     ListColumns, Scene, SceneConsole, SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow,
-    SceneIcon,
+    SceneIcon, SceneRuleEditor,
 };
 pub use surface::{CompositionSurface, Frame};
 pub use theme::{Theme, GRID_CAPTION_H_MULT};

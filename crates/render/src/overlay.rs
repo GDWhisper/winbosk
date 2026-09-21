@@ -58,15 +58,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_DBLCLKS, GA_ROOT,
     GWLP_USERDATA, GW_HWNDPREV, HCURSOR, HICON, HTCLIENT, HTTRANSPARENT, HWND_TOP, ICON_BIG,
     ICON_SMALL, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG,
-    MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, PM_REMOVE, QS_ALLINPUT, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNA, SW_SHOWNOACTIVATE,
-    WM_CHAR, WM_CLOSE, WM_CTLCOLOREDIT, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES,
-    WM_ERASEBKGND, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETICON, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, PM_REMOVE, QS_ALLINPUT, SET_WINDOW_POS_FLAGS,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNA,
+    SW_SHOWNOACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_CTLCOLOREDIT, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
+    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_TIMER, WNDCLASSW,
+    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use winbosk_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
@@ -217,6 +217,8 @@ pub enum ConsoleZone {
     Tab(usize),
     /// 标题栏「切换桌面」按钮：栅栏 ⇄ 原始桌面。
     DesktopToggle,
+    /// 底部「开机自启」切换按钮。
+    AutostartToggle,
     /// 栅栏管理页：选中第 `index` 个栅栏显示详情控制。
     FenceSelect(usize),
     FenceLayout(FenceLayout),
@@ -239,6 +241,26 @@ pub enum ConsoleZone {
     FenceRulePreset(Option<CategoryPreset>),
     /// 栅栏管理页：「一键整理」按钮（按各栅栏规则自动收纳桌面图标）。
     AutoOrganize,
+    /// 控制中心：切换简化/高级模式。
+    ToggleAdvancedMode,
+    /// 规则总开关：开启/禁用当前栅栏规则。
+    RuleToggleEnabled,
+    /// 规则编辑：添加后缀白名单（弹出内联编辑）。
+    RuleAddExtension,
+    /// 规则编辑：删除第 idx 个后缀白名单。
+    RuleDeleteExtension(usize),
+    /// 规则编辑：添加排除后缀黑名单。
+    RuleAddExcludeExtension,
+    /// 规则编辑：删除第 idx 个排除后缀黑名单。
+    RuleDeleteExcludeExtension(usize),
+    /// 规则编辑：添加文件名通配符模式。
+    RuleAddPattern,
+    /// 规则编辑：删除第 idx 个文件名通配符模式。
+    RuleDeletePattern(usize),
+    /// 规则编辑：切换自动捕获新文件开关。
+    RuleToggleAutoCapture,
+    /// 规则编辑：针对当前栅栏立即应用规则重新整理。
+    RuleApplyFence,
 }
 
 /// 控制台（插件面板）的命中数据：整体矩形（窗口区域 + 命中判定范围）、
@@ -462,9 +484,9 @@ struct WindowState {
     last_cursor: Option<(f32, f32)>,
     /// 上次 SetWindowRgn 的区域句柄：区域几何未变时跳过 SetWindowRgn。
     ///
-    /// SetWindowRgn 会使窗口无效并触发整窗重绘/重合成（即使区域完全相同），
-    /// Dock 存在时光标移动每次都会 set_model 到这里——反复调用造成无谓 CPU 与
-    /// 边缘重绘抖动。区域句柄所有权归窗口（系统释放），此处仅保存引用用于 EqualRgn。
+    /// 即便 `bRedraw=false`，每次调用仍有区域对象创建/销毁与 DWM 形状通知开销；
+    /// Dock 存在时光标移动每次都会 set_model 到这里——反复调用造成无谓 CPU。
+    /// 区域句柄所有权归窗口（系统释放），此处仅保存引用用于 EqualRgn。
     last_region: Option<HRGN>,
     /// App 层事件处理器；返回新的命中模型以同步区域与命中数据。
     ///
@@ -474,6 +496,15 @@ struct WindowState {
     handler: Option<Box<dyn FnMut(OverlayEvent) -> Option<HitModel>>>,
     /// 编辑框（重命名/待办输入）背景画刷：`WM_CTLCOLOREDIT` 返回它让 EDIT 用深色底。
     edit_brush: HBRUSH,
+    /// create 时的父/owner 窗口（与 `OverlayWindow.owner` 同源、不可变）：wnd_proc 处理
+    /// `WM_MOUSELEAVE` 回落桌面带时需要它计算「owner 正上方」锚点，而 wnd_proc 拿不到
+    /// OverlayWindow 本体。
+    owner: HWND,
+    /// 控制中心会话是否激活（业务位，由 app 的 `set_console_open` 单一出口推送）。
+    ///
+    /// 会话激活期间光标离开窗口不回落桌面带（生命周期由开/关配对管理）；非会话期的
+    /// 点击唤起（点栅栏临时用一下）随光标离开表面而结束。
+    console_session: bool,
 }
 
 /// overlay 窗口。
@@ -496,6 +527,69 @@ pub struct OverlayWindow {
     state: *mut WindowState,
 }
 
+/// 「只动 Z 序」的 `SetWindowPos` flags：提权（`HWND_TOP`）与回落桌面带（锚点插入）共用。
+/// **绝不能加 `SWP_NOZORDER`**——它会忽略 `hWndInsertAfter`，两个方向的锚点都会失效
+/// （提权纹丝不动、回落落不进桌面带）。以内部 `u32` 聚合而非 `|` 运算符：windows-rs 的
+/// `BitOr` 不是 const fn，无法在 `const` 上下文调用（E0015），值与 `|` 写法完全一致。
+const SWP_ZORDER_ONLY: SET_WINDOW_POS_FLAGS = SET_WINDOW_POS_FLAGS(
+    SWP_NOMOVE.0 | SWP_NOSIZE.0 | SWP_NOACTIVATE.0 | SWP_NOREDRAW.0 | SWP_NOOWNERZORDER.0,
+);
+
+/// 把窗口提到普通 Z 序带顶部（用户前台会话的提权）。
+///
+/// overlay 以 WorkerW 为 owner 锚在桌面带，默认永远低于普通应用窗口；用户主动操作
+/// （唤出控制中心、点击栅栏/面板表面）时需要临时浮于其上（盖住浏览器等普通窗口，
+/// 仍低于真正的 TOPMOST 窗口）。
+///
+/// 必须经前台锁（AttachThreadInput）：本进程常驻后台，裸调 `SetWindowPos(HWND_TOP)`
+/// 会被系统静默拒绝（返回 TRUE 但 Z 序纹丝不动，已实测）——与 `raise_to_foreground`
+/// 同一套手法。只动 Z 序：`SWP_NOACTIVATE` 不激活——激活会把桌面壳层提到应用之上，
+/// 且系统不接受激活（键盘输入走隐藏焦点代理）；几何与 owner 层级一律不动。
+/// 已在顶部时为无害空操作（不缓存「已提权」标志：被其它程序盖住时标志必然失真）。
+fn raise_hwnd_to_normal_top(hwnd: HWND) {
+    with_foreground_lock(|| unsafe {
+        let _ = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, SWP_ZORDER_ONLY);
+    });
+}
+
+/// 把窗口插回 owner（WorkerW）**正上方**，落回桌面带（用户前台会话结束）。
+///
+/// 注意 `SetWindowPos` 的 `hWndInsertAfter` 语义是「被定位窗口插到该窗口**之下**」：
+/// 直接传 owner 会把窗口插到 WorkerW 之下、壁纸之后（栅栏整体不可见不可点，已实测），
+/// 因此锚点必须取「owner 当前正上方的窗口」——把窗口恰好放进 owner 之上刚空出的位置，
+/// 与壁纸/图标/其它 WorkerW 的相对次序无关。owner 可能是子窗口（`SHELLDLL_DefView`），
+/// 先 `GA_ROOT` 归一到顶层域再取其上一窗；owner 之上若无窗口（理论边界），跳过恢复
+/// 保持现状（留在普通带优于误落到壁纸之后）。已在桌面带时锚点即窗口自身，无害空操作。
+/// owner 若已销毁，所有权机制会连带销毁 owned 窗口，不存在悬空句柄的运行态；
+/// `SetWindowPos` 失败仅忽略（容错口径与 `resize` 一致）。
+fn restore_hwnd_desktop_band(hwnd: HWND, owner: HWND) {
+    unsafe {
+        let root = GetAncestor(owner, GA_ROOT);
+        let Ok(anchor) = GetWindow(root, GW_HWNDPREV) else {
+            return;
+        };
+        let _ = SetWindowPos(hwnd, Some(anchor), 0, 0, 0, 0, SWP_ZORDER_ONLY);
+    }
+}
+
+/// 在「本线程已挂到前台线程」的保护下执行 `f`（前台锁）。
+///
+/// 非前台进程的 `SetForegroundWindow` / `SetWindowPos(HWND_TOP)` 会被系统直接拒绝或
+/// 静默忽略。经典解法是把本线程暂时挂到当前前台线程，设完再解挂——无需真正激活
+/// overlay，桌面壳层仍保持在应用之下。
+fn with_foreground_lock(f: impl FnOnce()) {
+    unsafe {
+        let cur = GetCurrentThreadId();
+        let fg_hwnd = GetForegroundWindow();
+        let fg = GetWindowThreadProcessId(fg_hwnd, None);
+        let attached = cur != fg && fg != 0 && AttachThreadInput(cur, fg, true).0 != 0;
+        f();
+        if attached {
+            let _ = AttachThreadInput(cur, fg, false);
+        }
+    }
+}
+
 impl OverlayWindow {
     /// 让 overlay 获得键盘输入（前台交给隐藏代理，overlay 本体不被激活/提层）。
     pub fn focus_for_input(&self) {
@@ -516,56 +610,29 @@ impl OverlayWindow {
         });
     }
 
-    /// 控制中心唤出：把 overlay 从桌面带临时提升到普通 Z 序带顶部（`HWND_TOP`）。
+    /// 控制中心会话开始：把 overlay 从桌面带临时提升到普通 Z 序带顶部（`HWND_TOP`）。
     ///
-    /// overlay 以 WorkerW 为 owner 锚在桌面带，默认永远低于普通应用窗口；用户显式唤出
-    /// 控制中心时需要临时浮于其上（盖住浏览器等普通窗口，仍低于真正的 TOPMOST 窗口）。
-    /// 必须经 `with_foreground_lock`：WinBosk 是后台进程，直接 `SetWindowPos(HWND_TOP)`
-    /// 会被系统静默拒绝（返回 TRUE 但 Z 序纹丝不动，已实测）——与 `raise_to_foreground`
-    /// 同一套 AttachThreadInput 手法。只动 Z 序：`SWP_NOACTIVATE` 不激活——激活会把
-    /// 桌面壳层提到应用之上，且系统不接受激活（键盘输入走隐藏焦点代理）；几何与
-    /// owner 层级一律不动。收起时必须配对调用 `restore_desktop_band`。
+    /// 仅 app 的 `set_console_open` 单一出口调用；点击唤起走 wnd_proc 内的
+    /// `raise_hwnd_to_normal_top`（约束与实测依据见该函数注释）。收起时必须配对调用
+    /// `restore_desktop_band`。
     pub fn raise_console(&self) {
-        self.with_foreground_lock(|| unsafe {
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(HWND_TOP),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER,
-            );
-        });
+        raise_hwnd_to_normal_top(self.hwnd);
     }
 
-    /// 控制中心收起：把 overlay 插回 owner（WorkerW）**正上方**，落回桌面带。
+    /// 控制中心会话结束：把 overlay 插回 owner（WorkerW）**正上方**，落回桌面带。
     ///
-    /// 与 `raise_console` 配对，恢复「栅栏属于桌面」的原有层级。注意 `SetWindowPos`
-    /// 的 `hWndInsertAfter` 语义是「被定位窗口插到该窗口**之下**」：直接传 owner 会把
-    /// overlay 插到 WorkerW 之下、壁纸之后（栅栏整体不可见不可点，已实测），因此锚点
-    /// 必须取「owner 当前正上方的窗口」——把 overlay 恰好放进 owner 之上刚空出的位置，
-    /// 与壁纸/图标/其它 WorkerW 的相对次序无关。owner 可能是子窗口（`SHELLDLL_DefView`），
-    /// 先 `GA_ROOT` 归一到顶层域再取其上一窗；owner 之上若无窗口（理论边界），跳过恢复
-    /// 保持现状（留在普通带优于误落到壁纸之后）。owner 若已销毁，所有权机制会连带销毁
-    /// overlay，本方法不会有悬空句柄的运行态；`SetWindowPos` 失败仅忽略（容错口径与
-    /// `resize` 一致）。
+    /// 仅 app 的 `set_console_open` 单一出口调用；锚点语义与实测依据见
+    /// `restore_hwnd_desktop_band` 注释。
     pub fn restore_desktop_band(&self) {
-        unsafe {
-            let root = GetAncestor(self.owner, GA_ROOT);
-            let Ok(anchor) = GetWindow(root, GW_HWNDPREV) else {
-                return;
-            };
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(anchor),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOOWNERZORDER,
-            );
-        }
+        restore_hwnd_desktop_band(self.hwnd, self.owner);
+    }
+
+    /// 推送控制中心会话位（业务状态，仅 app 的 `set_console_open` 单一出口调用）。
+    ///
+    /// 会话激活期间 `WM_MOUSELEAVE` 不回落桌面带（生命周期由开/关配对管理）；
+    /// 非会话期的点击唤起随光标离开表面回落。
+    pub fn set_console_session(&self, active: bool) {
+        unsafe { (*self.state).console_session = active };
     }
 
     /// 弹出菜单要用的 owner 窗口（可激活的焦点代理），并已把它提到前台。
@@ -593,16 +660,7 @@ impl OverlayWindow {
     /// （`shell_menu`）要把自己的宿主窗口前置，否则 `TrackPopupMenu` 弹出的菜单
     /// 点击外部不会关闭。
     pub fn with_foreground_lock(&self, f: impl FnOnce()) {
-        unsafe {
-            let cur = GetCurrentThreadId();
-            let fg_hwnd = GetForegroundWindow();
-            let fg = GetWindowThreadProcessId(fg_hwnd, None);
-            let attached = cur != fg && fg != 0 && AttachThreadInput(cur, fg, true).0 != 0;
-            f();
-            if attached {
-                let _ = AttachThreadInput(cur, fg, false);
-            }
-        }
+        with_foreground_lock(f);
     }
 
     /// 在桌面壳层下创建覆盖整个虚拟屏幕的 overlay 窗口。
@@ -634,6 +692,8 @@ impl OverlayWindow {
             last_region: None,
             handler: None,
             edit_brush,
+            owner: parent,
+            console_session: false,
         });
         let state_ptr = Box::into_raw(state);
 
@@ -946,6 +1006,20 @@ unsafe extern "system" fn proxy_proc(
 /// `cached` 保存上次交给窗口的区域句柄（所有权在窗口）。区域几何与上次完全相同时
 /// 直接跳过 SetWindowRgn——该调用会让窗口失效、强制重绘/重合成，悬停/光标移动期间
 /// 区域几乎总是不变，反复调用只会增加 CPU 与重绘抖动（Dock 场景尤其明显）。
+///
+/// `bRedraw` **必须是 false**：本窗口是 `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition
+/// 视觉树（无 GDI 客户区、无 WM_PAINT 绘制），区域只服务命中穿透与 DWM 可视裁剪。
+/// 传 true 会走「整窗失效 → DWM 拆掉再重合成」路径：拖动时区域每帧都变（被拖栅栏
+/// 矩形在并集里），**全部栅栏**（不只被拖的那个）都会跟着闪一下，观感就是「刷新了一
+/// 遍」。内容更新已由 App 层 `present` + `RequestCommitAsync` 完成，这里不需要系统
+/// 再强制重绘。区域几何本身仍立即生效（命中与可视裁剪不依赖 bRedraw）。
+///
+/// 新暴露区域可见内容的正确性还依赖一条 App 层顺序不变量——**内容提交（present）
+/// 必须先于命中模型/区域更新**：首帧路径是 main.rs 先 `compositor.present` 再
+/// `overlay.set_model`；事件路径按「App 处理交互 → 重绘 → 返回新命中模型（overlay
+/// 据此更新区域）」的契约在 handle_event 内先重绘再返回模型。因此区域扩张瞬间，
+/// 新暴露区域依赖的内容已先行提交到 DWM；若未来颠倒该顺序，`bRedraw=false` 会露出
+/// 一帧陈旧内容（审查发现的时序风险，已由既有不变量静态关闭，此处落字为证）。
 fn apply_region(hwnd: HWND, model: &HitModel, cached: &mut Option<HRGN>) {
     let Some(rgn) = build_region(model) else {
         return;
@@ -959,7 +1033,7 @@ fn apply_region(hwnd: HWND, model: &HitModel, cached: &mut Option<HRGN>) {
             }
         }
     }
-    unsafe { SetWindowRgn(hwnd, Some(rgn), true) };
+    unsafe { SetWindowRgn(hwnd, Some(rgn), false) };
     *cached = Some(rgn);
 }
 
@@ -1123,7 +1197,15 @@ unsafe extern "system" fn wnd_proc(
             // 客户端坐标即虚拟屏幕坐标，可直接命中测试。
             let (mx, my) = client_point(lparam);
             match msg {
-                WM_LBUTTONDOWN => on_button_down(hwnd, state, mx, my),
+                WM_LBUTTONDOWN => {
+                    // 用户按下即唤起（用户前台会话）：消息能到达本窗口即说明点击落在
+                    // 窗口区域内（栅栏 ∪ 控制台 ∪ 占位框），属于对 Sylva 表面的主动
+                    // 操作——`WS_EX_NOACTIVATE` 使系统永远不会因点击激活/提层本窗口，
+                    // 必须在此重断言顶部（被其它程序盖住后点击露出部分是常态场景）。
+                    // 不缓存「已提权」标志，已在顶部时为无害空操作。
+                    raise_hwnd_to_normal_top(hwnd);
+                    on_button_down(hwnd, state, mx, my);
+                }
                 WM_LBUTTONUP => on_button_up(hwnd, state, mx, my),
                 WM_LBUTTONDBLCLK => on_double_click(hwnd, state, mx, my),
                 _ => unreachable!(),
@@ -1187,6 +1269,39 @@ unsafe extern "system" fn wnd_proc(
             on_mouse_move(hwnd, state, mx, my);
             LRESULT(0)
         }
+        WM_CAPTURECHANGED => {
+            // 捕获被外部夺走 = 拖拽会话被迫终止（正常松开走 WM_LBUTTONUP）。不清掉的
+            // 话 state.drag 残留，会把随后迟到的 WM_MOUSELEAVE（ReleaseCapture 后约
+            // 31ms 才到）拦在 drag 门控上——点击唤起的提权就会滞留在普通带顶部。清掉
+            // 之后迟到的 leave 恢复生效，回落桌面带。布局持久化仍以真实 WM_LBUTTONUP
+            // 为准，此处只回收渲染层拖拽状态（孤儿状态回收）。
+            //
+            // 悬停旁路镜像必须与 App 层同批清除（旁路数据对齐）：下面的事件会把 App 层
+            // 的 `rt.cursor` / `rt.hover` / `rt.console_hover` 清掉，但渲染层镜像若不清，
+            // capture 被夺而光标仍停在图标上时，后续 WM_MOUSEMOVE 不会重发 HoverEnter
+            // （渲染层以为悬停从未离开）——悬停高亮 / Dock 放大滞留失效态，直到光标
+            // 离开再进入。重复的 HoverLeave / ConsoleHover 事件是幂等的，App 层以覆盖
+            // 写处理。此处刻意**不**回联 `restore_hwnd_desktop_band`：桌面带回落由拖拽
+            // 结束后迟到的 WM_MOUSELEAVE 承担（光标可能仍在表面，保持提权，移开即回落），
+            // 届时本分支已清 drag，leave 分支的 `drag.is_none()` 门控能放行。
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if ptr.is_null() {
+                return LRESULT(0);
+            }
+            let state = unsafe { &mut *ptr };
+            if state.drag.take().is_some() {
+                // 镜像 WM_MOUSELEAVE 的悬停清理（语义逐行一致，理由见该分支注释）。
+                state.hovered = None;
+                state.last_cursor = None;
+                if state.console_hovered.is_some() {
+                    state.console_hovered = None;
+                    emit_event(hwnd, state, OverlayEvent::ConsoleHover { zone: None });
+                }
+                emit_event(hwnd, state, OverlayEvent::HoverLeave);
+                emit_event(hwnd, state, OverlayEvent::CursorLeave);
+            }
+            LRESULT(0)
+        }
         WM_MOUSELEAVE => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if ptr.is_null() {
@@ -1206,6 +1321,14 @@ unsafe extern "system" fn wnd_proc(
             }
             emit_event(hwnd, state, OverlayEvent::HoverLeave);
             emit_event(hwnd, state, OverlayEvent::CursorLeave);
+            // 「前台会话」随光标离开表面而结束：点击唤起的提权（见 WM_LBUTTONDOWN /
+            // WM_RBUTTONDOWN 处注释）在光标移回其它窗口时回落桌面带。控制中心会话
+            // 不受此影响——生命周期由 app 的 `set_console_open` 开/关配对管理
+            // （`console_session` 位）；拖拽进行中也不回落（capture 期间光标可能瞬时
+            // 划出区域，中途回落会让拖拽物掉到其它窗口后面）。已在桌面带时为无害空操作。
+            if !state.console_session && state.drag.is_none() {
+                restore_hwnd_desktop_band(hwnd, state.owner);
+            }
             LRESULT(0)
         }
         WM_RBUTTONDOWN => {
@@ -1215,6 +1338,9 @@ unsafe extern "system" fn wnd_proc(
             }
             let state = unsafe { &mut *ptr };
             let (mx, my) = client_point(lparam);
+            // 右键同样属于对表面的主动操作：先唤起再弹菜单（见 WM_LBUTTONDOWN 处注释），
+            // 否则 Shell 菜单弹出在 Sylva 之下、点外部还可能被系统以前台化为由拒绝关闭。
+            raise_hwnd_to_normal_top(hwnd);
             // 命中：控制台 → 图标 → 栅栏；未命中任何交互目标时吞掉。
             if let Some(c) = &state.model.console {
                 if c.rect.contains(mx, my) {
@@ -2658,6 +2784,7 @@ mod tests {
             ConsoleZone::AutoOrganize,
             // 纯状态翻转，但每次翻转都伴随图标层 ShowWindow 与整屏淡入淡出，会闪
             ConsoleZone::DesktopToggle,
+            ConsoleZone::AutostartToggle,
             // 目前不会被 zones.push 的死控件：默认 fail-safe 拒绝
             ConsoleZone::Expand,
             ConsoleZone::Tab(1),

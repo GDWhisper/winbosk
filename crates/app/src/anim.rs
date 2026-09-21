@@ -112,19 +112,30 @@ pub(crate) fn tween_progress(t0: Instant, dur: f32, now: Instant) -> Option<f32>
     }
 }
 
+/// 栅栏平滑滚动阻尼补间。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScrollTween {
+    pub(crate) fence: usize,
+    pub(crate) from: f32,
+    pub(crate) to: f32,
+    pub(crate) t0: Instant,
+    pub(crate) dur: f32,
+}
+
 /// 启用动画定时器（overlay 每 16ms 触发一次 `AnimTick`）。
 pub(crate) fn arm_anim_timer(rt: &mut Runtime) {
     if !rt.console_anim.active()
         && rt.desktop_fade.is_none()
         && rt.fence_tweens.is_empty()
         && !icon_hover_active(rt)
+        && rt.scroll_tweens.is_empty()
     {
         return;
     }
     unsafe { (*rt.overlay_ptr).set_anim_active(true) };
 }
 
-/// 推进一帧动画：面板补间 + 栅栏补间 + 图标悬停。
+/// 推进一帧动画：面板补间 + 栅栏补间 + 图标悬停 + 滚轮平滑滚动。
 /// 返回是否仍有动画在推进（否则调用方停用定时器）。
 pub(crate) fn advance_anim(rt: &mut Runtime) -> bool {
     let now = Instant::now();
@@ -154,10 +165,33 @@ pub(crate) fn advance_anim(rt: &mut Runtime) -> bool {
             }
         }
     }
+    // 栅栏平滑滚动阻尼推进
+    let mut scroll_finished = false;
+    rt.scroll_tweens.retain_mut(|st| {
+        if let Some(p) = tween_progress(st.t0, st.dur, now) {
+            let cur = st.from + (st.to - st.from) * ease_out_cubic(p);
+            if let Some(f) = rt.desk.fences.get_mut(st.fence) {
+                f.scroll = cur;
+            }
+            true
+        } else {
+            if let Some(f) = rt.desk.fences.get_mut(st.fence) {
+                f.scroll = st.to;
+            }
+            scroll_finished = true;
+            false
+        }
+    });
+    // 滚动动画结束时一次性防抖持久化
+    if scroll_finished {
+        let _ = rt.store.save(&rt.desk);
+    }
+
     anim.active()
         || rt.desktop_fade.is_some()
         || !rt.fence_tweens.is_empty()
         || icon_hover_active(rt)
+        || !rt.scroll_tweens.is_empty()
 }
 
 /// 开始面板展开/折叠补间（`to` 目标进度）。目标立即生效于命中模型，

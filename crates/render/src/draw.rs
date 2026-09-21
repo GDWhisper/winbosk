@@ -35,9 +35,9 @@ use winbosk_shell::icons::IconData;
 use crate::overlay::{ConsoleZone, RectF};
 use crate::scene::{
     ListColumns, Scene, SceneConsole, SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow,
-    SceneReserved,
+    SceneReserved, SceneRuleEditor,
 };
-use crate::theme::{TextStyle, Theme, GRID_CAPTION_H_MULT};
+use crate::theme::{detail_style, TextStyle, Theme, GRID_CAPTION_H_MULT};
 
 /// 图标位图缓存：`bitmap_id` → 设备上的 D2D 位图。
 ///
@@ -92,14 +92,21 @@ impl Default for IconStore {
 /// 跨帧缓存的 DWrite 文本格式（设备无关，可安全缓存）。
 pub struct TextFormats {
     pub title: IDWriteTextFormat,
-    /// 粗体标题（控制中心顶部「WinBosk」）。
-    pub title_bold: IDWriteTextFormat,
+    /// 控制中心顶部「WinBosk」粗体标题（控制中心专用字号，见 `Theme::console_title`）。
+    pub console_title_bold: IDWriteTextFormat,
+    /// 控制中心关闭按钮「✕」的文本格式（样式取自 `Theme::console_title`，与粗体标题同字号）。
+    pub console_close: IDWriteTextFormat,
     pub label: IDWriteTextFormat,
+    /// 控制中心正文（栅栏行 / 详情标题 / 分段按钮文字），比桌面 `label` 大两号。
+    pub console_label: IDWriteTextFormat,
     /// 就地编辑框文字：同 `label` 字号，但段落垂直居中——编辑框内字形上下留白均匀，
     /// 高 DPI 下也不会贴着框顶被裁。
     pub edit: IDWriteTextFormat,
-    /// 待办副行（详细信息）用小一号字号。
+    /// 桌面就地编辑占位符用小一号字号。
     pub detail: IDWriteTextFormat,
+    /// 控制中心 detail 级小字（行标签 / 文件位置 / 路径）：`DETAIL_SIZE_RATIO` ×
+    /// `console_label`，与桌面 `detail` 同比例但基准更大。
+    pub console_detail: IDWriteTextFormat,
     /// 自持一份 DirectWrite 工厂：凡是要**贴着字形**的绘制（下划线、高亮底）都必须**实测**
     /// 宽度，而实测要 `CreateTextLayout`、它又需要工厂。工厂由渲染设备持有、布局层拿不到，
     /// 所以"画的人"自己留一份。克隆 `IDWriteFactory` 只是加一次 COM 引用，开销可忽略。
@@ -109,33 +116,46 @@ pub struct TextFormats {
 impl TextFormats {
     pub fn new(dwrite: &IDWriteFactory, theme: &Theme) -> Result<Self> {
         let title = make_text_format(dwrite, theme.title, DWRITE_FONT_WEIGHT_NORMAL)?;
-        let title_bold = make_text_format(dwrite, theme.title, DWRITE_FONT_WEIGHT_BOLD)?;
+        let console_title_bold =
+            make_text_format(dwrite, theme.console_title, DWRITE_FONT_WEIGHT_BOLD)?;
+        let console_close =
+            make_text_format(dwrite, theme.console_title, DWRITE_FONT_WEIGHT_NORMAL)?;
         tracing::debug!("TextFormats: 标题格式就绪");
         let label = make_text_format(dwrite, theme.label, DWRITE_FONT_WEIGHT_NORMAL)?;
         tracing::debug!("TextFormats: 标签格式就绪");
+        // 控制中心正文格式：独立字号（比桌面 label 大两号）。
+        let console_label =
+            make_text_format(dwrite, theme.console_label, DWRITE_FONT_WEIGHT_NORMAL)?;
         // 编辑框文字格式 = 标签字号 + 垂直居中（就地重命名用）。
         let edit = make_text_format(dwrite, theme.label, DWRITE_FONT_WEIGHT_NORMAL)?;
         unsafe {
             edit.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
         }
-        let detail_style = crate::theme::TextStyle {
-            font_family: theme.label.font_family,
-            size: theme.label.size * 0.72,
-            color: theme.label.color,
-        };
-        let detail = make_text_format(dwrite, detail_style, DWRITE_FONT_WEIGHT_NORMAL)?;
+        let detail = make_text_format(
+            dwrite,
+            detail_style(&theme.label),
+            DWRITE_FONT_WEIGHT_NORMAL,
+        )?;
+        let console_detail = make_text_format(
+            dwrite,
+            detail_style(&theme.console_label),
+            DWRITE_FONT_WEIGHT_NORMAL,
+        )?;
         tracing::debug!("TextFormats: 副行格式就绪");
         Ok(Self {
             title,
-            title_bold,
+            console_title_bold,
+            console_close,
             label,
+            console_label,
             edit,
             detail,
+            console_detail,
             dwrite: dwrite.clone(),
         })
     }
 
-    /// 用 DirectWrite **实测**一段 `detail` 字号文字的真实 `(宽, 高)`（DIP）。
+    /// 用 DirectWrite **实测**一段 `console_detail` 字号文字的真实 `(宽, 高)`（DIP）。
     ///
     /// 布局宽度出自 `winbosk_core::text::estimate_width`，它是**刻意保守**的估算：ASCII 按
     /// 0.62 em，而 Microsoft YaHei UI 的 ASCII 实测约 0.5 em——偏大 25%~33%
@@ -147,7 +167,7 @@ impl TextFormats {
     ///   默认面板宽下会让下划线戳出一整段空白（实测约 49·s），看着像画错了。
     ///
     /// 返回 `None` = 实测失败；调用方**必须退回估算值照常画**，不能因为量不出来就不画。
-    pub fn measure_detail(&self, text: &str) -> Option<(f32, f32)> {
+    pub fn measure_console_detail(&self, text: &str) -> Option<(f32, f32)> {
         if text.is_empty() {
             return Some((0.0, 0.0));
         }
@@ -155,7 +175,7 @@ impl TextFormats {
         // 1e6 而不是 f32::MAX：给一个有限但足够大的约束，避免任何实现把 MAX 当异常值。
         let layout = unsafe {
             self.dwrite
-                .CreateTextLayout(&utf16, &self.detail, 1.0e6, 1.0e6)
+                .CreateTextLayout(&utf16, &self.console_detail, 1.0e6, 1.0e6)
                 .ok()?
         };
         let mut m = DWRITE_TEXT_METRICS::default();
@@ -367,19 +387,19 @@ fn draw_console_content(
     let title_h = c.title_h.max(34.0 * s);
     let title_lr = D2D_RECT_F {
         left: c.x,
-        top: c.y + (title_h - theme.title.size * 1.6) / 2.0,
+        top: c.y + (title_h - theme.console_title.size * 1.6) / 2.0,
         right: c.x + c.width,
         bottom: c.y + title_h,
     };
     draw_text_centered(
         target,
         "WinBosk",
-        &formats.title_bold,
+        &formats.console_title_bold,
         title_lr,
         &brushes.title,
     );
 
-    // 标题栏：关闭按钮「✕」+「切换桌面」按钮
+    // 标题栏：关闭按钮「✕」
     let close_hover = matches!(c.hover_zone, Some(ConsoleZone::Close));
     if close_hover {
         let hov = D2D1_ROUNDED_RECT {
@@ -396,19 +416,62 @@ fn draw_console_content(
             unsafe { target.CreateSolidColorBrush(&color([0.85, 0.28, 0.28, 0.30 * a]), None)? };
         unsafe { target.FillRoundedRectangle(&hov, &hov_bg) };
     }
-    let xw = text_estimate_width("✕", theme.title.size);
+    let xw = text_estimate_width("✕", theme.console_title.size);
     let close_lr = D2D_RECT_F {
         left: c.close.x + (c.close.w - xw) / 2.0,
-        top: c.close.y + (c.close.h - theme.title.size * 1.6) / 2.0,
+        top: c.close.y + (c.close.h - theme.console_title.size * 1.6) / 2.0,
         right: c.close.x + c.close.w,
         bottom: c.close.y + c.close.h,
     };
     let close_brush =
         unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.62 * a]), None)? };
-    draw_text(target, "✕", &formats.title, close_lr, &close_brush);
+    draw_text(target, "✕", &formats.console_close, close_lr, &close_brush);
 
-    // 栅栏管理页（单页，无标签栏）
+    // 标题栏：模式切换按钮（简化 / 高级）
+    if c.mode_toggle.w > 0.0 {
+        let mode_hover = matches!(c.hover_zone, Some(ConsoleZone::ToggleAdvancedMode));
+        let mode_label = if c.advanced {
+            "⤡ 简化"
+        } else {
+            "⤢ 高级"
+        };
+        draw_segmented_button(
+            target,
+            theme,
+            c.mode_toggle,
+            mode_label,
+            c.advanced,
+            mode_hover,
+            formats,
+            accent,
+        );
+    }
+
+    // 栅栏管理页（左栏）
     draw_fences_page(target, theme, c, formats, a, accent)?;
+
+    // 高级模式：右栏工作台
+    if c.advanced {
+        let div_x = if let Some(re) = &c.rule_editor {
+            re.rect.x
+        } else {
+            c.x + c.width / 2.0
+        };
+        let div_brush =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.12 * a]), None)? };
+        let div_rect = D2D_RECT_F {
+            left: div_x,
+            top: c.y + title_h + 8.0 * s,
+            right: div_x + 1.0,
+            bottom: c.y + c.height - 12.0 * s,
+        };
+        unsafe { target.FillRectangle(&div_rect, &div_brush) };
+
+        if let Some(re) = &c.rule_editor {
+            draw_rule_editor(target, theme, c, re, formats, a, accent)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -465,13 +528,13 @@ fn draw_fence_rows(
         }
         let lr = D2D_RECT_F {
             left: r.rect.x + 12.0 * s,
-            top: r.rect.y + (r.rect.h - theme.label.size * 1.6) / 2.0,
+            top: r.rect.y + (r.rect.h - theme.console_label.size * 1.6) / 2.0,
             right: r.rect.x + r.rect.w - 30.0 * s,
             bottom: r.rect.y + r.rect.h,
         };
         let txt =
             unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.90 * full_t]), None)? };
-        draw_text_centered(target, &r.title, &formats.label, lr, &txt);
+        draw_text_centered(target, &r.title, &formats.console_label, lr, &txt);
     }
     Ok(())
 }
@@ -554,7 +617,7 @@ fn draw_fences_page(
             accent
         },
     );
-    // 「恢复桌面 / 回到栅栏」按钮（删除栅栏下方）
+    // 「恢复桌面 / 回到栅栏」按钮（删除栅栏下方，左半）
     let toggle_hover = matches!(c.hover_zone, Some(ConsoleZone::DesktopToggle));
     let toggle_label = if c.desktop_mode {
         "回到栅栏"
@@ -571,7 +634,384 @@ fn draw_fences_page(
         formats,
         accent,
     );
+    // 「开机自启」按钮（删除栅栏下方，右半）
+    let autostart_hover = matches!(c.hover_zone, Some(ConsoleZone::AutostartToggle));
+    let autostart_label = if c.autostart {
+        "开机自启：开"
+    } else {
+        "开机自启：关"
+    };
+    draw_segmented_button(
+        target,
+        theme,
+        c.autostart_toggle,
+        autostart_label,
+        c.autostart,
+        autostart_hover,
+        formats,
+        accent,
+    );
     Ok(())
+}
+
+/// 栅栏高级规则编辑器工作台（高级模式右栏）。
+#[allow(clippy::too_many_arguments)]
+fn draw_rule_editor(
+    target: &ID2D1RenderTarget,
+    theme: &Theme,
+    c: &SceneConsole,
+    re: &SceneRuleEditor,
+    formats: &TextFormats,
+    full_t: f32,
+    accent: [f32; 4],
+) -> Result<()> {
+    let s = theme.scale;
+    let label_font = theme.console_label.size;
+
+    // 1. 标题与总开关
+    let header_lr = D2D_RECT_F {
+        left: re.rect.x + 12.0 * s,
+        top: re.toggle_btn.y + (re.toggle_btn.h - label_font * 1.6) / 2.0,
+        right: re.toggle_btn.x - 8.0 * s,
+        bottom: re.toggle_btn.y + re.toggle_btn.h,
+    };
+    let title_text = format!("【{}】规则接管", re.fence_title);
+    let title_b =
+        unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.88 * full_t]), None)? };
+    draw_text(
+        target,
+        &title_text,
+        &formats.console_label,
+        header_lr,
+        &title_b,
+    );
+
+    let toggle_hover = matches!(c.hover_zone, Some(ConsoleZone::RuleToggleEnabled));
+    let toggle_label = if re.rule_enabled {
+        "规则：已开启"
+    } else {
+        "规则：已停用"
+    };
+    draw_segmented_button(
+        target,
+        theme,
+        re.toggle_btn,
+        toggle_label,
+        re.rule_enabled,
+        toggle_hover,
+        formats,
+        accent,
+    );
+
+    // 2. 预设分类快速选用
+    for (preset, rect, is_sel) in &re.preset_chips {
+        let hover = matches!(c.hover_zone, Some(ConsoleZone::FenceRulePreset(p)) if p == *preset);
+        let label = match preset {
+            None => "全部",
+            Some(winbosk_core::model::CategoryPreset::Apps) => "应用",
+            Some(winbosk_core::model::CategoryPreset::Documents) => "文档",
+            Some(winbosk_core::model::CategoryPreset::Media) => "媒体",
+            Some(winbosk_core::model::CategoryPreset::Archives) => "压缩",
+            Some(winbosk_core::model::CategoryPreset::Folders) => "目录",
+        };
+        draw_segmented_button(target, theme, *rect, label, *is_sel, hover, formats, accent);
+    }
+
+    // 小标笔刷
+    let sec_label_b =
+        unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.50 * full_t]), None)? };
+
+    // 3. 后缀白名单
+    if let Some((_, first_chip, _)) = re.ext_chips.first() {
+        let slr = D2D_RECT_F {
+            left: re.rect.x + 12.0 * s,
+            top: first_chip.y - 14.0 * s,
+            right: re.rect.x + re.rect.w - 12.0 * s,
+            bottom: first_chip.y,
+        };
+        draw_text(
+            target,
+            "包含后缀（符合即收纳）：",
+            &formats.console_detail,
+            slr,
+            &sec_label_b,
+        );
+    } else {
+        let slr = D2D_RECT_F {
+            left: re.rect.x + 12.0 * s,
+            top: re.add_ext_btn.y - 14.0 * s,
+            right: re.rect.x + re.rect.w - 12.0 * s,
+            bottom: re.add_ext_btn.y,
+        };
+        draw_text(
+            target,
+            "包含后缀（符合即收纳）：",
+            &formats.console_detail,
+            slr,
+            &sec_label_b,
+        );
+    }
+    for (i, (ext, chip_r, del_r)) in re.ext_chips.iter().enumerate() {
+        let del_hover =
+            matches!(c.hover_zone, Some(ConsoleZone::RuleDeleteExtension(idx)) if idx == i);
+        draw_rule_chip(
+            target, theme, *chip_r, *del_r, ext, del_hover, formats, accent,
+        );
+    }
+    let add_ext_hover = matches!(c.hover_zone, Some(ConsoleZone::RuleAddExtension));
+    draw_segmented_button(
+        target,
+        theme,
+        re.add_ext_btn,
+        "＋ 添加后缀",
+        false,
+        add_ext_hover,
+        formats,
+        accent,
+    );
+
+    // 4. 排除黑名单
+    if let Some((_, first_chip, _)) = re.exclude_chips.first() {
+        let slr = D2D_RECT_F {
+            left: re.rect.x + 12.0 * s,
+            top: first_chip.y - 14.0 * s,
+            right: re.rect.x + re.rect.w - 12.0 * s,
+            bottom: first_chip.y,
+        };
+        draw_text(
+            target,
+            "排除后缀（黑名单优先拒绝）：",
+            &formats.console_detail,
+            slr,
+            &sec_label_b,
+        );
+    } else {
+        let slr = D2D_RECT_F {
+            left: re.rect.x + 12.0 * s,
+            top: re.add_exclude_btn.y - 14.0 * s,
+            right: re.rect.x + re.rect.w - 12.0 * s,
+            bottom: re.add_exclude_btn.y,
+        };
+        draw_text(
+            target,
+            "排除后缀（黑名单优先拒绝）：",
+            &formats.console_detail,
+            slr,
+            &sec_label_b,
+        );
+    }
+    for (i, (ext, chip_r, del_r)) in re.exclude_chips.iter().enumerate() {
+        let del_hover =
+            matches!(c.hover_zone, Some(ConsoleZone::RuleDeleteExcludeExtension(idx)) if idx == i);
+        draw_rule_chip(
+            target,
+            theme,
+            *chip_r,
+            *del_r,
+            ext,
+            del_hover,
+            formats,
+            [0.85, 0.35, 0.35, 0.9],
+        );
+    }
+    let add_ex_hover = matches!(c.hover_zone, Some(ConsoleZone::RuleAddExcludeExtension));
+    draw_segmented_button(
+        target,
+        theme,
+        re.add_exclude_btn,
+        "＋ 排除后缀",
+        false,
+        add_ex_hover,
+        formats,
+        accent,
+    );
+
+    // 5. 通配符模式
+    if let Some((_, first_chip, _)) = re.pattern_chips.first() {
+        let slr = D2D_RECT_F {
+            left: re.rect.x + 12.0 * s,
+            top: first_chip.y - 14.0 * s,
+            right: re.rect.x + re.rect.w - 12.0 * s,
+            bottom: first_chip.y,
+        };
+        draw_text(
+            target,
+            "文件名通配符（支持 * 与 ?）：",
+            &formats.console_detail,
+            slr,
+            &sec_label_b,
+        );
+    } else {
+        let slr = D2D_RECT_F {
+            left: re.rect.x + 12.0 * s,
+            top: re.add_pattern_btn.y - 14.0 * s,
+            right: re.rect.x + re.rect.w - 12.0 * s,
+            bottom: re.add_pattern_btn.y,
+        };
+        draw_text(
+            target,
+            "文件名通配符（支持 * 与 ?）：",
+            &formats.console_detail,
+            slr,
+            &sec_label_b,
+        );
+    }
+    for (i, (pat, chip_r, del_r)) in re.pattern_chips.iter().enumerate() {
+        let del_hover =
+            matches!(c.hover_zone, Some(ConsoleZone::RuleDeletePattern(idx)) if idx == i);
+        draw_rule_chip(
+            target,
+            theme,
+            *chip_r,
+            *del_r,
+            pat,
+            del_hover,
+            formats,
+            [0.30, 0.70, 0.60, 0.9],
+        );
+    }
+    let add_pat_hover = matches!(c.hover_zone, Some(ConsoleZone::RuleAddPattern));
+    draw_segmented_button(
+        target,
+        theme,
+        re.add_pattern_btn,
+        "＋ 添加通配符",
+        false,
+        add_pat_hover,
+        formats,
+        accent,
+    );
+
+    // 6. 自动捕获
+    let auto_hover = matches!(c.hover_zone, Some(ConsoleZone::RuleToggleAutoCapture));
+    let auto_label = if re.auto_capture_val {
+        "新文件自动捕获：开启"
+    } else {
+        "新文件自动捕获：关闭"
+    };
+    draw_segmented_button(
+        target,
+        theme,
+        re.auto_capture_toggle,
+        auto_label,
+        re.auto_capture_val,
+        auto_hover,
+        formats,
+        accent,
+    );
+
+    // 7. 立即整理按钮
+    let apply_hover = matches!(c.hover_zone, Some(ConsoleZone::RuleApplyFence));
+    draw_segmented_button(
+        target,
+        theme,
+        re.apply_btn,
+        "⚡ 立即按规则整理当前栅栏",
+        false,
+        apply_hover,
+        formats,
+        accent,
+    );
+
+    // 8. 提示卡片
+    draw_rule_tip_card(target, theme, re.tip_rect, formats);
+
+    Ok(())
+}
+
+/// 规则标签芯片（文字 + 删除「×」按钮）
+#[allow(clippy::too_many_arguments)]
+fn draw_rule_chip(
+    target: &ID2D1RenderTarget,
+    theme: &Theme,
+    rect: RectF,
+    del_btn: RectF,
+    text: &str,
+    is_del_hover: bool,
+    formats: &TextFormats,
+    accent: [f32; 4],
+) {
+    let s = theme.scale;
+    let rr = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: rect.x,
+            top: rect.y,
+            right: rect.x + rect.w,
+            bottom: rect.y + rect.h,
+        },
+        radiusX: 4.0 * s,
+        radiusY: 4.0 * s,
+    };
+    let fill = [accent[0], accent[1], accent[2], 0.20];
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(fill), None) } {
+        unsafe { target.FillRoundedRectangle(&rr, &b) };
+    }
+    let stroke = [accent[0], accent[1], accent[2], 0.50];
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(stroke), None) } {
+        unsafe { target.DrawRoundedRectangle(&rr, &b, 1.0, None) };
+    }
+    let font_size = theme.console_label.size * crate::theme::DETAIL_SIZE_RATIO;
+    let text_lr = D2D_RECT_F {
+        left: rect.x + 6.0 * s,
+        top: rect.y + (rect.h - font_size * 1.6) / 2.0,
+        right: del_btn.x,
+        bottom: rect.y + rect.h,
+    };
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.9]), None) } {
+        draw_text(target, text, &formats.console_detail, text_lr, &b);
+    }
+    let del_color = if is_del_hover {
+        [0.95, 0.35, 0.35, 0.95]
+    } else {
+        [1.0, 1.0, 1.0, 0.55]
+    };
+    let del_lr = D2D_RECT_F {
+        left: del_btn.x,
+        top: del_btn.y + (del_btn.h - font_size * 1.6) / 2.0,
+        right: del_btn.x + del_btn.w,
+        bottom: del_btn.y + del_btn.h,
+    };
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(del_color), None) } {
+        draw_text_centered(target, "×", &formats.console_detail, del_lr, &b);
+    }
+}
+
+/// 规则提示卡片（给足使用提示，避免用户茫然）
+fn draw_rule_tip_card(
+    target: &ID2D1RenderTarget,
+    theme: &Theme,
+    rect: RectF,
+    formats: &TextFormats,
+) {
+    let s = theme.scale;
+    let rr = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: rect.x,
+            top: rect.y,
+            right: rect.x + rect.w,
+            bottom: rect.y + rect.h,
+        },
+        radiusX: 7.0 * s,
+        radiusY: 7.0 * s,
+    };
+    let fill = [0.12, 0.17, 0.25, 0.50];
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(fill), None) } {
+        unsafe { target.FillRoundedRectangle(&rr, &b) };
+    }
+    let stroke = [0.25, 0.45, 0.85, 0.35];
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(stroke), None) } {
+        unsafe { target.DrawRoundedRectangle(&rr, &b, 1.0, None) };
+    }
+    let lr = D2D_RECT_F {
+        left: rect.x + 8.0 * s,
+        top: rect.y + 6.0 * s,
+        right: rect.x + rect.w - 8.0 * s,
+        bottom: rect.y + rect.h - 6.0 * s,
+    };
+    let text = "💡 规则配置说明：\n• 后缀白名单：如 png, docx（可用逗号或空格分隔）\n• 排除黑名单：优先排除指定扩展名（如 tmp, bak）\n• 通配符模式：* 匹配任意字符，? 匹配单字符（如 log*）\n• 自动捕获：桌面新增匹配文件时将自动移入此栅栏";
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color([0.82, 0.88, 0.95, 0.85]), None) } {
+        draw_text(target, text, &formats.console_detail, lr, &b);
+    }
 }
 
 /// 栅栏详情控制区：布局 / 图标大小 / 背景风格 分段按钮 + 色调色板。
@@ -594,7 +1034,7 @@ fn draw_fence_detail(
     };
     let title =
         unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.75 * full_t]), None)? };
-    draw_text(target, &d.title, &formats.label, label_lr, &title);
+    draw_text(target, &d.title, &formats.console_label, label_lr, &title);
 
     let label_x = d.rect.x + 2.0 * s;
     let label_w = 40.0 * s;
@@ -610,7 +1050,7 @@ fn draw_fence_detail(
             right: label_x + label_w,
             bottom: r0.y + 24.0 * s,
         };
-        draw_text(target, "布局", &formats.detail, lr, &label_brush);
+        draw_text(target, "布局", &formats.console_detail, lr, &label_brush);
     }
     draw_segmented_button(
         target,
@@ -660,7 +1100,7 @@ fn draw_fence_detail(
             right: label_x + label_w,
             bottom: d.size_s.y + 24.0 * s,
         };
-        draw_text(target, "大小", &formats.detail, lr2, &label_brush);
+        draw_text(target, "大小", &formats.console_detail, lr2, &label_brush);
         for (rect, val, label) in [
             (d.size_s, 32.0, "小"),
             (d.size_m, 48.0, "中"),
@@ -688,7 +1128,7 @@ fn draw_fence_detail(
             right: label_x + label_w,
             bottom: r2.y + 24.0 * s,
         };
-        draw_text(target, "风格", &formats.detail, lr3, &label_brush);
+        draw_text(target, "风格", &formats.console_detail, lr3, &label_brush);
     }
     draw_segmented_button(
         target,
@@ -751,7 +1191,7 @@ fn draw_fence_detail(
             right: label_x + label_w,
             bottom: d.tint_default.y + 22.0 * s,
         };
-        draw_text(target, "色调", &formats.detail, lr4, &label_brush);
+        draw_text(target, "色调", &formats.console_detail, lr4, &label_brush);
         draw_tint_swatch(
             target,
             theme,
@@ -789,7 +1229,13 @@ fn draw_fence_detail(
             right: label_x + label_w,
             bottom: vr.y + 24.0 * s,
         };
-        draw_text(target, "文件位置", &formats.detail, lr5, &label_brush);
+        draw_text(
+            target,
+            "文件位置",
+            &formats.console_detail,
+            lr5,
+            &label_brush,
+        );
     }
     // 值行：状态标签 + 路径。**值行零按钮**：路径本身就是「打开」的热区
     // （见 `SceneFenceDetail::storage_path_hit`），hover 时提亮 + 加下划线把"可点"画出来。
@@ -821,19 +1267,19 @@ fn draw_fence_detail(
         draw_text(
             target,
             &d.storage_path_text,
-            &formats.detail,
+            &formats.console_detail,
             tr,
             &path_brush,
         );
-        // 下划线：宽度与位置都按**实测**字形来（见 `TextFormats::measure_detail`）。
+        // 下划线：宽度与位置都按**实测**字形来（见 `TextFormats::measure_console_detail`）。
         // 命中区 `storage_path_hit.w` 用的是**保守估算**（ASCII 偏大 25%~33%）——那是故意的：
         // 路径右侧留白也能点，无害且更宽容（值行右端没有别的控件可抢，动作又是可逆的"打开"）。
         // 但**画出来的范围必须等于字形**——否则默认宽下会有一整段空白被划上线，看着像画错了。
         // 实测失败时退回命中区宽度照常画，不能因为量不出来就不给 hover 反馈。
         if path_hover && d.storage_path_hit.w > 0.0 {
-            let detail_font = unsafe { formats.detail.GetFontSize() };
+            let detail_font = unsafe { formats.console_detail.GetFontSize() };
             let (text_w, text_h) = formats
-                .measure_detail(&d.storage_path_text)
+                .measure_console_detail(&d.storage_path_text)
                 .unwrap_or((d.storage_path_hit.w, detail_font * 1.6));
             // 锚在实测文字盒底 + 一个下划线间隙（约 0.06 em），不是值行带底，也不是估算行高
             // 1.6 em —— 后者会让下划线悬在字形下方约 3·s，读起来像一根悬空横杠，高 DPI 更明显。
@@ -867,7 +1313,7 @@ fn draw_fence_detail(
         draw_text(
             target,
             &d.storage_hint_text,
-            &formats.detail,
+            &formats.console_detail,
             hr,
             &hint_brush,
         );
@@ -906,7 +1352,13 @@ fn draw_fence_detail(
         };
         let pos_label_brush =
             unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.45 * full_t]), None)? };
-        draw_text(target, "位置", &formats.detail, lr6, &pos_label_brush);
+        draw_text(
+            target,
+            "位置",
+            &formats.console_detail,
+            lr6,
+            &pos_label_brush,
+        );
         for (rect, pos, label) in [
             (d.sidebar_left, SidebarPosition::Left, "左"),
             (d.sidebar_top, SidebarPosition::Top, "上"),
@@ -928,7 +1380,13 @@ fn draw_fence_detail(
         };
         let rule_label_brush =
             unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.45 * full_t]), None)? };
-        draw_text(target, "规则", &formats.detail, lr_r, &rule_label_brush);
+        draw_text(
+            target,
+            "规则",
+            &formats.console_detail,
+            lr_r,
+            &rule_label_brush,
+        );
 
         let presets = [
             (d.rule_none, None, "无"),
@@ -1039,13 +1497,13 @@ fn draw_segmented_button(
     }
     let lr = D2D_RECT_F {
         left: rect.x,
-        top: rect.y + (rect.h - theme.label.size * 1.6) / 2.0,
+        top: rect.y + (rect.h - theme.console_label.size * 1.6) / 2.0,
         right: rect.x + rect.w,
         bottom: rect.y + rect.h,
     };
     let alpha = if active { 0.96 } else { 0.80 };
     if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, alpha]), None) } {
-        draw_text_centered(target, label, &formats.label, lr, &b);
+        draw_text_centered(target, label, &formats.console_label, lr, &b);
     }
 }
 
@@ -1088,8 +1546,8 @@ fn draw_storage_chip(
         unsafe { target.FillRoundedRectangle(&rr, &b) };
     }
     // 文字顶线由调用方传入（值行内三段同字号文字共用一条）。这里**不能**再按
-    // `theme.label.size * 1.6` 就地估算居中：本标签用的是 `detail` 字号（0.72 × label），
-    // 按 label 字号算出来的行高比标签框还高，文字会被顶到框外。
+    // `theme.console_label.size * 1.6` 就地估算居中：本标签用的是 `console_detail` 字号
+    // （`DETAIL_SIZE_RATIO` × console_label），按 label 字号算出来的行高比标签框还高，文字会被顶到框外。
     let lr = D2D_RECT_F {
         left: rect.x,
         top: text_top,
@@ -1099,7 +1557,7 @@ fn draw_storage_chip(
     if let Ok(b) =
         unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, text_alpha]), None) }
     {
-        draw_text_centered(target, kind.badge(), &formats.detail, lr, &b);
+        draw_text_centered(target, kind.badge(), &formats.console_detail, lr, &b);
     }
 }
 
@@ -1252,21 +1710,14 @@ fn draw_fence_inner(
         }
         None => fence.content_top,
     };
-    // 悬停图标放大时扩展裁剪区域，避免 2x 放大的图标被内容区裁掉
-    let hover_grow = if let Some(hi) = fence.hover_icon {
-        fence
-            .icons
-            .get(hi)
-            .map(|ic| (ic.size * (ic.scale - 1.0) * 0.5).max(0.0))
-            .unwrap_or(0.0)
-    } else {
-        0.0
-    };
+    // 内容区裁剪：上下边界严格固定在内容可视区（row_top .. row_top + scroll_view），
+    // 绝不绑定动态动画变量（避免悬停补间导致裁剪框每帧剧烈伸缩抖动）。
+    // 左右留出固定 4px 冗余容纳图标微光与圆角高亮。
     let clip = D2D_RECT_F {
-        left: fence.content_left - hover_grow,
-        top: row_top - hover_grow,
-        right: fence.x + fence.width - theme.fence_padding + hover_grow,
-        bottom: row_top + fence.scroll_view + hover_grow,
+        left: fence.content_left - 4.0,
+        top: row_top,
+        right: fence.x + fence.width - theme.fence_padding + 4.0,
+        bottom: row_top + fence.scroll_view,
     };
     unsafe { target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) };
 
@@ -2121,6 +2572,7 @@ fn wide(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::DETAIL_SIZE_RATIO;
 
     #[test]
     fn icon_store_ids_are_monotonic_without_gpu() {
@@ -2132,14 +2584,14 @@ mod tests {
         let _ = &mut store;
     }
 
-    /// `measure_detail` 是「贴字形的绘制必须**实测**」这条契约的地基，必须用真 DWrite 钉住。
+    /// `measure_console_detail` 是「贴字形的绘制必须**实测**」这条契约的地基，必须用真 DWrite 钉住。
     ///
     /// 关键断言：**实测宽度 < 估算宽度**（ASCII 路径上小 20%~30%）。这正是
     /// `docs/plans/09-storage-row-ux.md` §8.1 用 Pillow 量出的偏差，也是下划线一度戳出
     /// 字形一大截的根因。若哪天有人把 `estimate_width` 的 ASCII 系数调准了，这条断言会失败
     /// ——那时应当回头确认下划线是否还需要实测，而不是直接放宽区间。
     #[test]
-    fn measure_detail_is_tighter_than_estimate_for_ascii() {
+    fn measure_console_detail_is_tighter_than_estimate_for_ascii() {
         use windows::Win32::Graphics::DirectWrite::{
             DWriteCreateFactory, DWRITE_FACTORY_TYPE_ISOLATED,
         };
@@ -2147,11 +2599,12 @@ mod tests {
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }.expect("建 DWrite 工厂");
         let theme = crate::theme::Theme::default();
         let formats = TextFormats::new(&dwrite, &theme).expect("建文本格式");
-        let font = theme.label.size * 0.72;
+        // `measure_console_detail` 实测的是 `console_detail`（DETAIL_SIZE_RATIO × console_label），估算必须同源。
+        let font = theme.console_label.size * DETAIL_SIZE_RATIO;
 
         // ASCII 路径：估算按 0.62 em/字，YaHei UI 实测约 0.5 em → 实测应明显小于估算。
         let ascii = r"G:\Codes\sylva\target\debug\data\library";
-        let (w, h) = formats.measure_detail(ascii).expect("实测失败");
+        let (w, h) = formats.measure_console_detail(ascii).expect("实测失败");
         let est = winbosk_core::text::estimate_width(ascii, font);
         assert!(
             w > 0.0 && w < est,
@@ -2171,7 +2624,7 @@ mod tests {
 
         // CJK：估算 1.0 em/字，YaHei UI 的 CJK 正好 1.0 em → 两者应几乎相等。
         let cjk = "资料库归档";
-        let (cw, _) = formats.measure_detail(cjk).expect("实测失败");
+        let (cw, _) = formats.measure_console_detail(cjk).expect("实测失败");
         let cest = winbosk_core::text::estimate_width(cjk, font);
         assert!(
             (cw - cest).abs() / cest < 0.05,
@@ -2180,7 +2633,7 @@ mod tests {
         );
 
         // 空串：零宽零高，且**不能**是实测失败（否则下划线会退回估算宽度、白留一段空白）。
-        assert_eq!(formats.measure_detail(""), Some((0.0, 0.0)));
+        assert_eq!(formats.measure_console_detail(""), Some((0.0, 0.0)));
     }
 
     #[test]

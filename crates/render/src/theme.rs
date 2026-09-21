@@ -38,6 +38,22 @@ pub struct TextStyle {
     pub color: Color,
 }
 
+/// detail 级小字（副行/详情标签/路径）字号 = 基准字号 × 此比例。
+///
+/// 唯一真源：render 层 `TextFormats` 的 `detail` / `console_detail` 与 app 层
+/// `storage_row_geometry` 的宽度预算都从这里取值——改比例必须全链路同源，
+/// 禁止在调用点手写字面量。
+pub const DETAIL_SIZE_RATIO: f32 = 0.72;
+
+/// 从基准样式派生 detail 级小字样式（同族字体与颜色、字号按 [`DETAIL_SIZE_RATIO`] 缩小）。
+pub fn detail_style(base: &TextStyle) -> TextStyle {
+    TextStyle {
+        font_family: base.font_family,
+        size: base.size * DETAIL_SIZE_RATIO,
+        color: base.color,
+    }
+}
+
 /// 主题：栅栏外观、标题、图标网格与文字。
 ///
 /// 渲染目标固定为 96 DPI（1 DIP = 1 物理像素），因此**全部尺寸都是物理像素**。
@@ -71,6 +87,14 @@ pub struct Theme {
     // 标题
     pub title: TextStyle,
     pub title_padding_bottom: f32,
+    // 控制中心文字。**与桌面栅栏文字解耦**：面板是管理界面，整体比栅栏同款大
+    // 两号（DIP +4）：`console_title` 20 / `console_label` 16；detail 级小字按
+    // `DETAIL_SIZE_RATIO` × `console_label.size` 派生（经 [`detail_style`]，
+    // 与 `TextFormats` 的 console_detail 同源）。
+    // 几何常量（行高 36 / 按钮高 24 / 行距 30 等）不随字号放大——16px 的实际字形
+    // 高（约 1.32 em ≈ 21px）仍装得进 24px 按钮带。
+    pub console_title: TextStyle,
+    pub console_label: TextStyle,
     // 图标
     pub icon_size: f32,
     pub icon_gap: f32,
@@ -109,6 +133,16 @@ impl Default for Theme {
                 color: Color::rgba(1.0, 1.0, 1.0, 0.90),
             },
             title_padding_bottom: 10.0,
+            console_title: TextStyle {
+                font_family: "Microsoft YaHei UI",
+                size: 20.0,
+                color: Color::rgba(1.0, 1.0, 1.0, 0.90),
+            },
+            console_label: TextStyle {
+                font_family: "Microsoft YaHei UI",
+                size: 16.0,
+                color: Color::rgba(1.0, 1.0, 1.0, 0.85),
+            },
             icon_size: 48.0,
             // 网格格宽保底 = 1.5×图标宽（见 app 层 grid_cell_w），种子栅栏宽度估算对齐
             icon_gap: 24.0,
@@ -137,6 +171,8 @@ mod tests {
         assert!(t.icon_cols > 0);
         assert!(t.fence_corner_radius >= 0.0);
         assert!(t.title.size > 0.0 && t.label.size > 0.0);
+        assert!(t.console_title.size > t.title.size);
+        assert!(t.console_label.size > t.label.size);
         assert!(t.fence_padding >= 0.0);
         assert!(t.fence_highlight_h > 0.0);
         assert!(t.fence_shadow_h > 0.0);

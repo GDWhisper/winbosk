@@ -54,11 +54,59 @@ use crate::scene::{Scene, SceneFence};
 use crate::surface::CompositionSurface;
 use crate::theme::Theme;
 
-/// 表面四周多留的空白（物理像素）：栅栏描边抗锯齿会向界外渗约 1px，留足余量避免
-/// 内容被裁；也吸收小幅拖动，避免每帧重建表面。
+/// 表面四周的最小空白（物理像素）：栅栏描边抗锯齿会向界外渗约 1px，留足余量避免
+/// 内容被裁。收缩路径用它；扩张路径用更大的 [`SURFACE_GROW`]。
 const SURFACE_PAD: f32 = 16.0;
-/// 收缩迟滞：表面面积超过内容包围盒的这么多倍时才重建缩小（防止拖动时反复建/缩）。
+/// 表面**扩张**时四周额外留的空白。拖动边界上的栅栏 / 占位框出现时，内容包围盒会
+/// 持续外扩——若仍只留 16px，每移几像素就会重建一次表面，重建瞬间新表面未就绪，
+/// **全部栅栏**闪一帧（与「拖拽时像刷新了一下」同症状）。按大块量子一次撑开，
+/// 让整段拖动落在同一表面上。
+const SURFACE_GROW: f32 = 256.0;
+/// 收缩迟滞：表面面积超过内容包围盒（含 [`SURFACE_GROW`] 余量）的这么多倍时才重建缩小。
 const SHRINK_FACTOR: f32 = 4.0;
+
+/// 把矩形四周各外扩 `pad`。
+fn expand_rect(bbox: RectF, pad: f32) -> RectF {
+    RectF {
+        x: bbox.x - pad,
+        y: bbox.y - pad,
+        w: bbox.w + 2.0 * pad,
+        h: bbox.h + 2.0 * pad,
+    }
+}
+
+/// `outer` 是否完整包含 `inner`。
+fn rect_contains(outer: RectF, inner: RectF) -> bool {
+    outer.x <= inner.x
+        && outer.y <= inner.y
+        && outer.x + outer.w >= inner.x + inner.w
+        && outer.y + outer.h >= inner.y + inner.h
+}
+
+/// 表面尺寸决策（纯几何）。`None` = 沿用当前表面；`Some(want)` = 需重建为该矩形。
+///
+/// - 盖住判定用最小余量 [`SURFACE_PAD`]（抗锯齿）：内容仍在现有表面内就不动；
+/// - 扩张用 [`SURFACE_GROW`]：一次撑开吸收整段边缘拖动 / 占位框进出场；
+/// - 收缩基准**必须**是 `bbox + SURFACE_GROW`，不能用 `bbox + SURFACE_PAD`：
+///   刚按 GROW 撑开的表面相对 16px probe 在小内容下面积比常 > `SHRINK_FACTOR`
+///   （例如 200×150 内容：GROW 后约 11 倍），若拿 probe 比，下一帧就会缩回去，
+///   再拖出 probe 又撑开——小栅栏拖动变成表面每几像素重建一次，闪烁/卡顿回潮。
+///   用 GROW 作基准：撑开后比值为 1（稳定不动点），只有内容真正大幅缩小
+///   （删栅栏 / 关控制台）才收缩。不会水涨船高——基准永远从当前 `bbox` 算，
+///   而不是从当前表面算（后者才会每次重建抬高下一次的阈值）。
+fn covering_decision(cur: RectF, bbox: RectF, keep_large: bool) -> Option<RectF> {
+    let probe = expand_rect(bbox, SURFACE_PAD);
+    let covers = rect_contains(cur, probe);
+    let oversized = !keep_large && {
+        let shrink_ref = expand_rect(bbox, SURFACE_GROW);
+        (cur.w * cur.h) > SHRINK_FACTOR * (shrink_ref.w * shrink_ref.h)
+    };
+    if covers && !oversized {
+        return None;
+    }
+    let pad = if covers { SURFACE_PAD } else { SURFACE_GROW };
+    Some(expand_rect(bbox, pad))
+}
 
 /// 一个模糊栅栏的视觉（与 `scene.fences[i]` 对应）。
 struct BlurVisual {
@@ -204,10 +252,11 @@ impl Compositor {
         Ok(())
     }
 
-    /// 确保表面覆盖 `bbox`（外加 `SURFACE_PAD` 余量）。
+    /// 确保表面覆盖 `bbox`。
     ///
-    /// - 内容超出当前表面 → 立即重建（放大），避免内容被裁；
-    /// - 内容远小于表面（`SHRINK_FACTOR` 倍以上）→ 重建缩小，把内存还回去；
+    /// - 内容超出当前表面 → 立即重建（放大，余量 [`SURFACE_GROW`]），避免内容被裁；
+    /// - 内容远小于表面（`SHRINK_FACTOR` 倍以上）→ 重建缩小（余量 [`SURFACE_PAD`]），
+    ///   把内存还回去；
     /// - 其余情况沿用现有表面（迟滞：拖动/悬停时表面稳定不抖动）。
     ///
     /// 重建时图标位图无需重新上传——它们是设备级资源，跨表面仍有效。
@@ -216,22 +265,13 @@ impl Compositor {
     /// 增删，若允许收缩，表面会在「Dock 小」与「Dock+工具提示大」间反复重建，
     /// 重建瞬间新表面未就绪闪一帧 → 只有侧边栏时肉眼可见的快速闪烁。禁止收缩后
     /// 表面只增不减，工具提示增删不再触发表面重建（见 `present` 的调用说明）。
+    ///
+    /// 尺寸决策抽成纯函数 [`covering_decision`]，便于单测（本函数只负责 GPU 资源）。
     fn ensure_covering(&mut self, bbox: RectF, keep_large: bool) {
-        let want = RectF {
-            x: bbox.x - SURFACE_PAD,
-            y: bbox.y - SURFACE_PAD,
-            w: bbox.w + 2.0 * SURFACE_PAD,
-            h: bbox.h + 2.0 * SURFACE_PAD,
-        };
         let cur = self.surface_rect;
-        let covers = cur.x <= want.x
-            && cur.y <= want.y
-            && cur.x + cur.w >= want.x + want.w
-            && cur.y + cur.h >= want.y + want.h;
-        let oversized = !keep_large && (cur.w * cur.h) > SHRINK_FACTOR * (want.w * want.h);
-        if covers && !oversized {
+        let Some(want) = covering_decision(cur, bbox, keep_large) else {
             return;
-        }
+        };
         let (sw, sh) = (want.w.max(1.0).ceil() as u32, want.h.max(1.0).ceil() as u32);
         let surface = match CompositionSurface::new(&self.device.gfx_device, sw, sh) {
             Ok(s) => s,
@@ -434,5 +474,120 @@ impl Compositor {
     /// 当前合成表面的尺寸（物理像素，即内容包围盒 + 余量）。
     pub fn size(&self) -> (f32, f32) {
         (self.surface.width as f32, self.surface.height as f32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 小栅栏（无 Dock）：GROW 撑开后的表面不得被立刻判 oversized 缩回，
+    /// 否则拖动中会出现「撑开→缩回→再撑开」的表面反复重建。
+    #[test]
+    fn grown_small_surface_is_not_immediately_shrunk() {
+        let bbox = RectF {
+            x: 100.0,
+            y: 100.0,
+            w: 200.0,
+            h: 150.0,
+        };
+        let grown = expand_rect(bbox, SURFACE_GROW);
+        // 刚撑开：仍盖住 probe，且不应收缩
+        assert_eq!(covering_decision(grown, bbox, false), None);
+        // 继续在同一表面内小幅拖动（bbox 平移 50px）：GROW 余量内仍盖住
+        let moved = RectF {
+            x: bbox.x + 50.0,
+            y: bbox.y + 20.0,
+            ..bbox
+        };
+        assert_eq!(covering_decision(grown, moved, false), None);
+    }
+
+    /// 拖出 GROW 余量 → 按大块量子再撑开一次（不是只扩 16px）。
+    #[test]
+    fn escaping_grow_slack_rebuilds_with_grow_pad() {
+        let bbox = RectF {
+            x: 100.0,
+            y: 100.0,
+            w: 200.0,
+            h: 150.0,
+        };
+        let grown = expand_rect(bbox, SURFACE_GROW);
+        // 平移超过 256 - 16 = 240px，probe 不再被盖住
+        let far = RectF {
+            x: bbox.x + 300.0,
+            y: bbox.y,
+            ..bbox
+        };
+        let want = covering_decision(grown, far, false).expect("应重建");
+        assert_eq!(want, expand_rect(far, SURFACE_GROW));
+    }
+
+    /// 内容大幅缩小（关面板/删栅栏）→ 按最小余量收缩。
+    #[test]
+    fn oversized_surface_shrinks_to_pad() {
+        // 模拟曾按大内容 GROW：表面很大
+        let big = RectF {
+            x: 0.0,
+            y: 0.0,
+            w: 2000.0,
+            h: 1500.0,
+        };
+        // 内容缩到远小于表面
+        let small = RectF {
+            x: 100.0,
+            y: 100.0,
+            w: 100.0,
+            h: 80.0,
+        };
+        let want = covering_decision(big, small, false).expect("应收缩");
+        assert_eq!(want, expand_rect(small, SURFACE_PAD));
+    }
+
+    /// Dock 在场：禁止收缩，即使表面远大于内容。
+    #[test]
+    fn keep_large_never_shrinks() {
+        let big = RectF {
+            x: 0.0,
+            y: 0.0,
+            w: 2000.0,
+            h: 1500.0,
+        };
+        let small = RectF {
+            x: 100.0,
+            y: 100.0,
+            w: 100.0,
+            h: 80.0,
+        };
+        // 盖住 probe 且 keep_large → 不动
+        assert_eq!(covering_decision(big, small, true), None);
+        // 不盖住时仍允许扩张（工具提示伸出、Dock 被拖到边缘）
+        let outside = RectF {
+            x: 2500.0,
+            y: 100.0,
+            w: 100.0,
+            h: 80.0,
+        };
+        let want = covering_decision(big, outside, true).expect("仍应扩张");
+        assert_eq!(want, expand_rect(outside, SURFACE_GROW));
+    }
+
+    /// 收缩基准不会随表面「水涨船高」：同一 bbox 反复决策结果稳定。
+    #[test]
+    fn decision_is_stable_fixed_point() {
+        let bbox = RectF {
+            x: 50.0,
+            y: 60.0,
+            w: 400.0,
+            h: 300.0,
+        };
+        let grown = expand_rect(bbox, SURFACE_GROW);
+        // 第一次：沿用
+        assert_eq!(covering_decision(grown, bbox, false), None);
+        // 第二次：仍然沿用（不是每帧重建）
+        assert_eq!(covering_decision(grown, bbox, false), None);
+        // 收缩后的表面在同一 bbox 下也稳定
+        let pad_surface = expand_rect(bbox, SURFACE_PAD);
+        assert_eq!(covering_decision(pad_surface, bbox, false), None);
     }
 }

@@ -213,3 +213,160 @@ SWP flags，6 组实验交叉验证）推翻了本计划初版的两处前提，
 3. **[低→有意统一] 持久化失败日志口径**：`TrayToggle` 与 `MENU_TRAY_CONSOLE` 原为
    `let _ =` 静默容错，收敛进 `set_console_open` 后统一为 `tracing::warn!`，与其余三处
    调用点既有口径一致——属有意统一，非行为回归。
+
+## 8. 第二迭代：点击唤起与离开回落 (Iteration 2: Click-to-Raise & Leave-to-Restore)
+
+### 8.1 场景与缺陷
+
+第一迭代只在 `set_console_open` 的状态迁移瞬间提权一次。用户唤出控制中心后被其它程序
+激活（非全屏），提权中的 overlay 被盖住；此后点击露出的栅栏/面板边缘——点击确实落在
+Sylva 表面（交互有效），但 `WS_EX_NOACTIVATE` 使系统永远不会因点击激活/提层它，而提权
+调用只在开/关时发生——**用户主动点击却无法把 Sylva 重新带到前面**。典型诉求：不全屏使
+用其它程序、想临时打开某个栅栏里的桌面应用。
+
+### 8.2 契约扩展
+
+- **点击唤起（render 层窗口机制）**：`WM_LBUTTONDOWN` / `WM_RBUTTONDOWN` 到达 wnd_proc
+  即意味着点击落在窗口区域（= 栅栏 ∪ 控制台 ∪ 占位框）内，属于用户对 Sylva 表面的主动
+  操作 → 先 `raise_hwnd_to_normal_top(hwnd)` 再分发。不缓存「已提权」标志——被其它程序盖住
+  时标志必然失真，每次按下重断言（已在顶部时为无害空操作）。滚轮不触发（语义收紧到
+  「按下 = 意图」）。
+- **离开回落（条件恢复）**：`WM_MOUSELEAVE` 时，若「控制中心会话」**未激活**且**无拖拽
+  进行中**（`state.drag.is_none()`，覆盖 Move/Select/Resize/ConsoleMove/ConsoleResize/
+  SidebarReorder 全部六类），落回桌面带。
+- **会话位（业务位单向推送）**：`WindowState` 新增 `console_session: bool` 与
+  `owner: HWND`（create 时的 parent，供 wnd_proc 恢复用；与 `OverlayWindow.owner` 同源
+  不可变，无失同步面）。app 的 `set_console_open` 在 Z 序同步的同一事务里调
+  `overlay.set_console_session(open)` 推送。控制中心会话期间离开不回落（生命周期仍由
+  开/关配对管理）；非会话期的点击唤起（点栅栏临时用一下）随光标离开 Sylva 表面而结束
+  ——「临时」语义由光标位置界定，无需新增退出事件。
+- **自由函数提取**：`raise_hwnd_to_normal_top(hwnd)` 与 `restore_hwnd_desktop_band(hwnd, owner)`
+  从方法中抽出供 wnd_proc 复用；`raise_console` / `restore_desktop_band` 成为薄委托，
+  语义升级为「用户前台会话」的提权/归位（不限于控制中心开合）。
+
+### 8.3 动力学推演
+
+- **拖拽中不回落**：拖动栅栏/框选/面板缩放时光标可能瞬时离开区域（capture 下消息仍到
+  overlay，leave 可能触发），`drag.is_none()` 门控阻断之；拖放结束后光标仍在表面 → 保持
+  提权，移开即回落。
+- **从栅栏启动应用**：双击图标 → 应用成为前台（普通带顶部，自然盖住 Sylva）；光标移向
+  新应用 → leave → 回落。连续启动多个应用期间光标未离开表面则保持提权——无需在启动
+  路径上显式回落。
+- **自愈性**：用户点击其它程序窗口 → 该窗口激活升到普通带顶部、重新盖住 Sylva（良性，
+  「最后点击者在前」的常规窗口语义）；再次点击 Sylva 露出部分即重新唤起。
+- **幂等**：已在顶部时 `HWND_TOP` 为空操作；已在桌面带（owner 正上方）时恢复的锚点即
+  overlay 自身（复验实验证实无害）。
+- **空闲归零**：唤起/回落均为用户交互驱动的一次性调用，不引入任何定时器。
+- **已知边界**：内联编辑（InlineEdit）是纯 D2D 绘制、编辑区属于 overlay 命中模型与窗口
+  区域，**不存在子窗口**，点击编辑区与点击栅栏同走 wnd_proc（唤起/回落语义一致）；
+  `WM_CTLCOLOREDIT`/`edit_brush` 是无消费者的遗留防御路径。注意（审查实证）：**若**未来
+  给 overlay 挂真实子窗口（EDIT 等），光标悬停子窗口会触发父窗口 `WM_MOUSELEAVE`——届时
+  必须把 `console_session`/拖拽门控扩展覆盖子窗口悬停场景，否则非会话期编辑中面板会被
+  回落到桌面带。
+
+### 8.4 验证补充
+
+在 §6 矩阵之上追加：
+
+| # | 操作 | 期望 |
+| :--- | :--- | :--- |
+| 7 | 唤出控制中心 → 激活其它程序盖住它 → 点击露出的面板/栅栏边缘 | Sylva 整体重回普通带顶部（本迭代的缺陷修复） |
+| 8 | 控制中心收起状态点栅栏 → 光标移到其它程序窗口 | 点击瞬间提权；移出 Sylva 表面即回落桌面带 |
+| 9 | 点栅栏并拖动 → 拖拽中光标短暂划出区域 | 拖拽全程保持提权，不中途回落 |
+| 10 | 点栅栏 → 双击图标启动应用 → 光标移向新应用 | 应用前台盖住 Sylva；光标离开后 Sylva 回落桌面带 |
+
+### 8.5 审查修正记录 (Iteration 2 Review Record)
+
+独立对抗审查（静态全分支核对 + rustc 探针实证：后台进程前台锁提权、桌面带空操作恢复、
+capture 下 TME_LEAVE 时序、子窗口悬停触发父级 leave）判定可合入，零必须修复项；三项
+低严重度发现的处置：
+
+1. **[已修] §8.3「内联编辑框是子窗口 EDIT」前提失实**：InlineEdit 实为纯 D2D 绘制
+   （编辑区在命中模型/窗口区域内），`WM_CTLCOLOREDIT` 是无消费者的遗留防御路径。
+   §8.3 已按实证改写，并把「未来引入真实子窗口必须扩展门控」写成显式约束。
+2. **[已修] capture 被外部夺走时 `state.drag` 残留**：拖拽中 capture 丢失 → 无
+   `WM_LBUTTONUP` → drag 残留拦住迟到的 leave（ReleaseCapture 后约 31ms 到达）→
+   点击唤起的提权滞留普通带顶部。新增 `WM_CAPTURECHANGED` 分支清 `state.drag`
+   （孤儿状态回收），迟到的 leave 恢复回落；布局持久化仍以真实 `WM_LBUTTONUP` 为准。
+3. **[记录在案] 「裸调 HWND_TOP 静默拒绝」是环境依赖行为**：本审查机（Win11 26200）
+   探针未复现静默拒绝。保留 `with_foreground_lock` 作为无条件纵深防御（迭代一的
+   实测约束在其它环境成立），不改变实现。
+4. **[已修] WM_CAPTURECHANGED 与 WM_MOUSELEAVE 的悬停旁路镜像不对齐**：初版仅 emit
+   CursorLeave 未重置渲染层 hovered/last_cursor/console_hovered，capture 被夺而光标
+   仍在图标上时悬停高亮滞留失效态；已镜像 leave 的悬停清理并补发
+   HoverLeave/ConsoleHover{zone:None}（取舍与「不回联桌面带」的理由见 §9.5）。
+
+## 9. 第二迭代同批附带变更记录 (Adjacent Changes)
+
+以下五项不在 §8 契约范围内，但与第二迭代同批进入工作区。按「scope creep 必须显式
+记录」的审查要求补录于此——每项写明症状/动机、改法与验证锚点，使 diff 与 spec
+一一对应。
+
+### 9.1 compositor 表面扩张迟滞重写（`SURFACE_GROW` + `covering_decision`）
+
+- **症状**：拖动边界上的栅栏（或占位框进出场）时内容包围盒持续外扩，旧逻辑只要超出
+  `SURFACE_PAD = 16` 余量就重建表面——拖动中每移几像素重建一次，重建瞬间新表面未就绪，
+  **全部栅栏**闪一帧。与 §9.2 的 bRedraw 闪烁同症状家族，同批修复。
+- **改法**：扩张改按大块量子 `SURFACE_GROW = 256` 一次撑开，让整段拖动落在同一表面上。
+  尺寸决策抽成纯函数 `covering_decision`（盖住判定仍用 16px probe；收缩基准改为
+  `bbox + SURFACE_GROW` 而非 16px probe——否则小栅栏刚按 GROW 撑开就会被判 oversized
+  缩回，「撑开→缩回→再撑开」闪烁回潮）。收缩基准永远从当前 `bbox` 计算、不从当前表面
+  计算，故不会「水涨船高」。`ensure_covering` 只剩 GPU 资源操作；`keep_large`（Dock 在场
+  禁止收缩）语义不变。
+- **验证锚点**：`compositor.rs` tests 模块 5 个纯几何单测（撑开不被立刻缩回、逃逸 GROW
+  余量按量子再撑、大幅缩小按 PAD 收缩、keep_large 不收缩、决策是稳定不动点），零 GPU
+  依赖，CI 可跑。
+
+### 9.2 `apply_region` 的 `SetWindowRgn` bRedraw true→false
+
+- **症状**：overlay 是 `WS_EX_NOREDIRECTIONBITMAP` + DirectComposition 视觉树窗口（无
+  GDI 客户区、无 WM_PAINT），`bRedraw=true` 仍会走「整窗失效 → DWM 拆掉再重合成」路径；
+  拖动时区域每帧都变，**全部栅栏**（不只被拖的）跟着闪一下，观感即「刷新了一遍」。
+- **改法**：`bRedraw=false`。区域几何本身生效（命中穿透与 DWM 可视裁剪）不依赖
+  bRedraw；内容更新本就由 App 层 `present` + `RequestCommitAsync` 承担。
+- **正确性依赖的顺序不变量**（审查发现的时序风险，已静态关闭并落字到 overlay.rs 与
+  main.rs 注释）：内容提交必须先于命中模型/区域更新——首帧路径 main.rs 先 `present`
+  再 `set_model`；事件路径按「App 处理交互 → 重绘 → 返回新命中模型」契约在
+  `handle_event` 内先重绘。颠倒该顺序会露出一帧陈旧内容。
+- **验证**：顺序不变量为静态代码核对（两条调用路径均成立）；拖动观感（无闪烁）属
+  交互项，留 §6 冒烟矩阵桌面复验。
+
+### 9.3 控制中心字号与桌面栅栏文字解耦
+
+- **动机**：控制中心是管理界面，文字需整体比桌面栅栏同款大两号；此前直接共用
+  `title`/`label`，两侧字号互相牵连。
+- **改法**：`Theme` 新增 `console_title`(20) / `console_label`(16) 两个 `TextStyle`；
+  `TextFormats` 相应扩充 `console_title_bold` / `console_close`（关闭按钮「✕」）/
+  `console_label` / `console_detail`。detail 级字号 = `DETAIL_SIZE_RATIO`(0.72) ×
+  `console_label.size`——比例常量与 `detail_style()` 派生构造是全链路唯一真源，app 层
+  宽度预算共用之。`apply_theme_scale` 同步缩放新字段（物理像素口径不变，AGENTS.md
+  约束 #9）。**几何常量（行高 36 / 按钮高 24 / 行距 30）不随字号放大**：16px 实际字形
+  高（约 1.32em ≈ 21px）仍装得进 24px 按钮带。
+- **验证锚点**：theme.rs 单测断言 console 字号大于桌面同款；scene.rs 宽度预算不变量
+  测试以 `CONSOLE_W` / `CONSOLE_MIN_W` 参数化，常量一改即被重验。
+
+### 9.4 `CONSOLE_W` 320→368（plan 09 Non-Goal 5 显式取代）
+
+- **动机**：字号加大两号后「更改文件位置…」「恢复默认」两个动作按钮实测变宽
+  （100·s→128·s、64·s→80·s），320 默认宽下后果提示放不下（两模式分别缺口约 18 / 32px），
+  违反 plan 09「默认宽度下提示常显」的主契约——宽度必须跟着字号走。
+- **改法**：`CONSOLE_W` 320→368（+48）。复算后提示预算余量 30 / 16px（复算表见
+  plan 09 §9.2）；最小宽 `CONSOLE_MIN_W` 不动，窄面板仍按「整条不画」优雅降级。
+- **与 plan 09 的关系**：plan 09 Non-Goal 5 是**该计划自身**的范围声明（禁止 plan 09
+  的改动顺带动宽度），不是对面板宽度的永久冻结；本迭代因 §9.3 字号解耦触发它，按
+  plan 09 §9 修订记录显式取代，预算表同步复算。
+
+### 9.5 `WM_CAPTURECHANGED` 超出 §8.5.2 最小范围的事件
+
+§8.5 第 2 条的最小修复是「清 `state.drag`」。实现额外镜像了 `WM_MOUSELEAVE` 的悬停
+旁路清理（`hovered` / `last_cursor` / `console_hovered` 置空 + 补发
+`ConsoleHover{zone:None}` / `HoverLeave` / `CursorLeave`）：
+
+- **动机（旁路数据对齐）**：只清 App 层（`CursorLeave` → `rt.cursor` / `rt.hover`）而
+  不清渲染层镜像，光标仍在图标上时 `HoverEnter` 不会重发，悬停高亮 / Dock 放大滞留
+  失效态直到离开再进入。镜像清理后，下一次 `WM_MOUSEMOVE` 重新建立悬停。
+- **幂等性**：capture 被夺后迟到的 `WM_MOUSELEAVE` 会再发一遍同组事件——App 层悬停
+  状态是覆盖写，重复事件无害（与现状一致，非新增风险）。
+- **刻意不做**：不在 `WM_CAPTURECHANGED` 里回联 `restore_hwnd_desktop_band`。拖拽异常
+  终止时光标通常仍在表面，按 §8.2 契约应保持提权；桌面带回落由迟到的 `WM_MOUSELEAVE`
+  承担（其 `drag.is_none()` 门控此时已放行）。

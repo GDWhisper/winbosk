@@ -199,7 +199,7 @@ pub struct SceneFenceDetail {
     ///
     /// 绘制层**仍会**二次截断（`draw_text` 的 `truncate_to_fit`）——App 层刻意预留了 2·s 余量
     /// 所以平时不会触发，但那只是兜底，别把它当保证：一旦预算改紧，超出的字会被静默换成「…」。
-    /// 因此 `storage_path_hit` 的宽度**不能**取自这里字串的估算宽（见 `TextFormats::measure_detail`）。
+    /// 因此 `storage_path_hit` 的宽度**不能**取自这里字串的估算宽（见 `TextFormats::measure_console_detail`）。
     pub storage_path_text: String,
     /// 路径文本区（值行；**仅绘制**——决定省略预算与裁剪框，不参与命中）。
     pub storage_path_rect: RectF,
@@ -256,8 +256,10 @@ pub struct SceneConsole {
     pub title_h: f32,
     /// 关闭按钮矩形（标题栏右上）。
     pub close: RectF,
-    /// 「恢复桌面」按钮矩形（标题栏，关闭按钮左侧）。
+    /// 「恢复桌面」按钮矩形（底部，左半）。
     pub desktop_toggle: RectF,
+    /// 「开机自启」按钮矩形（底部，右半）。
+    pub autostart_toggle: RectF,
     /// 栅栏管理页：可点选栅栏行（与 `desk.fences` 平行）。
     pub fence_rows: Vec<SceneFenceRow>,
     /// 栅栏管理页：列表可视区（行超出部分被裁剪，命中模型据此跳过不可见行）。
@@ -281,6 +283,41 @@ pub struct SceneConsole {
     pub hover_zone: Option<ConsoleZone>,
     /// 是否处于原始桌面模式（标题栏按钮文案与状态）。
     pub desktop_mode: bool,
+    /// 是否开启开机自启（按钮文案与状态）。
+    pub autostart: bool,
+    /// 是否处于高级模式（双栏展开）。
+    pub advanced: bool,
+    /// 模式切换按钮矩形（标题栏右侧，关闭按钮左边）。
+    pub mode_toggle: RectF,
+    /// 栅栏高级规则编辑器（高级模式右栏；无选中栅栏时为 None）。
+    pub rule_editor: Option<SceneRuleEditor>,
+}
+
+/// 高级模式下的栅栏规则编辑器（右栏工作台）。
+#[derive(Debug, Clone)]
+pub struct SceneRuleEditor {
+    pub rect: RectF,
+    pub fence_title: String,
+    pub rule_enabled: bool,
+    pub toggle_btn: RectF,
+    /// 包含预设类别按钮 (preset, rect, is_selected)
+    pub preset_chips: Vec<(Option<CategoryPreset>, RectF, bool)>,
+    /// 包含后缀芯片列表 (ext, chip_rect, del_btn_rect)
+    pub ext_chips: Vec<(String, RectF, RectF)>,
+    pub add_ext_btn: RectF,
+    /// 排除后缀黑名单列表 (ext, chip_rect, del_btn_rect)
+    pub exclude_chips: Vec<(String, RectF, RectF)>,
+    pub add_exclude_btn: RectF,
+    /// 通配符/关键字模式列表 (pat, chip_rect, del_btn_rect)
+    pub pattern_chips: Vec<(String, RectF, RectF)>,
+    pub add_pattern_btn: RectF,
+    /// 自动捕获开关
+    pub auto_capture_toggle: RectF,
+    pub auto_capture_val: bool,
+    /// 单栅栏即时应用规则整理按钮
+    pub apply_btn: RectF,
+    /// 提示引导文本与说明矩形
+    pub tip_rect: RectF,
 }
 
 /// 内联文本编辑的渲染数据（App 层 InlineEdit 的只读快照，绘制用）。

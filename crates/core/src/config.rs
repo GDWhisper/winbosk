@@ -17,6 +17,7 @@ pub struct AppSettings {
     pub free_area_height: f32,
     pub hotkeys: HotkeyConfig,
     /// 是否开机自启。
+    #[serde(default)]
     pub autostart: bool,
 }
 
@@ -139,5 +140,12 @@ mod tests {
         let loaded = ConfigStore::new(dir).load().unwrap();
         assert_eq!(loaded, desk);
         assert_eq!(loaded.fences[0].title.as_deref(), Some("工作"));
+    }
+
+    #[test]
+    fn app_settings_missing_autostart_defaults_to_false() {
+        let json = r#"{"show_free_area":true,"free_area_height":90.0,"hotkeys":{}}"#;
+        let settings: AppSettings = serde_json::from_str(json).expect("旧配置应能正常反序列化");
+        assert!(!settings.autostart, "缺失 autostart 字段时应默认为 false");
     }
 }

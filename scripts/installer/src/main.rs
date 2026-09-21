@@ -84,7 +84,7 @@ const ID_PATH: usize = 1007;
 /// 本模块未从 windows-rs 引入的少数消息/样式位，直接以数值定义。
 const SS_ICON: u32 = 0x0003;
 const SS_CENTERIMAGE: u32 = 0x0200;
-const BST_CHECKED: usize = 1;
+const BST_UNCHECKED: usize = 0;
 
 /// 安装面板白底黑字（深灰辅助文字）
 const PANEL_BG: COLORREF = COLORREF(0x00_FF_FF_FF); // 白
@@ -1309,7 +1309,8 @@ fn main() {
         if matches!(app.mode, Mode::Uninstall) {
             let _ = ShowWindow(app.hchk, SW_HIDE);
         }
-        let _ = SendMessageW(app.hchk, BM_SETCHECK, Some(WPARAM(BST_CHECKED)), None);
+        // 安装模式：开机自启默认不勾选（默认关闭）
+        let _ = SendMessageW(app.hchk, BM_SETCHECK, Some(WPARAM(BST_UNCHECKED)), None);
         let _ = SendMessageW(
             app.hprogress,
             PBM_SETRANGE32,

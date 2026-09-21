@@ -351,8 +351,14 @@ pub struct FenceRule {
     pub enabled: bool,
     /// 预设类别。
     pub preset: Option<CategoryPreset>,
-    /// 用户自定义扩展名（例如 ["log", "dump"]）。
+    /// 用户自定义扩展名白名单（例如 ["png", "jpg", "webp"]）。
     pub custom_extensions: Vec<String>,
+    /// 排除的扩展名黑名单（例如 ["psd", "raw"]，优先于预设与白名单生效）。
+    pub exclude_extensions: Vec<String>,
+    /// 文件名通配符/关键字白名单（例如 ["*draft*", "backup_*", "test_*.log"]）。
+    pub name_patterns: Vec<String>,
+    /// 文件名排除通配符/关键字（例如 ["*.tmp", "~*"]）。
+    pub exclude_patterns: Vec<String>,
     /// 是否在桌面出现新文件时自动捕获进此栅栏。
     pub auto_capture: bool,
 }
@@ -363,9 +369,70 @@ impl Default for FenceRule {
             enabled: true,
             preset: None,
             custom_extensions: Vec::new(),
+            exclude_extensions: Vec::new(),
+            name_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
             auto_capture: true,
         }
     }
+}
+
+impl FenceRule {
+    /// 规则是否包含实际生效的匹配条件。
+    pub fn is_effective(&self) -> bool {
+        self.enabled
+            && (self.preset.is_some()
+                || !self.custom_extensions.is_empty()
+                || !self.name_patterns.is_empty())
+    }
+}
+
+/// 针对文件名的轻量通配符/关键字匹配（不区分大小写）。
+///
+/// - 若包含 `*` 或 `?`，按经典 Glob 通配符双指针匹配；
+/// - 若不含通配符，判定是否作为子串包含（方便用户直接输入关键词如 `draft`）；
+/// - 空字符串或全空格模式忽略（返回 false）。
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return false;
+    }
+    let p_lower = p.to_ascii_lowercase();
+    let t_lower = text.to_ascii_lowercase();
+
+    if !p.contains('*') && !p.contains('?') {
+        return t_lower.contains(&p_lower);
+    }
+
+    let p_chars: Vec<char> = p_lower.chars().collect();
+    let t_chars: Vec<char> = t_lower.chars().collect();
+    let mut px = 0;
+    let mut tx = 0;
+    let mut star_px = None;
+    let mut match_tx = 0;
+
+    while tx < t_chars.len() {
+        if px < p_chars.len() && (p_chars[px] == '?' || p_chars[px] == t_chars[tx]) {
+            px += 1;
+            tx += 1;
+        } else if px < p_chars.len() && p_chars[px] == '*' {
+            star_px = Some(px);
+            px += 1;
+            match_tx = tx;
+        } else if let Some(spx) = star_px {
+            px = spx + 1;
+            match_tx += 1;
+            tx = match_tx;
+        } else {
+            return false;
+        }
+    }
+
+    while px < p_chars.len() && p_chars[px] == '*' {
+        px += 1;
+    }
+
+    px == p_chars.len()
 }
 
 const EXT_APPS: &[&str] = &[
@@ -416,6 +483,31 @@ impl FenceRule {
             .or_else(|| file_extension(&icon.display_name))
             .map(|s| s.to_ascii_lowercase());
 
+        let name = icon
+            .path
+            .as_deref()
+            .and_then(|p| p.rsplit(['/', '\\']).next())
+            .unwrap_or(&icon.display_name);
+
+        // 1. 黑名单短路检查（优先拒绝）
+        if let Some(ref ext_str) = ext {
+            if self
+                .exclude_extensions
+                .iter()
+                .any(|ee| ee.trim_start_matches('.').eq_ignore_ascii_case(ext_str))
+            {
+                return false;
+            }
+        }
+        if self
+            .exclude_patterns
+            .iter()
+            .any(|pat| glob_match(pat, name))
+        {
+            return false;
+        }
+
+        // 2. 白名单与通配符检查（命中任一即通过）
         if let Some(ref ext_str) = ext {
             if self
                 .custom_extensions
@@ -425,7 +517,11 @@ impl FenceRule {
                 return true;
             }
         }
+        if self.name_patterns.iter().any(|pat| glob_match(pat, name)) {
+            return true;
+        }
 
+        // 3. 预设类别匹配（未被排除且符合预设）
         match self.preset {
             Some(CategoryPreset::Folders) => icon.kind == ItemKind::Folder,
             Some(CategoryPreset::Apps) => {
@@ -626,6 +722,9 @@ pub struct Desk {
     /// 旧配置缺失时默认含「待办事项」（保持既有行为）。
     #[serde(default = "default_plugins")]
     pub plugins: Vec<PluginEntry>,
+    /// 控制中心面板是否处于高级模式（双栏展开）。
+    #[serde(default)]
+    pub console_advanced: bool,
     /// 桌面模式：false = 栅栏接管（隐藏真实图标）；true = 原始桌面（恢复真实图标、
     /// 栅栏淡出隐藏）。控制中心「切换桌面」按钮切换。
     #[serde(default)]
@@ -727,6 +826,7 @@ impl Desk {
             console_pos: None,
             console_size: None,
             plugins: default_plugins(),
+            console_advanced: false,
             desktop_mode: false,
         }
     }
@@ -815,9 +915,7 @@ impl Desk {
             .filter_map(|f| {
                 f.rule
                     .as_ref()
-                    .filter(|r| {
-                        r.enabled && (r.preset.is_some() || !r.custom_extensions.is_empty())
-                    })
+                    .filter(|r| r.is_effective())
                     .map(|r| (f.id, r.clone()))
             })
             .collect();
@@ -923,8 +1021,7 @@ impl Desk {
                             f.rule = Some(FenceRule {
                                 enabled: true,
                                 preset: Some(*preset),
-                                custom_extensions: Vec::new(),
-                                auto_capture: true,
+                                ..Default::default()
                             });
                             break;
                         }
@@ -1018,8 +1115,7 @@ impl Desk {
                 rule: Some(FenceRule {
                     enabled: true,
                     preset: Some(*preset),
-                    custom_extensions: Vec::new(),
-                    auto_capture: true,
+                    ..Default::default()
                 }),
                 collapsed: false,
             });
@@ -1033,9 +1129,7 @@ impl Desk {
             .filter_map(|f| {
                 f.rule
                     .as_ref()
-                    .filter(|r| {
-                        r.enabled && (r.preset.is_some() || !r.custom_extensions.is_empty())
-                    })
+                    .filter(|r| r.is_effective())
                     .map(|r| (f.id, r.clone()))
             })
             .collect();
@@ -1197,8 +1291,7 @@ mod tests {
             rule: Some(FenceRule {
                 enabled: true,
                 preset: Some(CategoryPreset::Documents),
-                custom_extensions: Vec::new(),
-                auto_capture: true,
+                ..Default::default()
             }),
             collapsed: false,
         });
@@ -1218,8 +1311,7 @@ mod tests {
             rule: Some(FenceRule {
                 enabled: true,
                 preset: Some(CategoryPreset::Media),
-                custom_extensions: Vec::new(),
-                auto_capture: true,
+                ..Default::default()
             }),
             collapsed: false,
         });
@@ -1376,8 +1468,7 @@ mod tests {
             rule: Some(FenceRule {
                 enabled: true,
                 preset: Some(CategoryPreset::Documents),
-                custom_extensions: Vec::new(),
-                auto_capture: true,
+                ..Default::default()
             }),
             collapsed: false,
         });
@@ -1444,6 +1535,7 @@ mod tests {
         // 旧配置无插件/桌面模式字段：默认注册表（待办启用）+ 栅栏模式
         assert_eq!(d.plugins.len(), 2);
         assert!(d.plugins.iter().any(|p| p.id == "todo" && p.enabled));
+        assert!(!d.console_advanced);
         assert!(!d.desktop_mode);
     }
 
@@ -1560,5 +1652,60 @@ mod tests {
             expanded.collision_rect(200.0),
             collapsed.collision_rect(200.0)
         );
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("*.txt", "hello.txt"));
+        assert!(glob_match("*.TXT", "HELLO.txt"));
+        assert!(glob_match("test_*", "test_abc"));
+        assert!(glob_match("test_?.*", "test_1.png"));
+        assert!(!glob_match("test_?.*", "test_12.png"));
+        assert!(glob_match("*draft*", "my_draft_v2.docx"));
+        // 纯文本按子串包含
+        assert!(glob_match("draft", "my_draft_v2.docx"));
+        assert!(!glob_match("meeting", "my_draft_v2.docx"));
+        // 边界
+        assert!(!glob_match("", "hello.txt"));
+        assert!(!glob_match("   ", "hello.txt"));
+        assert!(glob_match("*", "anything.xyz"));
+    }
+
+    #[test]
+    fn test_fence_rule_custom_extensions_and_exclusions() {
+        let rule = FenceRule {
+            enabled: true,
+            preset: Some(CategoryPreset::Media), // 内置媒体（如 png）
+            custom_extensions: vec!["custom".into(), "log".into()],
+            exclude_extensions: vec!["psd".into(), "raw".into()],
+            name_patterns: vec!["*important*".into()],
+            exclude_patterns: vec!["*.tmp".into(), "temp_*".into()],
+            auto_capture: true,
+        };
+
+        // 1. 正常命中的预设媒体
+        let mut icon_png = Icon::new("1".into(), "photo.png".into(), ItemKind::Doc);
+        icon_png.path = Some("C:\\photo.png".into());
+        assert!(rule.matches_icon(&icon_png));
+
+        // 2. 被排除的扩展名黑名单（即使属于媒体预设也被排除）
+        let mut icon_psd = Icon::new("2".into(), "design.psd".into(), ItemKind::Doc);
+        icon_psd.path = Some("C:\\design.psd".into());
+        assert!(!rule.matches_icon(&icon_psd));
+
+        // 3. 自定义白名单后缀
+        let mut icon_custom = Icon::new("3".into(), "data.custom".into(), ItemKind::Doc);
+        icon_custom.path = Some("C:\\data.custom".into());
+        assert!(rule.matches_icon(&icon_custom));
+
+        // 4. 文件名通配符白名单（即使不是媒体预设后缀也命中）
+        let mut icon_pattern = Icon::new("4".into(), "important_report.xyz".into(), ItemKind::Doc);
+        icon_pattern.path = Some("C:\\important_report.xyz".into());
+        assert!(rule.matches_icon(&icon_pattern));
+
+        // 5. 排除模式黑名单（命中 exclude_patterns 即使匹配了通配符也必须被拒绝）
+        let mut icon_tmp = Icon::new("5".into(), "important_backup.tmp".into(), ItemKind::Doc);
+        icon_tmp.path = Some("C:\\important_backup.tmp".into());
+        assert!(!rule.matches_icon(&icon_tmp));
     }
 }

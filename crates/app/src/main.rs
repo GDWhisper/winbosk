@@ -76,8 +76,8 @@ pub(crate) use winbosk_core::model::{
 pub(crate) use winbosk_render::{
     run_message_loop, Compositor, ConsoleHit, ConsoleZone, FenceHit, HitModel, IconHit,
     ListColumns, OverlayEvent, OverlayWindow, RectF, RenderDevice, ResizeZone, Scene, SceneConsole,
-    SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow, SceneIcon, Theme, GRID_CAPTION_H_MULT,
-    GRIP_SIZE, WM_APP_QUIT, WM_WINBOSK_INJECT,
+    SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow, SceneIcon, SceneRuleEditor, Theme,
+    GRID_CAPTION_H_MULT, GRIP_SIZE, WM_APP_QUIT, WM_WINBOSK_INJECT,
 };
 pub(crate) use winbosk_shell::icons::IconData;
 pub(crate) use winbosk_shell::items::DesktopItem;
@@ -106,7 +106,15 @@ pub(crate) const MEDIUM_BORDER_WIDTH: f32 = 2.0;
 
 // ---- 控制中心（桌面组件 + 栅栏管理）布局常量（DIP，× scale 变物理像素）----
 /// 控制台面板默认宽度（用户拖边缘缩放后由 `desk.console_size` 覆盖）。
-pub(crate) const CONSOLE_W: f32 = 320.0;
+///
+/// 368 = 320 + 48：控制中心字号整体加大两号（label 12→16）后，「更改文件位置…」
+/// 「恢复默认」两个动作按钮随之变宽，若维持 320 则默认宽下放不下后果提示，
+/// 违反 plan 09「默认宽度下提示常显」的契约（两种模式分别缺口 18 / 32px）。
+/// 宽 48 后提示预算余量 30 / 16px（复算见 plan 09 §9.2）；最小宽 `CONSOLE_MIN_W`
+/// 不变，窄面板仍按契约降级。
+pub(crate) const CONSOLE_W: f32 = 368.0;
+/// 高级模式下的双栏工作台宽度（DIP）。
+pub(crate) const CONSOLE_ADVANCED_W: f32 = 736.0;
 /// 控制台面板最小宽/高（缩放钳制，避免缩到无法交互）。
 pub(crate) const CONSOLE_MIN_W: f32 = 260.0;
 pub(crate) const CONSOLE_MIN_H: f32 = 170.0;
@@ -266,6 +274,8 @@ pub(crate) struct Runtime {
     /// 系统抢占、模态弹窗打断）时，占位框必须立刻消失，否则它会因并入窗口区域
     /// 而持续吞掉那块区域的桌面点击。
     pub(crate) drag_hint: Option<DragHint>,
+    /// 栅栏平滑滚动阻尼补间。
+    pub(crate) scroll_tweens: Vec<ScrollTween>,
 }
 
 // 事件处理器再入守卫：`handle_event` 打开模态菜单/属性页（`TrackPopupMenu`、Shell 动词
@@ -382,6 +392,15 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
         icons = desk.icons.len(),
         "桌面状态已加载"
     );
+
+    // 开机自启：若配置已启用，确保注册表中的当前 exe 路径准确有效（适应 exe 搬家或版本更新自愈）
+    if desk.settings.autostart {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Err(e) = winbosk_shell::autostart::set_autostart("WinBosk", &exe, true) {
+                tracing::warn!("同步开机自启注册表项失败: {e}");
+            }
+        }
+    }
 
     // 1) 壳层接管：探测层级并隐藏真实图标（反冲突约束：不重挂/不销毁他人窗口）。
     //    守卫确保后续任何失败都会恢复图标。
@@ -547,6 +566,7 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
         reorder_slot_order: std::collections::HashMap::new(),
         current_icon_positions: std::collections::HashMap::new(),
         drag_hint: None,
+        scroll_tweens: Vec::new(),
     };
     // 双向同步：启动时清一次——内部库被外部删除的文件、链接文件夹与栅栏的差集，
     // 都同步进栅栏（链接文件夹的预置文件启动即出现）。
@@ -592,7 +612,9 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
     memory::trim();
     memory::report("工作集修剪后");
 
-    // 6) 事件回路：App 处理交互 → 重绘 → 返回新命中模型（overlay 据此更新区域）
+    // 6) 事件回路：App 处理交互 → 重绘 → 返回新命中模型（overlay 据此更新区域）。
+    // 重绘（present）必须先于返回命中模型：区域若扩张，新暴露区域依赖刚提交的合成内容，
+    // 颠倒会露一帧陈旧内容——overlay `apply_region` 的 `bRedraw=false` 依赖此不变量。
     let runtime = Rc::new(RefCell::new(rt));
     let runtime2 = runtime.clone();
     overlay.set_event_handler(Box::new(move |ev| {
@@ -750,6 +772,62 @@ pub(crate) fn execute_auto_organize(rt: &mut Runtime) {
     }
 }
 
+/// 针对指定栅栏的规则立即执行收纳整理（从桌面栅栏与未分组项中匹配并移入）。
+pub(crate) fn execute_apply_fence_rule(rt: &mut Runtime, fence_idx: usize) {
+    let Some(target_fence) = rt.desk.fences.get(fence_idx) else {
+        return;
+    };
+    let target_fid = target_fence.id;
+    let Some(rule) = target_fence.rule.clone() else {
+        return;
+    };
+    if !rule.is_effective() {
+        return;
+    }
+
+    let desktop_dir = shell_desktop_path();
+    let src_id = rt
+        .desk
+        .fences
+        .iter()
+        .find(|f| {
+            f.id != target_fid
+                && (f.title.as_deref() == Some("桌面")
+                    || (desktop_dir.is_some()
+                        && f.storage_path.as_deref() == desktop_dir.as_deref()))
+        })
+        .map(|f| f.id);
+
+    let mut to_move = Vec::new();
+    if let Some(src_fid) = src_id {
+        if let Some(src) = rt.desk.fence(src_fid) {
+            for id in &src.icon_ids {
+                if let Some(ic) = rt.desk.icons.get(id) {
+                    if rule.matches_icon(ic) {
+                        to_move.push(id.clone());
+                    }
+                }
+            }
+        }
+    }
+    for id in &rt.desk.free_icons {
+        if let Some(ic) = rt.desk.icons.get(id) {
+            if rule.matches_icon(ic) && !to_move.contains(id) {
+                to_move.push(id.clone());
+            }
+        }
+    }
+
+    let count = to_move.len();
+    for id in to_move {
+        rt.desk.move_icon(&id, Some(target_fid));
+    }
+    if count > 0 {
+        tracing::info!(count, fence = fence_idx, "针对指定栅栏规则整理完成");
+        let _ = rt.store.save(&rt.desk);
+    }
+}
+
 /// 该事件是否代表「用户真正点/拖了某处」（内联编辑打开时据此提交/失焦）。
 /// 悬停、滚轮、定时器、注入重绘等非交互事件不在此列——它们不该关掉刚打开的编辑框。
 fn is_popup_dismiss_event(ev: &OverlayEvent) -> bool {
@@ -797,6 +875,9 @@ pub(crate) fn set_console_open(rt: &mut Runtime, open: bool) {
         } else {
             (*rt.overlay_ptr).restore_desktop_band();
         }
+        // 会话位与 Z 序同一事务推送：会话期间光标离开表面不回落（见 overlay 的
+        // WM_MOUSELEAVE），非会话期的点击唤起才随离开结束。
+        (*rt.overlay_ptr).set_console_session(open);
     }
     start_panel_tween(rt, if open { 1.0 } else { 0.0 });
 }
@@ -1080,20 +1161,46 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             add_paths_to_fence(rt, fence, &paths);
         }
         OverlayEvent::FenceScroll { fence, delta } => {
-            // 滚轮滚动：正=向上（回到开头），负=向下（看更多）。上界由 layout 钳制。
-            if let Some(f) = rt.desk.fences.get_mut(fence) {
-                let s = rt.theme.scale;
-                let step = match f.appearance.layout {
+            // 滚轮滚动：平滑阻尼插值滚动，抑制悬停动画抖动，停滚后统一防抖持久化。
+            rt.hover = None;
+            rt.icon_hover = None;
+            let s = rt.theme.scale;
+            let step = if let Some(f) = rt.desk.fences.get(fence) {
+                match f.appearance.layout {
                     FenceLayout::List => LIST_ICON_SIZE * s + rt.theme.list_row_gap,
                     FenceLayout::Grid | FenceLayout::Sidebar => {
                         (f.appearance.icon_size + f.appearance.gap) * s
                     }
+                }
+            } else {
+                40.0 * s
+            };
+            let delta_px = (delta as f32 / 120.0) * step;
+            let current_scroll = rt.desk.fences.get(fence).map(|f| f.scroll).unwrap_or(0.0);
+            let base_target = if let Some(tw) = rt.scroll_tweens.iter().find(|t| t.fence == fence) {
+                tw.to
+            } else {
+                current_scroll
+            };
+            let target = (base_target - delta_px).max(0.0);
+            if let Some(pos) = rt.scroll_tweens.iter().position(|t| t.fence == fence) {
+                rt.scroll_tweens[pos] = ScrollTween {
+                    fence,
+                    from: current_scroll,
+                    to: target,
+                    t0: Instant::now(),
+                    dur: 0.16,
                 };
-                f.scroll = (f.scroll - (delta as f32 / 120.0) * step).max(0.0);
+            } else {
+                rt.scroll_tweens.push(ScrollTween {
+                    fence,
+                    from: current_scroll,
+                    to: target,
+                    t0: Instant::now(),
+                    dur: 0.16,
+                });
             }
-            if let Err(e) = rt.store.save(&rt.desk) {
-                tracing::warn!("滚动位置持久化失败: {e}");
-            }
+            arm_anim_timer(rt);
         }
         OverlayEvent::FenceDragEnd { .. } => {
             // 拖动结束：持久化当前布局
@@ -1123,6 +1230,19 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             }
             ConsoleZone::DesktopToggle => {
                 toggle_desktop(rt);
+            }
+            ConsoleZone::AutostartToggle => {
+                let next = !rt.desk.settings.autostart;
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Err(e) = winbosk_shell::autostart::set_autostart("WinBosk", &exe, next) {
+                        tracing::error!("切换开机自启状态失败: {e}");
+                    } else {
+                        rt.desk.settings.autostart = next;
+                        if let Err(e) = rt.store.save(&rt.desk) {
+                            tracing::warn!("开机自启配置保存失败: {e}");
+                        }
+                    }
+                }
             }
             ConsoleZone::FenceSelect(i) => {
                 if i < rt.desk.fences.len() {
@@ -1332,6 +1452,158 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     .selected_fence
                     .min(rt.desk.fences.len().saturating_sub(1));
                 reset_fence_storage(rt, i);
+            }
+            ConsoleZone::ToggleAdvancedMode => {
+                rt.desk.console_advanced = !rt.desk.console_advanced;
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::RuleToggleEnabled => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    let mut rule = f.rule.clone().unwrap_or_default();
+                    rule.enabled = !rule.enabled;
+                    f.rule = Some(rule);
+                    let _ = rt.store.save(&rt.desk);
+                }
+            }
+            ConsoleZone::RuleToggleAutoCapture => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    let mut rule = f.rule.clone().unwrap_or_default();
+                    rule.auto_capture = !rule.auto_capture;
+                    f.rule = Some(rule);
+                    let _ = rt.store.save(&rt.desk);
+                }
+            }
+            ConsoleZone::RuleDeleteExtension(idx) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    if let Some(r) = f.rule.as_mut() {
+                        if idx < r.custom_extensions.len() {
+                            r.custom_extensions.remove(idx);
+                            let _ = rt.store.save(&rt.desk);
+                        }
+                    }
+                }
+            }
+            ConsoleZone::RuleDeleteExcludeExtension(idx) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    if let Some(r) = f.rule.as_mut() {
+                        if idx < r.exclude_extensions.len() {
+                            r.exclude_extensions.remove(idx);
+                            let _ = rt.store.save(&rt.desk);
+                        }
+                    }
+                }
+            }
+            ConsoleZone::RuleDeletePattern(idx) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    if let Some(r) = f.rule.as_mut() {
+                        if idx < r.name_patterns.len() {
+                            r.name_patterns.remove(idx);
+                            let _ = rt.store.save(&rt.desk);
+                        }
+                    }
+                }
+            }
+            ConsoleZone::RuleAddExtension => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                let s = rt.theme.scale;
+                let rect = if let Some((cx, cy)) = rt.cursor {
+                    RectF {
+                        x: cx - 10.0 * s,
+                        y: cy - 12.0 * s,
+                        w: 160.0 * s,
+                        h: 24.0 * s,
+                    }
+                } else {
+                    RectF {
+                        x: (rt.vw - 160.0 * s) / 2.0,
+                        y: (rt.vh - 24.0 * s) / 2.0,
+                        w: 160.0 * s,
+                        h: 24.0 * s,
+                    }
+                };
+                open_rule_input(
+                    rt,
+                    EditTarget::RuleExtension { fence: i },
+                    rect,
+                    "输入后缀如 png, jpg",
+                );
+            }
+            ConsoleZone::RuleAddExcludeExtension => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                let s = rt.theme.scale;
+                let rect = if let Some((cx, cy)) = rt.cursor {
+                    RectF {
+                        x: cx - 10.0 * s,
+                        y: cy - 12.0 * s,
+                        w: 160.0 * s,
+                        h: 24.0 * s,
+                    }
+                } else {
+                    RectF {
+                        x: (rt.vw - 160.0 * s) / 2.0,
+                        y: (rt.vh - 24.0 * s) / 2.0,
+                        w: 160.0 * s,
+                        h: 24.0 * s,
+                    }
+                };
+                open_rule_input(
+                    rt,
+                    EditTarget::RuleExcludeExtension { fence: i },
+                    rect,
+                    "输入排除后缀如 tmp, bak",
+                );
+            }
+            ConsoleZone::RuleAddPattern => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                let s = rt.theme.scale;
+                let rect = if let Some((cx, cy)) = rt.cursor {
+                    RectF {
+                        x: cx - 10.0 * s,
+                        y: cy - 12.0 * s,
+                        w: 160.0 * s,
+                        h: 24.0 * s,
+                    }
+                } else {
+                    RectF {
+                        x: (rt.vw - 160.0 * s) / 2.0,
+                        y: (rt.vh - 24.0 * s) / 2.0,
+                        w: 160.0 * s,
+                        h: 24.0 * s,
+                    }
+                };
+                open_rule_input(
+                    rt,
+                    EditTarget::RulePattern { fence: i },
+                    rect,
+                    "输入通配符如 draft*, log_?",
+                );
+            }
+            ConsoleZone::RuleApplyFence => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                execute_apply_fence_rule(rt, i);
             }
             // 标签页已随小组件一并移除；命中模型不再产生该控件，兜底吞掉。
             ConsoleZone::Tab(_) => {}
@@ -1572,6 +1844,8 @@ fn apply_theme_scale(theme: &mut Theme, scale: f32) {
     theme.scale = scale;
     theme.title.size *= scale;
     theme.label.size *= scale;
+    theme.console_title.size *= scale;
+    theme.console_label.size *= scale;
     theme.icon_size *= scale;
     theme.icon_gap *= scale;
     theme.icon_caption_gap *= scale;
