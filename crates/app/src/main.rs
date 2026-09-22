@@ -44,6 +44,10 @@ pub(crate) use windows::Win32::System::Memory::{
 };
 pub(crate) use windows::Win32::System::Ole::OleInitialize;
 pub(crate) use windows::Win32::System::Threading::CreateMutexW;
+pub(crate) use windows::Win32::UI::Controls::{
+    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDCBF_CANCEL_BUTTON,
+    TDF_USE_COMMAND_LINKS,
+};
 pub(crate) use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -772,48 +776,258 @@ pub(crate) fn execute_auto_organize(rt: &mut Runtime) {
     }
 }
 
-/// 针对指定栅栏的规则立即执行收纳整理（从桌面栅栏与未分组项中匹配并移入）。
-pub(crate) fn execute_apply_fence_rule(rt: &mut Runtime, fence_idx: usize) {
-    let Some(target_fence) = rt.desk.fences.get(fence_idx) else {
-        return;
-    };
-    let target_fid = target_fence.id;
-    let Some(rule) = target_fence.rule.clone() else {
-        return;
-    };
-    if !rule.is_effective() {
-        return;
+/// 跨栅栏命中图标的来源栅栏分组
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConflictGroup {
+    pub(crate) fence_id: u64,
+    pub(crate) fence_title: String,
+    pub(crate) icon_ids: Vec<String>,
+    pub(crate) icon_names: Vec<String>,
+}
+
+/// 冲突处理结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictResolution {
+    /// 全部转移到当前栅栏
+    MoveAll,
+    /// 仅转移特定栅栏（携带 fence_id）
+    MoveSpecific(u64),
+    /// 忽略冲突（仅收纳桌面及未分组项）
+    IgnoreConflicts,
+    /// 取消（放弃本次整理）
+    Cancel,
+}
+
+fn show_rule_conflict_dialog(
+    rt: &Runtime,
+    target_title: &str,
+    conflicts: &[ConflictGroup],
+) -> ConflictResolution {
+    let total_conflicts: usize = conflicts.iter().map(|c| c.icon_ids.len()).sum();
+    let title_w = wide("规则收纳冲突");
+    let main_inst_w = wide(&format!(
+        "发现 {} 个匹配文件已被其他栅栏收纳",
+        total_conflicts
+    ));
+
+    let mut content = format!("以下文件符合【{target_title}】规则，但当前已被其他栅栏持有：\n\n");
+    for c in conflicts {
+        let names = if c.icon_names.len() <= 4 {
+            c.icon_names.join(", ")
+        } else {
+            format!(
+                "{} 等共 {} 个文件",
+                c.icon_names[..4].join(", "),
+                c.icon_names.len()
+            )
+        };
+        content.push_str(&format!("• 【{}】：{}\n", c.fence_title, names));
+    }
+    content.push_str(&format!("\n请选择是否将文件转移收纳到【{target_title}】？"));
+    let content_w = wide(&content);
+
+    // 构造 Command Link 按钮（保持 wide 字符串存活直到调用结束）
+    let mut btn_texts_w = Vec::new();
+    let mut buttons = Vec::new();
+
+    // 按钮 101：全部转移
+    let move_all_text = wide(&format!(
+        "全部转移到【{target_title}】\n从所有其他栅栏移入全部 {total_conflicts} 个冲突文件"
+    ));
+    btn_texts_w.push(move_all_text);
+    buttons.push(TASKDIALOG_BUTTON {
+        nButtonID: 101,
+        pszButtonText: PCWSTR(btn_texts_w.last().unwrap().as_ptr()),
+    });
+
+    // 若有多个冲突栅栏，分别增加每个栅栏的专属转移按键（点选特定栅栏转移，其余忽略）
+    if conflicts.len() > 1 {
+        for (idx, c) in conflicts.iter().enumerate() {
+            let spec_text = wide(&format!(
+                "仅转移【{}】\n仅从该栅栏移入 {} 个文件，保留其他栅栏不变",
+                c.fence_title,
+                c.icon_ids.len()
+            ));
+            btn_texts_w.push(spec_text);
+            buttons.push(TASKDIALOG_BUTTON {
+                nButtonID: 102 + idx as i32,
+                pszButtonText: PCWSTR(btn_texts_w.last().unwrap().as_ptr()),
+            });
+        }
     }
 
-    let desktop_dir = shell_desktop_path();
-    let src_id = rt
-        .desk
+    // 按钮 200：忽略冲突
+    let ignore_text = wide("忽略冲突项\n保留其他栅栏不变，仅收纳桌面及未分组文件");
+    btn_texts_w.push(ignore_text);
+    buttons.push(TASKDIALOG_BUTTON {
+        nButtonID: 200,
+        pszButtonText: PCWSTR(btn_texts_w.last().unwrap().as_ptr()),
+    });
+
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: rt.hwnd,
+        pszWindowTitle: PCWSTR(title_w.as_ptr()),
+        pszMainInstruction: PCWSTR(main_inst_w.as_ptr()),
+        pszContent: PCWSTR(content_w.as_ptr()),
+        dwFlags: TDF_USE_COMMAND_LINKS,
+        dwCommonButtons: TDCBF_CANCEL_BUTTON,
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: 101,
+        ..Default::default()
+    };
+
+    let mut selected_button = 0i32;
+    unsafe {
+        let prev = GetForegroundWindow();
+        let proxy = (*rt.overlay_ptr).menu_owner();
+        (*rt.overlay_ptr).raise_to_foreground();
+
+        let _ = TaskDialogIndirect(&config, Some(&mut selected_button), None, None);
+
+        let fg = GetForegroundWindow();
+        if !prev.is_invalid() && (fg == rt.hwnd || fg == proxy) {
+            let _ = SetForegroundWindow(prev);
+        }
+    }
+
+    match selected_button {
+        101 => ConflictResolution::MoveAll,
+        b if b >= 102 && (b - 102) < conflicts.len() as i32 => {
+            let idx = (b - 102) as usize;
+            ConflictResolution::MoveSpecific(conflicts[idx].fence_id)
+        }
+        200 => ConflictResolution::IgnoreConflicts,
+        _ => ConflictResolution::Cancel,
+    }
+}
+
+/// 收集指定栅栏规则的候选项目：分为本地无冲突项与跨栅栏冲突项
+pub(crate) fn detect_rule_candidates(
+    desk: &Desk,
+    target_fid: u64,
+    rule: &winbosk_core::model::FenceRule,
+    desktop_dir: Option<&str>,
+) -> (Vec<String>, Vec<ConflictGroup>) {
+    let src_id = desk
         .fences
         .iter()
         .find(|f| {
             f.id != target_fid
                 && (f.title.as_deref() == Some("桌面")
-                    || (desktop_dir.is_some()
-                        && f.storage_path.as_deref() == desktop_dir.as_deref()))
+                    || (desktop_dir.is_some() && f.storage_path.as_deref() == desktop_dir))
         })
         .map(|f| f.id);
 
-    let mut to_move = Vec::new();
+    let mut local_matches = Vec::new();
     if let Some(src_fid) = src_id {
-        if let Some(src) = rt.desk.fence(src_fid) {
+        if let Some(src) = desk.fence(src_fid) {
             for id in &src.icon_ids {
-                if let Some(ic) = rt.desk.icons.get(id) {
+                if let Some(ic) = desk.icons.get(id) {
                     if rule.matches_icon(ic) {
-                        to_move.push(id.clone());
+                        local_matches.push(id.clone());
                     }
                 }
             }
         }
     }
-    for id in &rt.desk.free_icons {
-        if let Some(ic) = rt.desk.icons.get(id) {
-            if rule.matches_icon(ic) && !to_move.contains(id) {
-                to_move.push(id.clone());
+    for id in &desk.free_icons {
+        if let Some(ic) = desk.icons.get(id) {
+            if rule.matches_icon(ic) && !local_matches.contains(id) {
+                local_matches.push(id.clone());
+            }
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    for f in &desk.fences {
+        if f.id == target_fid || Some(f.id) == src_id {
+            continue;
+        }
+        let mut group_ids = Vec::new();
+        let mut group_names = Vec::new();
+        for id in &f.icon_ids {
+            if let Some(ic) = desk.icons.get(id) {
+                if rule.matches_icon(ic) {
+                    group_ids.push(id.clone());
+                    group_names.push(ic.display_name.clone());
+                }
+            }
+        }
+        if !group_ids.is_empty() {
+            conflicts.push(ConflictGroup {
+                fence_id: f.id,
+                fence_title: f.title.clone().unwrap_or_else(|| format!("栅栏 {}", f.id)),
+                icon_ids: group_ids,
+                icon_names: group_names,
+            });
+        }
+    }
+
+    (local_matches, conflicts)
+}
+
+/// 针对指定栅栏的规则立即执行收纳整理（包含桌面、未分组池以及跨栅栏冲突探测与弹窗选择）。
+pub(crate) fn execute_apply_fence_rule(rt: &mut Runtime, fence_idx: usize) {
+    let Some(target_fence) = rt.desk.fences.get(fence_idx) else {
+        return;
+    };
+    let target_fid = target_fence.id;
+    let target_title = target_fence
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("栅栏 {}", target_fid));
+    let Some(rule) = target_fence.rule.clone() else {
+        return;
+    };
+    if !rule.is_effective() {
+        modal_box(
+            rt,
+            "规则未开启",
+            "当前栅栏的分类规则未开启，或未配置任何包含后缀/通配符。",
+            MB_OK | MB_ICONWARNING,
+        );
+        return;
+    }
+
+    let desktop_dir = shell_desktop_path();
+    let (local_matches, conflicts) =
+        detect_rule_candidates(&rt.desk, target_fid, &rule, desktop_dir.as_deref());
+
+    // 3. 决策与收集要移动的项目
+    let mut to_move = Vec::new();
+    if conflicts.is_empty() {
+        if local_matches.is_empty() {
+            modal_box(
+                rt,
+                "规则整理提示",
+                &format!("未在桌面或未分组池中找到符合【{target_title}】规则的文件。"),
+                MB_OK,
+            );
+            return;
+        }
+        to_move.extend(local_matches);
+    } else {
+        let res = show_rule_conflict_dialog(rt, &target_title, &conflicts);
+        match res {
+            ConflictResolution::MoveAll => {
+                to_move.extend(local_matches);
+                for c in conflicts {
+                    to_move.extend(c.icon_ids);
+                }
+            }
+            ConflictResolution::MoveSpecific(fid) => {
+                to_move.extend(local_matches);
+                if let Some(c) = conflicts.into_iter().find(|c| c.fence_id == fid) {
+                    to_move.extend(c.icon_ids);
+                }
+            }
+            ConflictResolution::IgnoreConflicts => {
+                to_move.extend(local_matches);
+            }
+            ConflictResolution::Cancel => {
+                return;
             }
         }
     }
@@ -825,6 +1039,7 @@ pub(crate) fn execute_apply_fence_rule(rt: &mut Runtime, fence_idx: usize) {
     if count > 0 {
         tracing::info!(count, fence = fence_idx, "针对指定栅栏规则整理完成");
         let _ = rt.store.save(&rt.desk);
+        inject_rebuild(rt);
     }
 }
 
@@ -1323,14 +1538,10 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     .selected_fence
                     .min(rt.desk.fences.len().saturating_sub(1));
                 if let Some(f) = rt.desk.fences.get_mut(i) {
-                    if let Some(p) = preset {
-                        let mut rule = f.rule.clone().unwrap_or_default();
-                        rule.enabled = true;
-                        rule.preset = Some(p);
-                        f.rule = Some(rule);
-                    } else {
-                        f.rule = None;
-                    }
+                    let mut rule = f.rule.clone().unwrap_or_default();
+                    rule.enabled = true;
+                    rule.preset = preset;
+                    f.rule = Some(rule);
                 }
                 let _ = rt.store.save(&rt.desk);
             }
@@ -2142,6 +2353,10 @@ fn cursor_screen() -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use winbosk_core::config::AppSettings;
+    use winbosk_core::model::{
+        CategoryPreset, Fence, FenceAppearance, FenceRule, FenceState, Icon, ItemKind, Rect,
+    };
 
     /// 占位框安全网的自检：白名单必须精确覆盖"拖动中会上报的事件"，其余一律清理。
     ///
@@ -2200,7 +2415,158 @@ mod tests {
         assert!(!keeps_drag_hint(&OverlayEvent::OverlayFocusLost));
         assert!(!keeps_drag_hint(&OverlayEvent::FilesDropped {
             fence: 0,
-            paths: vec![]
+            paths: vec![],
         }));
+    }
+
+    fn make_test_fence(id: u64, title: &str) -> Fence {
+        Fence {
+            id,
+            title: Some(title.to_string()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed: false,
+        }
+    }
+
+    /// 验证规则预设切换至「全部」（preset 为 None）时保留 rule 对象与自定义后缀配置，
+    /// 杜绝之前因直接置 f.rule = None 导致规则失效的缺陷。
+    #[test]
+    fn test_rule_preset_none_preserves_custom_extensions() {
+        let mut fence = make_test_fence(1, "测试栅栏");
+        let mut initial_rule = FenceRule::default();
+        initial_rule.enabled = true;
+        initial_rule.preset = Some(CategoryPreset::Apps);
+        initial_rule.custom_extensions = vec!["bat".to_string()];
+        fence.rule = Some(initial_rule);
+
+        // 模拟用户在控制面板中点击「全部」（None）
+        let preset: Option<CategoryPreset> = None;
+        let mut rule = fence.rule.clone().unwrap_or_default();
+        rule.enabled = true;
+        rule.preset = preset;
+        fence.rule = Some(rule);
+
+        assert!(fence.rule.is_some());
+        let rule = fence.rule.as_ref().unwrap();
+        assert!(rule.enabled);
+        assert_eq!(rule.preset, None);
+        assert_eq!(rule.custom_extensions, vec!["bat".to_string()]);
+        assert!(rule.is_effective());
+    }
+
+    /// 验证跨栅栏规则冲突检测：
+    /// - 桌面源栅栏中的匹配项与未分组池中的匹配项归入本地无冲突列表；
+    /// - 其他普通栅栏中持有的匹配项归入跨栅栏冲突列表，并按来源栅栏分组。
+    #[test]
+    fn test_detect_rule_candidates_identifies_cross_fence_conflicts() {
+        let mut desk = Desk::new(AppSettings::default());
+
+        // 目标栅栏（Fence 10）
+        let target_fid = 10;
+        let target_fence = make_test_fence(target_fid, "目标栅栏");
+        desk.fences.push(target_fence);
+
+        // 桌面源栅栏（Fence 1）
+        let mut desktop_fence = make_test_fence(1, "桌面");
+        desktop_fence.storage_path = Some("C:\\Users\\Test\\Desktop".to_string());
+        desktop_fence.icon_ids.push("desktop_bat".to_string());
+        desk.fences.push(desktop_fence);
+
+        // 冲突普通栅栏（Fence 2，例如「常用应用」）
+        let mut apps_fence = make_test_fence(2, "常用应用");
+        apps_fence.icon_ids.push("apps_bat".to_string());
+        apps_fence.icon_ids.push("apps_exe".to_string());
+        desk.fences.push(apps_fence);
+
+        // 另一个无冲突普通栅栏（Fence 3）
+        let mut docs_fence = make_test_fence(3, "文档栅栏");
+        docs_fence.icon_ids.push("docs_txt".to_string());
+        desk.fences.push(docs_fence);
+
+        // 未分组池 free_icons
+        desk.free_icons.push("free_bat".to_string());
+
+        // 注册所有图标元数据
+        let make_icon = |id: &str, name: &str, path: &str, kind: ItemKind| {
+            let mut ic = Icon::new(id.to_string(), name.to_string(), kind);
+            ic.path = Some(path.to_string());
+            ic
+        };
+
+        desk.icons.insert(
+            "desktop_bat".to_string(),
+            make_icon(
+                "desktop_bat",
+                "reboot.bat",
+                "C:\\Users\\Test\\Desktop\\reboot.bat",
+                ItemKind::App,
+            ),
+        );
+        desk.icons.insert(
+            "apps_bat".to_string(),
+            make_icon(
+                "apps_bat",
+                "run.bat",
+                "C:\\Users\\Test\\Desktop\\run.bat",
+                ItemKind::App,
+            ),
+        );
+        desk.icons.insert(
+            "apps_exe".to_string(),
+            make_icon(
+                "apps_exe",
+                "tool.exe",
+                "C:\\Users\\Test\\Desktop\\tool.exe",
+                ItemKind::App,
+            ),
+        );
+        desk.icons.insert(
+            "docs_txt".to_string(),
+            make_icon(
+                "docs_txt",
+                "note.txt",
+                "C:\\Users\\Test\\Desktop\\note.txt",
+                ItemKind::Doc,
+            ),
+        );
+        desk.icons.insert(
+            "free_bat".to_string(),
+            make_icon(
+                "free_bat",
+                "build.bat",
+                "C:\\Users\\Test\\Desktop\\build.bat",
+                ItemKind::App,
+            ),
+        );
+
+        // 规则：启用，无 preset（全部），自定义包含 bat
+        let mut rule = FenceRule::default();
+        rule.enabled = true;
+        rule.preset = None;
+        rule.custom_extensions = vec!["bat".to_string()];
+
+        let (local_matches, conflicts) =
+            detect_rule_candidates(&desk, target_fid, &rule, Some("C:\\Users\\Test\\Desktop"));
+
+        // 本地无冲突项应包含桌面源栅栏中的 desktop_bat 与未分组的 free_bat
+        assert_eq!(local_matches.len(), 2);
+        assert!(local_matches.contains(&"desktop_bat".to_string()));
+        assert!(local_matches.contains(&"free_bat".to_string()));
+
+        // 冲突项应且仅应包含来自 Fence 2 的 apps_bat，apps_exe 和 docs_txt 不应出现
+        assert_eq!(conflicts.len(), 1);
+        let conflict = &conflicts[0];
+        assert_eq!(conflict.fence_id, 2);
+        assert_eq!(conflict.fence_title, "常用应用");
+        assert_eq!(conflict.icon_ids, vec!["apps_bat".to_string()]);
+        assert_eq!(conflict.icon_names, vec!["run.bat".to_string()]);
     }
 }

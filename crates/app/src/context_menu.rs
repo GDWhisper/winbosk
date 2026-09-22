@@ -481,7 +481,7 @@ pub(crate) fn warn_storage_reject(rt: &Runtime, reason: &str) {
 /// 故所有模态框都必须走这里——与 `track_popup_menu` 同一套手法。
 /// owner 用 overlay 本体而**不是**代理：代理是离屏 1×1，拿它当 owner 会把对话框
 /// 居中到 (-32000,-32000) 屏幕外。
-fn modal_box(
+pub(crate) fn modal_box(
     rt: &Runtime,
     caption: &str,
     text: &str,
