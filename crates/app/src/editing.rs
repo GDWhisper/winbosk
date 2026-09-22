@@ -293,15 +293,10 @@ pub(crate) fn apply_rule_input(rt: &mut Runtime, target: EditTarget, text: &str)
 }
 
 /// 打开规则输入框（弹出 D2D 内联编辑）。
-pub(crate) fn open_rule_input(
-    rt: &mut Runtime,
-    target: EditTarget,
-    rect: RectF,
-    placeholder: &str,
-) {
+pub(crate) fn open_rule_input(rt: &mut Runtime, target: EditTarget, placeholder: &str) {
     rt.edit = Some(InlineEdit {
         target,
-        rect,
+        rect: RectF::default(),
         lines: vec![String::new()],
         line: 0,
         col: 0,
@@ -313,7 +308,6 @@ pub(crate) fn open_rule_input(
         committing: false,
     });
     focus_overlay(rt);
-    position_ime_window(rt);
     tracing::info!(target = ?target, "打开规则输入框（D2D 内联）");
 }
 
@@ -526,14 +520,17 @@ pub(crate) fn edit_caret_point(rt: &Runtime) -> (i32, i32) {
     let font = rt.theme.label.size;
     let before: String = edit.current_line().chars().take(edit.col).collect();
     let w = label_width(&before, font) + label_width(&edit.comp, font);
-    let x = edit.rect.x + 10.0 * s + w;
-    // 文本布局顶 = 剪裁上内缩（4·scale）：光标/IME 候选窗口随文字定位，与绘制一致。
-    let y = edit.rect.y + 4.0 * s + edit.line as f32 * (font * 1.5) + font * 0.8;
+    let x = edit.rect.x + 8.0 * s + w;
+    let y = if edit.single_line {
+        edit.rect.y + edit.rect.h / 2.0
+    } else {
+        edit.rect.y + 4.0 * s + edit.line as f32 * (font * 1.5) + font * 0.8
+    };
     (x as i32, y as i32)
 }
 
 /// 鼠标点在编辑框内（x 为虚拟屏幕物理坐标）：把光标定位到对应字符。
-/// 与 `edit_caret_point` 同口径（文本左缘 = rect.x + 10*s，逐字累计宽度），
+/// 与 `edit_caret_point` 同口径（文本左缘 = rect.x + 8*s，逐字累计宽度），
 /// 半字宽以上的点击进下一格，与常见编辑器行为一致。
 pub(crate) fn edit_click(rt: &mut Runtime, x: f32) {
     let s = rt.theme.scale;
@@ -544,7 +541,7 @@ pub(crate) fn edit_click(rt: &mut Runtime, x: f32) {
     if !edit.single_line {
         return; // 多行定位需按 y 判行，重命名不用；待办编辑暂保持键盘定位
     }
-    let text_left = edit.rect.x + 10.0 * s;
+    let text_left = edit.rect.x + 8.0 * s;
     let rel = (x - text_left).max(0.0);
     let line = edit.current_line().to_string();
     let mut col = 0;

@@ -318,6 +318,8 @@ pub struct SceneRuleEditor {
     pub apply_btn: RectF,
     /// 提示引导文本与说明矩形
     pub tip_rect: RectF,
+    /// 当前激活的规则输入框矩形（若处于添加后缀/排除/通配符编辑态）
+    pub active_edit_rect: Option<RectF>,
 }
 
 /// 内联文本编辑的渲染数据（App 层 InlineEdit 的只读快照，绘制用）。

@@ -819,11 +819,18 @@ fn draw_rule_editor(
             &sec_label_b,
         );
     } else {
+        let top_y = if re.add_ext_btn.h > 0.0 {
+            re.add_ext_btn.y
+        } else if let Some(er) = re.active_edit_rect {
+            er.y
+        } else {
+            re.add_ext_btn.y
+        };
         let slr = D2D_RECT_F {
             left: re.rect.x + 12.0 * s,
-            top: re.add_ext_btn.y - 14.0 * s,
+            top: top_y - 14.0 * s,
             right: re.rect.x + re.rect.w - 12.0 * s,
-            bottom: re.add_ext_btn.y,
+            bottom: top_y,
         };
         draw_text(
             target,
@@ -867,11 +874,18 @@ fn draw_rule_editor(
             &sec_label_b,
         );
     } else {
+        let top_y = if re.add_exclude_btn.h > 0.0 {
+            re.add_exclude_btn.y
+        } else if let Some(er) = re.active_edit_rect {
+            er.y
+        } else {
+            re.add_exclude_btn.y
+        };
         let slr = D2D_RECT_F {
             left: re.rect.x + 12.0 * s,
-            top: re.add_exclude_btn.y - 14.0 * s,
+            top: top_y - 14.0 * s,
             right: re.rect.x + re.rect.w - 12.0 * s,
-            bottom: re.add_exclude_btn.y,
+            bottom: top_y,
         };
         draw_text(
             target,
@@ -922,11 +936,18 @@ fn draw_rule_editor(
             &sec_label_b,
         );
     } else {
+        let top_y = if re.add_pattern_btn.h > 0.0 {
+            re.add_pattern_btn.y
+        } else if let Some(er) = re.active_edit_rect {
+            er.y
+        } else {
+            re.add_pattern_btn.y
+        };
         let slr = D2D_RECT_F {
             left: re.rect.x + 12.0 * s,
-            top: re.add_pattern_btn.y - 14.0 * s,
+            top: top_y - 14.0 * s,
             right: re.rect.x + re.rect.w - 12.0 * s,
-            bottom: re.add_pattern_btn.y,
+            bottom: top_y,
         };
         draw_text(
             target,
@@ -1008,6 +1029,9 @@ fn draw_chip_add_button(
     formats: &TextFormats,
     accent: [f32; 4],
 ) {
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return;
+    }
     let s = theme.scale;
     let rr = D2D1_ROUNDED_RECT {
         rect: D2D_RECT_F {
@@ -2370,7 +2394,7 @@ fn draw_inline_edit(
     formats: &TextFormats,
 ) -> Result<()> {
     let s = theme.scale;
-    let pad_x = 10.0 * s;
+    let pad_x = 8.0 * s;
     let font = theme.label.size;
     let line_h = font * 1.5;
     let rr = D2D1_ROUNDED_RECT {
@@ -2380,25 +2404,29 @@ fn draw_inline_edit(
             right: e.rect.x + e.rect.w,
             bottom: e.rect.y + e.rect.h,
         },
-        radiusX: 7.0 * s,
-        radiusY: 7.0 * s,
+        radiusX: 4.0 * s,
+        radiusY: 4.0 * s,
     };
-    let bg_alpha = if e.focused { 0.10 } else { 0.06 };
-    let bg = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, bg_alpha]), None)? };
+    let bg_color = if e.focused {
+        [0.10, 0.13, 0.20, 0.96]
+    } else {
+        [0.10, 0.13, 0.20, 0.85]
+    };
+    let bg = unsafe { target.CreateSolidColorBrush(&color(bg_color), None)? };
     unsafe { target.FillRoundedRectangle(&rr, &bg) };
     if e.focused {
-        let edge = unsafe { target.CreateSolidColorBrush(&color([0.35, 0.62, 1.0, 0.9]), None)? };
+        let edge = unsafe { target.CreateSolidColorBrush(&color([0.35, 0.62, 1.0, 0.95]), None)? };
         unsafe { target.DrawRoundedRectangle(&rr, &edge, 1.2, None) };
     } else {
-        let edge = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.14]), None)? };
+        let edge = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.20]), None)? };
         unsafe { target.DrawRoundedRectangle(&rr, &edge, 1.0, None) };
     }
 
     let clip = D2D_RECT_F {
-        left: e.rect.x + 6.0 * s,
-        top: e.rect.y + 4.0 * s,
-        right: e.rect.x + e.rect.w - 6.0 * s,
-        bottom: e.rect.y + e.rect.h - 4.0 * s,
+        left: e.rect.x + 2.0 * s,
+        top: e.rect.y + 1.0 * s,
+        right: e.rect.x + e.rect.w - 2.0 * s,
+        bottom: e.rect.y + e.rect.h - 1.0 * s,
     };
     unsafe { target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) };
 
@@ -2406,15 +2434,15 @@ fn draw_inline_edit(
     if empty && !e.placeholder.is_empty() {
         let lr = D2D_RECT_F {
             left: e.rect.x + pad_x,
-            top: e.rect.y + (e.rect.h - font * 1.6) / 2.0,
+            top: e.rect.y,
             right: e.rect.x + e.rect.w - pad_x,
             bottom: e.rect.y + e.rect.h,
         };
-        let pb = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.36]), None)? };
-        draw_text(target, &e.placeholder, &formats.detail, lr, &pb);
+        let pb = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.45]), None)? };
+        draw_text(target, &e.placeholder, &formats.edit, lr, &pb);
     } else {
         let top0 = if e.single_line {
-            e.rect.y + (e.rect.h - font * 1.6) / 2.0
+            e.rect.y
         } else {
             e.rect.y + pad_x / 2.0
         };
@@ -2427,23 +2455,35 @@ fn draw_inline_edit(
             } else {
                 line.clone()
             };
-            let lr = D2D_RECT_F {
-                left: e.rect.x + pad_x,
-                top: top0 + li as f32 * line_h,
-                right: e.rect.x + e.rect.w - pad_x,
-                bottom: top0 + li as f32 * line_h + font * 1.6,
+            let lr = if e.single_line {
+                D2D_RECT_F {
+                    left: e.rect.x + pad_x,
+                    top: e.rect.y,
+                    right: e.rect.x + e.rect.w - pad_x,
+                    bottom: e.rect.y + e.rect.h,
+                }
+            } else {
+                D2D_RECT_F {
+                    left: e.rect.x + pad_x,
+                    top: top0 + li as f32 * line_h,
+                    right: e.rect.x + e.rect.w - pad_x,
+                    bottom: top0 + li as f32 * line_h + font * 1.6,
+                }
             };
-            let tb = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.92]), None)? };
+            let tb = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.95]), None)? };
             draw_text(target, &text, &formats.edit, lr, &tb);
             if e.focused && is_caret {
                 let before: String = line.chars().take(e.col).collect();
                 let before_w =
                     text_estimate_width(&before, font) + text_estimate_width(&e.comp, font);
                 let caret_x = e.rect.x + pad_x + before_w;
-                let caret_y = if e.single_line {
-                    e.rect.y + (e.rect.h - font * 1.6) / 2.0
+                let (caret_y1, caret_y2) = if e.single_line {
+                    let cy = e.rect.y + e.rect.h / 2.0;
+                    let half = (font * 0.65).min(e.rect.h / 2.0 - 2.0 * s);
+                    (cy - half, cy + half)
                 } else {
-                    top0 + li as f32 * line_h
+                    let y = top0 + li as f32 * line_h;
+                    (y, y + font * 1.4)
                 };
                 let blink_on = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2455,11 +2495,11 @@ fn draw_inline_edit(
                     };
                     let p1 = windows_numerics::Vector2 {
                         X: caret_x,
-                        Y: caret_y,
+                        Y: caret_y1,
                     };
                     let p2 = windows_numerics::Vector2 {
                         X: caret_x,
-                        Y: caret_y + font * 1.4,
+                        Y: caret_y2,
                     };
                     unsafe { target.DrawLine(p1, p2, &cb, 1.4, None) };
                 }

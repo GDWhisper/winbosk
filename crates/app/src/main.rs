@@ -1522,26 +1522,9 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 let i = rt
                     .selected_fence
                     .min(rt.desk.fences.len().saturating_sub(1));
-                let s = rt.theme.scale;
-                let rect = if let Some((cx, cy)) = rt.cursor {
-                    RectF {
-                        x: cx - 10.0 * s,
-                        y: cy - 12.0 * s,
-                        w: 160.0 * s,
-                        h: 24.0 * s,
-                    }
-                } else {
-                    RectF {
-                        x: (rt.vw - 160.0 * s) / 2.0,
-                        y: (rt.vh - 24.0 * s) / 2.0,
-                        w: 160.0 * s,
-                        h: 24.0 * s,
-                    }
-                };
                 open_rule_input(
                     rt,
                     EditTarget::RuleExtension { fence: i },
-                    rect,
                     "输入后缀如 png, jpg",
                 );
             }
@@ -1549,26 +1532,9 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 let i = rt
                     .selected_fence
                     .min(rt.desk.fences.len().saturating_sub(1));
-                let s = rt.theme.scale;
-                let rect = if let Some((cx, cy)) = rt.cursor {
-                    RectF {
-                        x: cx - 10.0 * s,
-                        y: cy - 12.0 * s,
-                        w: 160.0 * s,
-                        h: 24.0 * s,
-                    }
-                } else {
-                    RectF {
-                        x: (rt.vw - 160.0 * s) / 2.0,
-                        y: (rt.vh - 24.0 * s) / 2.0,
-                        w: 160.0 * s,
-                        h: 24.0 * s,
-                    }
-                };
                 open_rule_input(
                     rt,
                     EditTarget::RuleExcludeExtension { fence: i },
-                    rect,
                     "输入排除后缀如 tmp, bak",
                 );
             }
@@ -1576,26 +1542,9 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 let i = rt
                     .selected_fence
                     .min(rt.desk.fences.len().saturating_sub(1));
-                let s = rt.theme.scale;
-                let rect = if let Some((cx, cy)) = rt.cursor {
-                    RectF {
-                        x: cx - 10.0 * s,
-                        y: cy - 12.0 * s,
-                        w: 160.0 * s,
-                        h: 24.0 * s,
-                    }
-                } else {
-                    RectF {
-                        x: (rt.vw - 160.0 * s) / 2.0,
-                        y: (rt.vh - 24.0 * s) / 2.0,
-                        w: 160.0 * s,
-                        h: 24.0 * s,
-                    }
-                };
                 open_rule_input(
                     rt,
                     EditTarget::RulePattern { fence: i },
-                    rect,
                     "输入通配符如 draft*, log_?",
                 );
             }

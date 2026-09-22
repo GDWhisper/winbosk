@@ -289,7 +289,18 @@ pub(crate) fn build_scene(rt: &mut Runtime, now: Instant) -> Scene {
     // 控制中心：关闭后完全不渲染（不留胶囊）；展开动画期间 panel > 0 才画。
     let panel = rt.console_anim.panel;
     if rt.desk.console_open || panel > 0.01 {
-        scene.console = Some(build_console(rt, &rt.console_anim));
+        let console = build_console(rt, &rt.console_anim);
+        if let Some(re) = &console.rule_editor {
+            if let Some(active_r) = re.active_edit_rect {
+                if let Some(e) = rt.edit.as_mut() {
+                    if e.rect != active_r {
+                        e.rect = active_r;
+                        position_ime_window(rt);
+                    }
+                }
+            }
+        }
+        scene.console = Some(console);
     }
     // 内联编辑（最后绘制，浮于所有内容之上）
     scene.edit = rt.edit.as_ref().map(|e| SceneEdit {
@@ -743,18 +754,28 @@ pub(crate) fn storage_zones(
     zones
 }
 
+/// 芯片流式排版结果
+struct ChipsLayout {
+    chips: Vec<(String, RectF, RectF)>,
+    add_btn: RectF,
+    edit_rect: Option<RectF>,
+    end_y: f32,
+}
+
 /// 计算带「添加」按钮的标签芯片流式自动换行排版
+#[allow(clippy::too_many_arguments)]
 fn layout_chips_with_add(
     items: &[String],
     add_btn_text: &str,
+    is_editing: bool,
     start_x: f32,
     start_y: f32,
     max_w: f32,
     scale: f32,
     font_size: f32,
-) -> (Vec<(String, RectF, RectF)>, RectF, f32) {
-    let chip_h = 20.0 * scale;
-    let row_pitch = 24.0 * scale;
+) -> ChipsLayout {
+    let chip_h = 22.0 * scale;
+    let row_pitch = 26.0 * scale;
     let gap = 5.0 * scale;
     let del_w = 14.0 * scale;
     let mut chips = Vec::with_capacity(items.len());
@@ -784,19 +805,45 @@ fn layout_chips_with_add(
         cur_x += chip_w + gap;
     }
 
-    let add_w = winbosk_core::text::estimate_width(add_btn_text, font_size) + 16.0 * scale;
-    if cur_x + add_w > start_x + max_w && cur_x > start_x {
-        cur_x = start_x;
-        cur_y += row_pitch;
+    if is_editing {
+        let edit_w = (140.0 * scale).min(max_w);
+        if cur_x + edit_w > start_x + max_w && cur_x > start_x {
+            cur_x = start_x;
+            cur_y += row_pitch;
+        }
+        let edit_rect = RectF {
+            x: cur_x,
+            y: cur_y,
+            w: edit_w,
+            h: chip_h,
+        };
+        let end_y = cur_y + chip_h;
+        ChipsLayout {
+            chips,
+            add_btn: RectF::default(),
+            edit_rect: Some(edit_rect),
+            end_y,
+        }
+    } else {
+        let add_w = winbosk_core::text::estimate_width(add_btn_text, font_size) + 16.0 * scale;
+        if cur_x + add_w > start_x + max_w && cur_x > start_x {
+            cur_x = start_x;
+            cur_y += row_pitch;
+        }
+        let add_btn = RectF {
+            x: cur_x,
+            y: cur_y,
+            w: add_w,
+            h: chip_h,
+        };
+        let end_y = cur_y + chip_h;
+        ChipsLayout {
+            chips,
+            add_btn,
+            edit_rect: None,
+            end_y,
+        }
     }
-    let add_btn = RectF {
-        x: cur_x,
-        y: cur_y,
-        w: add_w,
-        h: chip_h,
-    };
-    let end_y = cur_y + chip_h;
-    (chips, add_btn, end_y)
 }
 
 /// 构建控制中心面板场景（栅栏管理单页）。关闭后完全隐藏（无胶囊），
@@ -1217,41 +1264,53 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         }
         cur_y += 30.0 * s;
 
+        let is_editing_ext = matches!(rt.edit.as_ref().map(|e| e.target), Some(EditTarget::RuleExtension { fence }) if fence == sel);
+        let is_editing_exclude = matches!(rt.edit.as_ref().map(|e| e.target), Some(EditTarget::RuleExcludeExtension { fence }) if fence == sel);
+        let is_editing_pattern = matches!(rt.edit.as_ref().map(|e| e.target), Some(EditTarget::RulePattern { fence }) if fence == sel);
+
         // 3. 后缀白名单芯片列表 + 添加按钮
-        let (ext_chips, add_ext_btn, next_y1) = layout_chips_with_add(
+        let ext_layout = layout_chips_with_add(
             &rule.custom_extensions,
             "＋ 添加后缀",
+            is_editing_ext,
             rx,
             cur_y + 16.0 * s,
             rw,
             s,
             theme.console_label.size * DETAIL_SIZE_RATIO,
         );
-        cur_y = next_y1 + 10.0 * s;
+        cur_y = ext_layout.end_y + 10.0 * s;
 
         // 4. 排除黑名单后缀芯片列表 + 添加按钮
-        let (exclude_chips, add_exclude_btn, next_y2) = layout_chips_with_add(
+        let exclude_layout = layout_chips_with_add(
             &rule.exclude_extensions,
             "＋ 排除后缀",
+            is_editing_exclude,
             rx,
             cur_y + 16.0 * s,
             rw,
             s,
             theme.console_label.size * DETAIL_SIZE_RATIO,
         );
-        cur_y = next_y2 + 10.0 * s;
+        cur_y = exclude_layout.end_y + 10.0 * s;
 
         // 5. 通配符模式芯片列表 + 添加按钮
-        let (pattern_chips, add_pattern_btn, next_y3) = layout_chips_with_add(
+        let pattern_layout = layout_chips_with_add(
             &rule.name_patterns,
             "＋ 添加通配符",
+            is_editing_pattern,
             rx,
             cur_y + 16.0 * s,
             rw,
             s,
             theme.console_label.size * DETAIL_SIZE_RATIO,
         );
-        cur_y = next_y3 + 12.0 * s;
+        cur_y = pattern_layout.end_y + 12.0 * s;
+
+        let active_edit_rect = ext_layout
+            .edit_rect
+            .or(exclude_layout.edit_rect)
+            .or(pattern_layout.edit_rect);
 
         // 6. 自动捕获开关
         let auto_capture_toggle = RectF {
@@ -1293,16 +1352,17 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
             rule_enabled: rule.enabled,
             toggle_btn,
             preset_chips,
-            ext_chips,
-            add_ext_btn,
-            exclude_chips,
-            add_exclude_btn,
-            pattern_chips,
-            add_pattern_btn,
+            ext_chips: ext_layout.chips,
+            add_ext_btn: ext_layout.add_btn,
+            exclude_chips: exclude_layout.chips,
+            add_exclude_btn: exclude_layout.add_btn,
+            pattern_chips: pattern_layout.chips,
+            add_pattern_btn: pattern_layout.add_btn,
             auto_capture_toggle,
             auto_capture_val: rule.auto_capture,
             apply_btn,
             tip_rect,
+            active_edit_rect,
         })
     } else {
         None
@@ -3223,9 +3283,10 @@ mod tests {
         let scale = 1.0;
         let font_size = 12.0;
 
-        let (chips, add_btn, end_y) = layout_chips_with_add(
+        let normal = layout_chips_with_add(
             &items,
             "＋ 添加后缀",
+            false,
             start_x,
             start_y,
             max_w,
@@ -3233,10 +3294,11 @@ mod tests {
             font_size,
         );
 
-        assert_eq!(chips.len(), items.len());
+        assert_eq!(normal.chips.len(), items.len());
+        assert!(normal.edit_rect.is_none());
         // 宽度限制在 200.0，较长文字必然导致换行
         let mut saw_wrap = false;
-        for (i, (name, rect, del_btn)) in chips.iter().enumerate() {
+        for (i, (name, rect, del_btn)) in normal.chips.iter().enumerate() {
             assert_eq!(name, &items[i]);
             // 芯片在 x 轴起点不小于 start_x
             assert!(rect.x >= start_x);
@@ -3248,7 +3310,26 @@ mod tests {
             }
         }
         assert!(saw_wrap, "多项长名称应触发换行");
-        assert!(add_btn.w > 0.0 && add_btn.h > 0.0);
-        assert!(end_y >= add_btn.y + add_btn.h);
+        assert!(normal.add_btn.w > 0.0 && normal.add_btn.h > 0.0);
+        assert!(normal.end_y >= normal.add_btn.y + normal.add_btn.h);
+
+        // 测试编辑模式：add_btn 隐藏，生成 edit_rect 且位于芯片之后
+        let edit_mode = layout_chips_with_add(
+            &items,
+            "＋ 添加后缀",
+            true,
+            start_x,
+            start_y,
+            max_w,
+            scale,
+            font_size,
+        );
+        assert_eq!(edit_mode.add_btn.w, 0.0);
+        assert_eq!(edit_mode.add_btn.h, 0.0);
+        let er = edit_mode.edit_rect.expect("编辑模式必须生成 edit_rect");
+        assert!(er.x >= start_x);
+        assert!(er.w > 0.0);
+        assert!(er.h > 0.0);
+        assert!(edit_mode.end_y >= er.y + er.h);
     }
 }
