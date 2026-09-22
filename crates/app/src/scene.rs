@@ -784,7 +784,7 @@ fn layout_chips_with_add(
         cur_x += chip_w + gap;
     }
 
-    let add_w = winbosk_core::text::estimate_width(add_btn_text, font_size) + 14.0 * scale;
+    let add_w = winbosk_core::text::estimate_width(add_btn_text, font_size) + 16.0 * scale;
     if cur_x + add_w > start_x + max_w && cur_x > start_x {
         cur_x = start_x;
         cur_y += row_pitch;
@@ -809,8 +809,8 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
     let title_h = CONSOLE_TITLE_H * s;
     let content_top = panel.y + title_h;
 
-    // —— 标题栏：关闭 + 模式切换（简化/高级） ——
-    let mode_btn_w = 56.0 * s;
+    // —— 标题栏：关闭 + 模式切换单按钮（简化/高级） ——
+    let mode_btn_w = CONSOLE_CLOSE_W * s;
     let mode_toggle = RectF {
         x: panel.x + panel.w - CONSOLE_CLOSE_W * s - 8.0 * s - mode_btn_w - 6.0 * s,
         y: panel.y + 8.0 * s,
@@ -1183,7 +1183,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         let mut cur_y = content_top + 8.0 * s;
 
         // 1. 标题与总开关
-        let toggle_w = 78.0 * s;
+        let toggle_w = 96.0 * s;
         let toggle_h = 24.0 * s;
         let toggle_btn = RectF {
             x: rx + rw - toggle_w,
@@ -1276,7 +1276,7 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
             x: rx,
             y: cur_y,
             w: rw,
-            h: 90.0 * s,
+            h: 102.0 * s,
         };
 
         Some(SceneRuleEditor {

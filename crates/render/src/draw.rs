@@ -427,23 +427,60 @@ fn draw_console_content(
         unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.62 * a]), None)? };
     draw_text(target, "✕", &formats.console_close, close_lr, &close_brush);
 
-    // 标题栏：模式切换按钮（简化 / 高级）
+    // 标题栏：模式切换单按钮（⤢ 高级模式 / ⤡ 简化模式）
+    let mode_hover = matches!(c.hover_zone, Some(ConsoleZone::ToggleAdvancedMode));
     if c.mode_toggle.w > 0.0 {
-        let mode_hover = matches!(c.hover_zone, Some(ConsoleZone::ToggleAdvancedMode));
-        let mode_label = if c.advanced {
-            "⤡ 简化"
-        } else {
-            "⤢ 高级"
+        let btn_rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: c.mode_toggle.x,
+                top: c.mode_toggle.y,
+                right: c.mode_toggle.x + c.mode_toggle.w,
+                bottom: c.mode_toggle.y + c.mode_toggle.h,
+            },
+            radiusX: 8.0 * s,
+            radiusY: 8.0 * s,
         };
-        draw_segmented_button(
+        if mode_hover {
+            let hov_bg =
+                unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.15 * a]), None)? };
+            unsafe { target.FillRoundedRectangle(&btn_rr, &hov_bg) };
+        } else if c.advanced {
+            let act_bg = unsafe {
+                target.CreateSolidColorBrush(
+                    &color([accent[0], accent[1], accent[2], 0.22 * a]),
+                    None,
+                )?
+            };
+            unsafe { target.FillRoundedRectangle(&btn_rr, &act_bg) };
+        }
+
+        let mode_icon = if c.advanced { "⤡" } else { "⤢" };
+        let iw = text_estimate_width(mode_icon, theme.console_title.size);
+        let icon_lr = D2D_RECT_F {
+            left: c.mode_toggle.x + (c.mode_toggle.w - iw) / 2.0,
+            top: c.mode_toggle.y + (c.mode_toggle.h - theme.console_title.size * 1.6) / 2.0,
+            right: c.mode_toggle.x + c.mode_toggle.w,
+            bottom: c.mode_toggle.y + c.mode_toggle.h,
+        };
+        let icon_color = if mode_hover {
+            [1.0, 1.0, 1.0, 0.95 * a]
+        } else if c.advanced {
+            [
+                accent[0] * 0.4 + 0.6,
+                accent[1] * 0.4 + 0.6,
+                accent[2] * 0.4 + 0.6,
+                0.95 * a,
+            ]
+        } else {
+            [1.0, 1.0, 1.0, 0.62 * a]
+        };
+        let icon_brush = unsafe { target.CreateSolidColorBrush(&color(icon_color), None)? };
+        draw_text(
             target,
-            theme,
-            c.mode_toggle,
-            mode_label,
-            c.advanced,
-            mode_hover,
-            formats,
-            accent,
+            mode_icon,
+            &formats.console_close,
+            icon_lr,
+            &icon_brush,
         );
     }
 
@@ -470,6 +507,51 @@ fn draw_console_content(
         if let Some(re) = &c.rule_editor {
             draw_rule_editor(target, theme, c, re, formats, a, accent)?;
         }
+    }
+
+    // 模式切换悬停提示气泡：置顶绘制在整个控制面板最上层
+    if mode_hover && c.mode_toggle.w > 0.0 {
+        let tip_text = if c.advanced {
+            "简化模式"
+        } else {
+            "高级模式"
+        };
+        let font_size = theme.label.size;
+        let pad_x = 8.0 * s;
+        let pad_y = 5.0 * s;
+        let tw = text_estimate_width(tip_text, font_size) + pad_x * 2.0;
+        let th = font_size * 1.6 + pad_y * 2.0;
+        let mut tx = c.mode_toggle.x + c.mode_toggle.w / 2.0 - tw / 2.0;
+        tx = tx.clamp(c.x + 8.0 * s, c.x + c.width - tw - 8.0 * s);
+        let ty = c.mode_toggle.y + c.mode_toggle.h + 4.0 * s;
+
+        let tip_rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: tx,
+                top: ty,
+                right: tx + tw,
+                bottom: ty + th,
+            },
+            radiusX: 6.0 * s,
+            radiusY: 6.0 * s,
+        };
+        let tip_bg =
+            unsafe { target.CreateSolidColorBrush(&color([0.10, 0.12, 0.18, 0.96 * a]), None)? };
+        let tip_border =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.35 * a]), None)? };
+        let tip_brush =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.95 * a]), None)? };
+        unsafe {
+            target.FillRoundedRectangle(&tip_rr, &tip_bg);
+            target.DrawRoundedRectangle(&tip_rr, &tip_border, 1.0 * s, None);
+        }
+        let text_lr = D2D_RECT_F {
+            left: tx + pad_x,
+            top: ty + pad_y,
+            right: tx + tw - pad_x,
+            bottom: ty + th - pad_y,
+        };
+        draw_text(target, tip_text, &formats.label, text_lr, &tip_brush);
     }
 
     Ok(())
@@ -759,12 +841,11 @@ fn draw_rule_editor(
         );
     }
     let add_ext_hover = matches!(c.hover_zone, Some(ConsoleZone::RuleAddExtension));
-    draw_segmented_button(
+    draw_chip_add_button(
         target,
         theme,
         re.add_ext_btn,
         "＋ 添加后缀",
-        false,
         add_ext_hover,
         formats,
         accent,
@@ -815,15 +896,14 @@ fn draw_rule_editor(
         );
     }
     let add_ex_hover = matches!(c.hover_zone, Some(ConsoleZone::RuleAddExcludeExtension));
-    draw_segmented_button(
+    draw_chip_add_button(
         target,
         theme,
         re.add_exclude_btn,
         "＋ 排除后缀",
-        false,
         add_ex_hover,
         formats,
-        accent,
+        [0.85, 0.35, 0.35, 0.9],
     );
 
     // 5. 通配符模式
@@ -871,12 +951,11 @@ fn draw_rule_editor(
         );
     }
     let add_pat_hover = matches!(c.hover_zone, Some(ConsoleZone::RuleAddPattern));
-    draw_segmented_button(
+    draw_chip_add_button(
         target,
         theme,
         re.add_pattern_btn,
         "＋ 添加通配符",
-        false,
         add_pat_hover,
         formats,
         accent,
@@ -917,6 +996,60 @@ fn draw_rule_editor(
     draw_rule_tip_card(target, theme, re.tip_rect, formats);
 
     Ok(())
+}
+
+/// 规则芯片添加按钮（与芯片同高、使用 detail 字体，保证文本完整显示且不溢出）
+fn draw_chip_add_button(
+    target: &ID2D1RenderTarget,
+    theme: &Theme,
+    rect: RectF,
+    label: &str,
+    hover: bool,
+    formats: &TextFormats,
+    accent: [f32; 4],
+) {
+    let s = theme.scale;
+    let rr = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: rect.x,
+            top: rect.y,
+            right: rect.x + rect.w,
+            bottom: rect.y + rect.h,
+        },
+        radiusX: 4.0 * s,
+        radiusY: 4.0 * s,
+    };
+    let fill = if hover {
+        [accent[0], accent[1], accent[2], 0.28]
+    } else {
+        [1.0, 1.0, 1.0, 0.08]
+    };
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(fill), None) } {
+        unsafe { target.FillRoundedRectangle(&rr, &b) };
+    }
+    let stroke = if hover {
+        [accent[0], accent[1], accent[2], 0.65]
+    } else {
+        [1.0, 1.0, 1.0, 0.20]
+    };
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(stroke), None) } {
+        unsafe { target.DrawRoundedRectangle(&rr, &b, 1.0, None) };
+    }
+    let font_size = theme.console_label.size * crate::theme::DETAIL_SIZE_RATIO;
+    let lr = D2D_RECT_F {
+        left: rect.x,
+        top: rect.y + (rect.h - font_size * 1.6) / 2.0,
+        right: rect.x + rect.w,
+        bottom: rect.y + rect.h,
+    };
+    let text_color = if hover {
+        [1.0, 1.0, 1.0, 0.98]
+    } else {
+        [1.0, 1.0, 1.0, 0.75]
+    };
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(text_color), None) } {
+        draw_text_centered(target, label, &formats.console_detail, lr, &b);
+    }
 }
 
 /// 规则标签芯片（文字 + 删除「×」按钮）
@@ -976,7 +1109,7 @@ fn draw_rule_chip(
     }
 }
 
-/// 规则提示卡片（给足使用提示，避免用户茫然）
+/// 规则提示卡片（按行渲染，给足使用提示，杜绝多行文本截断）
 fn draw_rule_tip_card(
     target: &ID2D1RenderTarget,
     theme: &Theme,
@@ -1002,15 +1135,25 @@ fn draw_rule_tip_card(
     if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(stroke), None) } {
         unsafe { target.DrawRoundedRectangle(&rr, &b, 1.0, None) };
     }
-    let lr = D2D_RECT_F {
-        left: rect.x + 8.0 * s,
-        top: rect.y + 6.0 * s,
-        right: rect.x + rect.w - 8.0 * s,
-        bottom: rect.y + rect.h - 6.0 * s,
-    };
-    let text = "💡 规则配置说明：\n• 后缀白名单：如 png, docx（可用逗号或空格分隔）\n• 排除黑名单：优先排除指定扩展名（如 tmp, bak）\n• 通配符模式：* 匹配任意字符，? 匹配单字符（如 log*）\n• 自动捕获：桌面新增匹配文件时将自动移入此栅栏";
-    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color([0.82, 0.88, 0.95, 0.85]), None) } {
-        draw_text(target, text, &formats.console_detail, lr, &b);
+    let font_size = theme.console_label.size * crate::theme::DETAIL_SIZE_RATIO;
+    let line_h = font_size * 1.5;
+    let lines = [
+        "💡 规则配置说明：",
+        "• 包含后缀：如 png, docx（可用逗号或空格分隔）",
+        "• 排除后缀：优先排除指定扩展名（如 tmp, bak）",
+        "• 通配符模式：* 匹配任意字符，? 匹配单字符",
+        "• 自动捕获：桌面新增匹配文件时将自动移入此栅栏",
+    ];
+    if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color([0.82, 0.88, 0.95, 0.88]), None) } {
+        for (i, line) in lines.iter().enumerate() {
+            let line_rect = D2D_RECT_F {
+                left: rect.x + 10.0 * s,
+                top: rect.y + 6.0 * s + i as f32 * line_h,
+                right: rect.x + rect.w - 10.0 * s,
+                bottom: rect.y + 6.0 * s + (i + 1) as f32 * line_h,
+            };
+            draw_text(target, line, &formats.console_detail, line_rect, &b);
+        }
     }
 }
 
@@ -1463,6 +1606,7 @@ fn draw_tint_swatch(
 }
 
 /// 分段按钮：圆角底 + 居中文字；`active` = 强调色填充，`hover` = 提亮。
+/// 文本宽度自适应：当正文字号过紧或放不下时，智能选用 detail 级小号字体，彻底杜绝非预期截断与省略号。
 #[allow(clippy::too_many_arguments)]
 fn draw_segmented_button(
     target: &ID2D1RenderTarget,
@@ -1495,15 +1639,23 @@ fn draw_segmented_button(
     if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color(fill), None) } {
         unsafe { target.FillRoundedRectangle(&rr, &b) };
     }
+    let label_font_size = theme.console_label.size;
+    let detail_font_size = label_font_size * crate::theme::DETAIL_SIZE_RATIO;
+    let pad = 6.0 * s;
+    let (fmt, font_size) = if text_estimate_width(label, label_font_size) + pad * 2.0 <= rect.w {
+        (&formats.console_label, label_font_size)
+    } else {
+        (&formats.console_detail, detail_font_size)
+    };
     let lr = D2D_RECT_F {
         left: rect.x,
-        top: rect.y + (rect.h - theme.console_label.size * 1.6) / 2.0,
+        top: rect.y + (rect.h - font_size * 1.6) / 2.0,
         right: rect.x + rect.w,
         bottom: rect.y + rect.h,
     };
     let alpha = if active { 0.96 } else { 0.80 };
     if let Ok(b) = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, alpha]), None) } {
-        draw_text_centered(target, label, &formats.console_label, lr, &b);
+        draw_text_centered(target, label, fmt, lr, &b);
     }
 }
 
@@ -2196,7 +2348,17 @@ fn draw_text_centered(
         right: rect.right,
         ..rect
     };
-    draw_text(target, &shown, format, centered, brush);
+    let wide: Vec<u16> = shown.encode_utf16().collect();
+    unsafe {
+        target.DrawText(
+            &wide,
+            format,
+            &centered,
+            brush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            DWRITE_MEASURING_MODE_NATURAL,
+        );
+    }
 }
 
 /// 内联文本编辑渲染：输入行底 + 文本（含 IME 合成串）+ 光标 + 聚焦描边。
