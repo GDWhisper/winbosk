@@ -2636,7 +2636,8 @@ fn draw_fence_inner(
                         .unwrap_or(fence.x + fence.width - theme.fence_padding),
                     bottom: ty + label_h,
                 };
-                draw_text(target, &icon.label, &formats.label, name_lr, &brushes.label);
+                // 名称列：中段省略 + 保住扩展名（其余列仍走尾部省略号）
+                draw_name_text(target, &icon.label, &formats.label, name_lr, &brushes.label);
                 if let Some(cols) = fence.list_cols {
                     let type_lr = D2D_RECT_F {
                         left: cols.type_x,
@@ -2798,7 +2799,7 @@ fn draw_fence_inner(
                         right: tt.x + tt.w - pad,
                         bottom: tt.y + tt.h - pad,
                     };
-                    draw_text(target, &icon.label, &formats.label, lr, &brushes.label);
+                    draw_name_text(target, &icon.label, &formats.label, lr, &brushes.label);
                 }
             }
         }
@@ -2922,7 +2923,35 @@ fn draw_text(
     let font_size = unsafe { format.GetFontSize() };
     let max_w = (rect.right - rect.left).max(0.0);
     let shown = truncate_to_fit(text, max_w, font_size);
-    let wide: Vec<u16> = shown.encode_utf16().collect();
+    draw_wide(target, &shown, format, rect, brush);
+}
+
+/// 画**文件名**标签（单行）：超出时中段省略并保住扩展名。
+///
+/// 与 `draw_text` 的分工：类型 / 修改日期 / 大小等列不是文件名，尾部省略号即可；
+/// 文件名若也尾部省略，后缀名必然被砍掉，用户认不出文件类型（见 `elide_name`）。
+fn draw_name_text(
+    target: &ID2D1RenderTarget,
+    text: &str,
+    format: &IDWriteTextFormat,
+    rect: D2D_RECT_F,
+    brush: &ID2D1SolidColorBrush,
+) {
+    let font_size = unsafe { format.GetFontSize() };
+    let max_w = (rect.right - rect.left).max(0.0);
+    let shown = elide_single_line(text, max_w, font_size);
+    draw_wide(target, &shown, format, rect, brush);
+}
+
+/// 把已定稿的单行文本（可能含「…」）画进矩形：NO_WRAP，超出部分裁剪。
+fn draw_wide(
+    target: &ID2D1RenderTarget,
+    text: &str,
+    format: &IDWriteTextFormat,
+    rect: D2D_RECT_F,
+    brush: &ID2D1SolidColorBrush,
+) {
+    let wide: Vec<u16> = text.encode_utf16().collect();
     unsafe {
         target.DrawText(
             &wide,
@@ -2952,17 +2981,7 @@ fn draw_text_centered(
         right: rect.right,
         ..rect
     };
-    let wide: Vec<u16> = shown.encode_utf16().collect();
-    unsafe {
-        target.DrawText(
-            &wide,
-            format,
-            &centered,
-            brush,
-            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-            DWRITE_MEASURING_MODE_NATURAL,
-        );
-    }
+    draw_wide(target, &shown, format, centered, brush);
 }
 
 /// 内联文本编辑渲染：输入行底 + 文本（含 IME 合成串）+ 光标 + 聚焦描边。
@@ -3095,28 +3114,149 @@ fn text_fits(text: &str, max_w: f32, font_size: f32) -> bool {
     text_estimate_width(text, font_size) <= max_w
 }
 
+/// 省略号（U+2026）。绘制层统一用它，避免「...」与「…」混用。
+const ELLIPSIS: &str = "…";
+
 /// 放不下时截断成「…」：从前往后保留放得下的字符，末尾补省略号（Windows 风格）。
+///
+/// **不是文件名**的文本（类型 / 修改日期 / 大小 / 提示语）走这里；文件名标签走
+/// [`elide_single_line`]——它中段省略并保住扩展名。
 fn truncate_to_fit<'a>(text: &'a str, max_w: f32, font_size: f32) -> std::borrow::Cow<'a, str> {
     if text.is_empty() || text_fits(text, max_w, font_size) {
         return std::borrow::Cow::Borrowed(text);
     }
-    let ell = "…";
-    let ell_w = text_estimate_width(ell, font_size);
+    let ell_w = text_estimate_width(ELLIPSIS, font_size);
     // 预算扣除省略号宽度；极窄时至少留半个字宽，保证能放一个字符 + 省略号
     let budget = (max_w - ell_w).max(font_size * 0.5);
-    let mut out = String::new();
-    for c in text.chars() {
-        let w = if c.is_ascii() { 0.62 } else { 1.0 } * font_size;
-        if text_estimate_width(&out, font_size) + w > budget {
-            break;
-        }
-        out.push(c);
-    }
-    out.push_str(ell);
+    let mut out = take_prefix(text, budget, font_size);
+    out.push_str(ELLIPSIS);
     std::borrow::Cow::Owned(out)
 }
 
-/// 网格图标文件名标签：最多两行，第一行塞满、第二行放不下时末尾补省略号。
+/// 从头贪心取放得进 `budget` 的最长前缀（按 `char` 累加，绝不切开多字节字符）。
+fn take_prefix(s: &str, budget: f32, font_size: f32) -> String {
+    let mut out = String::new();
+    let mut used = 0.0;
+    for c in s.chars() {
+        let w = char_w(c, font_size);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out
+}
+
+/// 取末尾放得进 `budget` 的最长后缀（口径同 `take_prefix`）。
+fn take_tail(s: &str, budget: f32, font_size: f32) -> String {
+    let mut out = String::new();
+    let mut used = 0.0;
+    for c in s.chars().rev() {
+        let w = char_w(c, font_size);
+        if used + w > budget {
+            break;
+        }
+        out.insert(0, c);
+        used += w;
+    }
+    out
+}
+
+/// 按 `.` 切出「主体 + 扩展名」：扩展名**含点**，无扩展名时是空串。
+///
+/// 判定与 Windows 一致：最后一个 `.` 不在首位（`.gitignore` 是「无扩展名的隐藏文件」）、
+/// 且点后非空（`name.` 没有扩展名）。`.` 恒为单字节，`split_at` 不会切断 UTF-8。
+fn split_name_ext(text: &str) -> (&str, &str) {
+    match text.rfind('.') {
+        Some(i) if i > 0 && i + 1 < text.len() => text.split_at(i),
+        _ => (text, ""),
+    }
+}
+
+/// 名称中段省略的切分结果：被丢掉的字符位于 `head` 与 `tail` 之间（调用方以「…」占位）。
+#[derive(Debug, PartialEq, Eq)]
+struct ElidedName {
+    head: String,
+    tail: String,
+}
+
+/// 文件名中段省略（Windows 资源管理器风格）：**扩展名必须完整可见**，丢的是主体中段。
+///
+/// 取舍优先级：**扩展名完整** > **尾部主体** > **头部主体**——「后缀名不能被省略掉」
+/// 这条要求就落在这里：先按 `tail_budget` 从扩展名向前贪心补齐主体末尾，剩余预算给头部；
+/// 扩展名自身比 `tail_budget` 宽时允许侵占头部预算（两者之和是硬上限，总宽不超预算）。
+/// 无扩展名的名字（文件夹、`.gitignore`）退化为通用中段省略，同样保住尾段。
+///
+/// 返回 `None` 表示头尾已把整串接上（没有任何字符被丢），调用方应改走普通折行/原样绘制。
+/// 宽度口径与 `text_estimate_width` 一致；只按 `char` 边界切分，不切开多字节字符。
+fn elide_name(
+    text: &str,
+    head_budget: f32,
+    tail_budget: f32,
+    font_size: f32,
+) -> Option<ElidedName> {
+    if text.is_empty() || font_size <= 0.0 || head_budget <= 0.0 || tail_budget <= 0.0 {
+        return None;
+    }
+    let (stem, ext) = split_name_ext(text);
+    let ext_w = text_estimate_width(ext, font_size);
+    // 扩展名优先：尾巴预算不够时从头部借，但总量封顶 = 头 + 尾
+    let room = if ext_w <= tail_budget {
+        tail_budget
+    } else {
+        ext_w.min(head_budget + tail_budget)
+    };
+    let mut tail = String::new();
+    let tail_w;
+    if ext_w <= room {
+        let mut used = 0.0;
+        for c in stem.chars().rev() {
+            let w = char_w(c, font_size);
+            if used + ext_w + w > room {
+                break;
+            }
+            tail.insert(0, c);
+            used += w;
+        }
+        tail.push_str(ext);
+        tail_w = used + ext_w;
+    } else {
+        // 扩展名自身就超预算（极窄宽度）：只保它的尾段，避免整串被丢空
+        tail = take_tail(text, room, font_size);
+        if tail.is_empty() {
+            return None;
+        }
+        tail_w = text_estimate_width(&tail, font_size);
+    }
+
+    // 尾巴不侵入头部：`tail` 恒是 `text` 的后缀，按字节长度即可反推它的起点
+    let tail_start = text.len() - tail.len();
+    // 头部的预算：扩展名借过位的，头相应让位（保证 head + 「…」+ tail 不超总预算）
+    let borrowed = (tail_w - tail_budget).max(0.0);
+    let head_room = (head_budget - borrowed).max(0.0);
+    let head = take_prefix(&text[..tail_start], head_room, font_size);
+    if head.len() == tail_start {
+        return None;
+    }
+    Some(ElidedName { head, tail })
+}
+
+/// 单行文件名：超出时中段省略并**保住扩展名**（Windows 资源管理器风格）。
+fn elide_single_line<'a>(text: &'a str, max_w: f32, font_size: f32) -> std::borrow::Cow<'a, str> {
+    if text.is_empty() || text_fits(text, max_w, font_size) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let ell_w = text_estimate_width(ELLIPSIS, font_size);
+    let avail = (max_w - ell_w).max(0.0);
+    // 头尾各占一半预算；扩展名放不下时由 `elide_name` 自行向头部借
+    if let Some(e) = elide_name(text, avail * 0.5, avail * 0.5, font_size) {
+        return std::borrow::Cow::Owned(format!("{}{}{}", e.head, ELLIPSIS, e.tail));
+    }
+    truncate_to_fit(text, max_w, font_size)
+}
+
+/// 网格图标文件名标签：最多两行，两行放不下时**中段省略并保住扩展名**（见 `wrap_two_lines`）。
 /// 手工断行后以 `\n` 交给 DWrite（NO_WRAP 格式下 `\n` 仍恒产生换行），
 /// 避免长文件名被单行截断掉大半。估算口径与 `truncate_to_fit` 一致（CJK 1.0、
 /// ASCII 0.62 倍字宽，DWrite 实际 CJK 正好 1.0 em、ASCII 更窄，偏保守不超宽）。
@@ -3143,46 +3283,42 @@ fn draw_caption(
     }
 }
 
-/// 把文本断成最多两行（第二行末尾放不下时补省略号），返回含 `\n` 的字符串。
+/// 普通两行折行：整串都能装进两行时返回 `行1\n行2`（无省略），装不下返回 `None`。
+fn wrap_plain_two_lines(text: &str, max_w: f32, font_size: f32) -> Option<String> {
+    let line1 = take_prefix(text, max_w, font_size);
+    let rest = &text[line1.len()..];
+    if rest.is_empty() {
+        return Some(line1);
+    }
+    if !text_fits(rest, max_w, font_size) {
+        return None;
+    }
+    Some(format!("{line1}\n{rest}"))
+}
+
+/// 把文件名断成最多两行（两行放不下时中段省略），返回含 `\n` 的字符串。
+///
+/// 省略策略遵循 Windows 原生：**后缀名必须可见**。旧实现是「第一行塞满、第二行末尾补
+/// 省略号」，长文件名一律把扩展名连同尾部一起砍掉（`很长的名字.docx` → `很长的名…`），
+/// 用户反而认不出文件类型；现在改成行 1 放头、行 2 放「…」+ 尾，尾由 [`elide_name`]
+/// 保证先装下 `.docx` 再向前补主体字符。
 fn wrap_two_lines(text: &str, max_w: f32, font_size: f32) -> String {
     if text.is_empty() || max_w <= 0.0 {
         return String::new();
     }
-    // 单行放得下：整串返回（DWrite 单行绘制）
-    if text_fits(text, max_w, font_size) {
-        return text.to_string();
+    // 两行装得下：整串显示，不加省略号
+    if let Some(plain) = wrap_plain_two_lines(text, max_w, font_size) {
+        return plain;
     }
-    let ell = "…";
-    let ell_w = text_estimate_width(ell, font_size);
-    // 第一行：贪心塞满 max_w
-    let mut line1 = String::new();
-    for c in text.chars() {
-        if text_estimate_width(&line1, font_size) + char_w(c, font_size) > max_w {
-            break;
-        }
-        line1.push(c);
+    let ell_w = text_estimate_width(ELLIPSIS, font_size);
+    // 中段省略：行 1 放头；行 2 放「…」+ 尾，故尾巴预算 = 行 2 容量 − 省略号
+    if let Some(e) = elide_name(text, max_w, (max_w - ell_w).max(0.0), font_size) {
+        return format!("{}{}{}{}", e.head, '\n', ELLIPSIS, e.tail);
     }
-    let rest = &text[line1.len()..];
-    if rest.is_empty() {
-        return line1;
-    }
-    // 第二行：预算预留省略号宽度
+    // 兜底：宽度窄到连「…」都容不下（正常栅栏几何不会到这）——保住头部
     let budget = (max_w - ell_w).max(font_size * 0.5);
-    let mut line2 = String::new();
-    for c in rest.chars() {
-        if text_estimate_width(&line2, font_size) + char_w(c, font_size) > budget {
-            break;
-        }
-        line2.push(c);
-    }
-    let rest2 = &rest[line2.len()..];
-    let mut out = line1;
-    out.push('\n');
-    out.push_str(&line2);
-    if !rest2.is_empty() {
-        out.push_str(ell);
-    }
-    out
+    let head = take_prefix(text, budget, font_size);
+    format!("{head}{ELLIPSIS}")
 }
 
 /// 单个字符估算宽（与 `estimate_width` 同口径）。
@@ -3459,10 +3595,68 @@ mod tests {
     }
 
     #[test]
-    fn wrap_two_lines_ellipsis_on_third_line() {
-        // 12 个 CJK 字（144px），两行共 12 字 → 第一行 6 字 + 第二行 5 字 + 省略号
-        let out = wrap_two_lines("一二三四五六七八九十一二", 72.0, 12.0);
-        assert_eq!(out, "一二三四五六\n七八九十一…");
+    fn wrap_two_lines_exact_two_lines_needs_no_ellipsis() {
+        // 12 个 CJK 字（144px）正好填满两行 → 不省略（旧实现会白扣一个省略号位）
+        assert_eq!(
+            wrap_two_lines("一二三四五六七八九十一二", 72.0, 12.0),
+            "一二三四五六\n七八九十一二"
+        );
+    }
+
+    /// 本次修复的主断言：长文件名在两行里放不下时，**后缀名必须显示**，
+    /// 省略点落在主体中段（行 2 = 「…」+ 尾），而不是把尾巴（含扩展名）整个砍掉。
+    #[test]
+    fn wrap_two_lines_keeps_extension_when_overflowing() {
+        // 12 个 CJK（144px）+ ".docx"（37.2px）= 181.2px，两行只有 144px → 省略
+        let out = wrap_two_lines("一个很长很长的文件名示例.docx", 72.0, 12.0);
+        assert_eq!(out, "一个很长很长\n…例.docx");
+        assert!(out.ends_with(".docx"), "后缀名必须可见：{out}");
+    }
+
+    /// 单行（列表视图名称列）同样保后缀名：头 + 「…」+ 尾。
+    #[test]
+    fn elide_single_line_keeps_extension() {
+        let out = elide_single_line("一个很长很长的文件名示例.docx", 72.0, 12.0);
+        assert!(out.ends_with(".docx"), "后缀名必须可见：{out}");
+        assert!(out.contains('…'), "过长时必须出现省略点：{out}");
+        // 放得下则原样返回，不引入省略号
+        assert_eq!(elide_single_line("短名.docx", 72.0, 12.0), "短名.docx");
+        assert_eq!(elide_single_line("", 72.0, 12.0), "");
+    }
+
+    /// 无扩展名的名字（文件夹 / `.gitignore`）退化为通用中段省略，仍保住尾段。
+    #[test]
+    fn elide_name_without_extension_keeps_tail() {
+        // 无扩展名：头尾各占一半预算，尾部同样保留（不整体丢弃）
+        let out = elide_single_line("一二三四五六七八九十一二", 72.0, 12.0);
+        assert_eq!(out, "一二…一二");
+        // 首点开头（.gitignore）：不当扩展名，但尾部照旧保留
+        let dot = elide_single_line(".gitignore_and_more_chars", 120.0, 12.0);
+        assert!(dot.ends_with("chars"), "尾部必须保留：{dot}");
+        assert!(dot.contains('…'), "过长时必须出现省略点：{dot}");
+    }
+
+    /// 取舍优先级：扩展名 > 尾部主体 > 头部主体——扩展名放不下时从头部预算里借。
+    #[test]
+    fn elide_name_prioritizes_extension_over_head() {
+        // 尾巴预算 12px（仅 1 个 CJK），扩展名 ".docx" 需 37.2px → 借头部预算
+        let e = elide_name("一二三四五六.docx", 72.0, 12.0, 12.0).expect("应发生省略");
+        assert_eq!(e.tail, ".docx");
+        assert_eq!(e.head, "一二三");
+        // 头尾相接、没有任何字符被丢 → 不省略（调用方原样绘制）
+        assert_eq!(elide_name("短.docx", 72.0, 72.0, 12.0), None);
+    }
+
+    #[test]
+    fn split_name_ext_matches_windows_rules() {
+        assert_eq!(split_name_ext("报告.docx"), ("报告", ".docx"));
+        assert_eq!(split_name_ext("archive.tar.gz"), ("archive.tar", ".gz"));
+        // 首点 = 隐藏文件，无扩展名
+        assert_eq!(split_name_ext(".gitignore"), (".gitignore", ""));
+        // 尾点后为空 = 无扩展名
+        assert_eq!(split_name_ext("name."), ("name.", ""));
+        assert_eq!(split_name_ext("文件夹"), ("文件夹", ""));
+        assert_eq!(split_name_ext(""), ("", ""));
     }
 
     #[test]
