@@ -2083,6 +2083,7 @@ fn on_mouse_move(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                 ResizeZone::TopRight => {
                     r.y += dy;
                     r.h -= dy;
+                    r.w += dx;
                 }
             }
             let event = OverlayEvent::FenceResize {

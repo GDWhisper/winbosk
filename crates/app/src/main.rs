@@ -72,7 +72,9 @@ pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 pub(crate) use winbosk_core::config::ConfigStore;
-pub(crate) use winbosk_core::magnet::{settle_move, settle_resize, FreeSides, FENCE_GAP};
+pub(crate) use winbosk_core::magnet::{
+    settle_move, settle_resize_with_push, FreeSides, ResizePushConfig, FENCE_GAP,
+};
 pub(crate) use winbosk_core::model::{
     Desk, Fence, FenceAppearance, FenceLayout, FenceState, FenceStyle, Icon, Rect, SidebarPosition,
     Vec2,
@@ -201,6 +203,17 @@ pub(crate) struct DragHint {
     pub(crate) requested: Rect,
 }
 
+/// 调整栅栏尺寸期间的状态（瞬态，不持久化）。
+///
+/// 记录拖拽开始时各栅栏的初始状态，确保在单次拖拽中来回拉伸平滑可逆且不发生漂移。
+pub(crate) struct ResizeSession {
+    pub(crate) fence: usize,
+    /// 拖拽开始时各栅栏用于碰撞计算的矩形（真实高度入算）
+    pub(crate) initial_collision_rects: Vec<Rect>,
+    /// 拖拽开始时各栅栏的模型 bounds
+    pub(crate) initial_bounds: Vec<Rect>,
+}
+
 /// App 运行时：领域模型 + 渲染 + 持久化的组合根。
 ///
 /// 由 `OverlayEvent` 回调持有（`Rc<RefCell>`），事件在主线程 wnd_proc 中同步处理，
@@ -278,6 +291,8 @@ pub(crate) struct Runtime {
     /// 系统抢占、模态弹窗打断）时，占位框必须立刻消失，否则它会因并入窗口区域
     /// 而持续吞掉那块区域的桌面点击。
     pub(crate) drag_hint: Option<DragHint>,
+    /// 栅栏调整尺寸拖拽会话（拖拽中保持基准，拖拽结束清空）。
+    pub(crate) resize_session: Option<ResizeSession>,
     /// 栅栏平滑滚动阻尼补间。
     pub(crate) scroll_tweens: Vec<ScrollTween>,
 }
@@ -570,6 +585,7 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
         reorder_slot_order: std::collections::HashMap::new(),
         current_icon_positions: std::collections::HashMap::new(),
         drag_hint: None,
+        resize_session: None,
         scroll_tweens: Vec::new(),
     };
     // 双向同步：启动时清一次——内部库被外部删除的文件、链接文件夹与栅栏的差集，
@@ -1151,6 +1167,9 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
         rt.drag_hint = None;
         reserved_changed = true;
     }
+    if rt.resize_session.is_some() && !keeps_drag_hint(&ev) {
+        rt.resize_session = None;
+    }
     // 就地重命名编辑期间，真正的用户交互事件先提交编辑（资源管理器行为：点击别处即确认）。
     // 只对「用户确实在别处点/拖/滚」的事件提交——定时器（SyncLibrary）与悬停高亮
     // （HoverEnter/Leave）不算，否则编辑框会被后台同步或鼠标扫过自动关掉，用户根本没
@@ -1232,11 +1251,28 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             if fence < rt.desk.fences.len() && rt.desk.fences[fence].collapsed {
                 return None;
             }
-            // 拖边缘/角标：只动可动边，被其它栅栏挡住时停在交界边（不侵入），
-            // 边接近时吸附对齐；锚定边不动，最小尺寸/屏幕边界约束在算法内完成。
-            // 直接落到目标（无补间），视觉 = 模型 = 鼠标，即时跟手。
+            if fence >= rt.desk.fences.len() {
+                return None;
+            }
+
+            // 初始化或获取单次调整尺寸拖拽会话（记录初始位置，防止连续微调时单向漂移）
+            if rt.resize_session.as_ref().map(|s| s.fence) != Some(fence) {
+                let initial_collision_rects: Vec<Rect> = (0..rt.desk.fences.len())
+                    .map(|i| fence_collision_rect(rt, i))
+                    .collect();
+                let initial_bounds: Vec<Rect> = rt.desk.fences.iter().map(|f| f.bounds).collect();
+                rt.resize_session = Some(ResizeSession {
+                    fence,
+                    initial_collision_rects,
+                    initial_bounds,
+                });
+            }
+
+            let session = rt.resize_session.as_ref().unwrap();
+            let initial_collision = session.initial_collision_rects.clone();
+            let initial_bounds = session.initial_bounds.clone();
+
             let (nx, ny, nw, nh) = rect;
-            let others = other_bounds(rt, fence);
             let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
             let free = match zone {
                 ResizeZone::Right => FreeSides::Right,
@@ -1247,15 +1283,29 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 ResizeZone::TopRight => FreeSides::TopRight,
             };
             let cand = Rect::new(nx, ny, nw, nh);
-            let mut out = settle_resize(
+            let fixed: Vec<bool> = rt
+                .desk
+                .fences
+                .iter()
+                .enumerate()
+                .map(|(i, f)| i != fence && f.appearance.layout == FenceLayout::Sidebar)
+                .collect();
+
+            let new_rects = settle_resize_with_push(
+                &initial_collision,
+                fence,
                 &cand,
-                &others,
-                &wa,
-                free,
-                MIN_FENCE_W,
-                MIN_FENCE_H,
-                FENCE_GAP,
+                &ResizePushConfig {
+                    screen: &wa,
+                    free,
+                    min_w: MIN_FENCE_W,
+                    min_h: MIN_FENCE_H,
+                    gap: FENCE_GAP,
+                    fixed: &fixed,
+                },
             );
+
+            let mut out = new_rects[fence];
             // 侧边栏 dock：厚度轴锁定为「紧贴放大图标」的停靠值——纵向锁 x/w、
             // 横向锁 y/h，只保留用户拖动的那一轴，宽度/高度弹回锁定值，放大图标不再被裁。
             if let Some(f) = rt.desk.fences.get(fence) {
@@ -1275,7 +1325,21 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 }
             }
             if let Some(f) = rt.desk.fences.get_mut(fence) {
-                f.bounds = out;
+                f.bounds = Rect::new(out.x.round(), out.y.round(), out.w.round(), out.h.round());
+            }
+
+            // 同步更新所有被推开的邻居栅栏位置
+            for i in 0..rt.desk.fences.len() {
+                if i != fence
+                    && i < new_rects.len()
+                    && i < initial_collision.len()
+                    && i < initial_bounds.len()
+                {
+                    let dx = new_rects[i].x - initial_collision[i].x;
+                    let dy = new_rects[i].y - initial_collision[i].y;
+                    rt.desk.fences[i].bounds.x = (initial_bounds[i].x + dx).round();
+                    rt.desk.fences[i].bounds.y = (initial_bounds[i].y + dy).round();
+                }
             }
         }
         OverlayEvent::IconDoubleClicked { fence, icon } => {
@@ -1418,6 +1482,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             arm_anim_timer(rt);
         }
         OverlayEvent::FenceDragEnd { .. } => {
+            rt.resize_session = None;
             // 拖动结束：持久化当前布局
             if let Err(e) = rt.store.save(&rt.desk) {
                 tracing::warn!("布局持久化失败: {e}");

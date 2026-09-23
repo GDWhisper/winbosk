@@ -347,6 +347,395 @@ pub fn settle_resize(
     r
 }
 
+/// 栅栏调整尺寸带推挤的配置参数
+#[derive(Debug, Clone, Copy)]
+pub struct ResizePushConfig<'a> {
+    pub screen: &'a Rect,
+    pub free: FreeSides,
+    pub min_w: f32,
+    pub min_h: f32,
+    pub gap: f32,
+    pub fixed: &'a [bool],
+}
+
+struct PushContext<'a> {
+    active_idx: usize,
+    orig_active: Rect,
+    screen: &'a Rect,
+    gap: f32,
+    fixed: &'a [bool],
+}
+
+impl<'a> PushContext<'a> {
+    fn is_fixed(&self, i: usize) -> bool {
+        self.fixed.get(i).copied().unwrap_or(false)
+    }
+}
+
+fn push_direction_right(
+    ctx: &PushContext,
+    active: &mut Rect,
+    cur_rects: &mut [Rect],
+    initial_fences: &[Rect],
+    min_w: f32,
+) {
+    if active.right() <= ctx.orig_active.right() {
+        return;
+    }
+    for _ in 0..4 {
+        let mut max_overflow = 0.0f32;
+        let mut queue = vec![ctx.active_idx];
+        let mut in_chain = vec![false; cur_rects.len()];
+        in_chain[ctx.active_idx] = true;
+
+        while let Some(pusher_idx) = queue.pop() {
+            let pusher = cur_rects[pusher_idx];
+            for (target_idx, target_rect) in cur_rects.iter_mut().enumerate() {
+                if target_idx == ctx.active_idx || target_idx == pusher_idx {
+                    continue;
+                }
+                if initial_fences[target_idx].x < initial_fences[pusher_idx].x {
+                    continue;
+                }
+                if clearance_y(&pusher, target_rect) >= ctx.gap {
+                    continue;
+                }
+                let req_x = pusher.right() + ctx.gap;
+                if target_rect.x < req_x {
+                    let shift = req_x - target_rect.x;
+                    if ctx.is_fixed(target_idx) {
+                        max_overflow = max_overflow.max(shift);
+                    } else {
+                        target_rect.x = req_x;
+                        let target_overflow = target_rect.right() - ctx.screen.right();
+                        if target_overflow > 0.0 {
+                            max_overflow = max_overflow.max(target_overflow);
+                        }
+                        if !in_chain[target_idx] {
+                            in_chain[target_idx] = true;
+                            queue.push(target_idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        if max_overflow > 0.001 {
+            let old_w = active.w;
+            active.w = (active.w - max_overflow).max(min_w);
+            let reduced = old_w - active.w;
+            cur_rects.copy_from_slice(initial_fences);
+            cur_rects[ctx.active_idx] = *active;
+            if reduced <= 0.001 {
+                for (target_idx, rect) in cur_rects.iter_mut().enumerate() {
+                    if target_idx != ctx.active_idx
+                        && !ctx.is_fixed(target_idx)
+                        && rect.right() > ctx.screen.right()
+                    {
+                        rect.x = (ctx.screen.right() - rect.w).max(ctx.screen.x);
+                    }
+                }
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+fn push_direction_left(
+    ctx: &PushContext,
+    active: &mut Rect,
+    cur_rects: &mut [Rect],
+    initial_fences: &[Rect],
+    min_w: f32,
+) {
+    if active.x >= ctx.orig_active.x {
+        return;
+    }
+    for _ in 0..4 {
+        let mut max_overflow = 0.0f32;
+        let mut queue = vec![ctx.active_idx];
+        let mut in_chain = vec![false; cur_rects.len()];
+        in_chain[ctx.active_idx] = true;
+
+        while let Some(pusher_idx) = queue.pop() {
+            let pusher = cur_rects[pusher_idx];
+            for (target_idx, target_rect) in cur_rects.iter_mut().enumerate() {
+                if target_idx == ctx.active_idx || target_idx == pusher_idx {
+                    continue;
+                }
+                if initial_fences[target_idx].right() > initial_fences[pusher_idx].right() {
+                    continue;
+                }
+                if clearance_y(&pusher, target_rect) >= ctx.gap {
+                    continue;
+                }
+                let req_right = pusher.x - ctx.gap;
+                let req_x = req_right - target_rect.w;
+                if target_rect.x > req_x {
+                    let shift = target_rect.x - req_x;
+                    if ctx.is_fixed(target_idx) {
+                        max_overflow = max_overflow.max(shift);
+                    } else {
+                        target_rect.x = req_x;
+                        let target_overflow = ctx.screen.x - target_rect.x;
+                        if target_overflow > 0.0 {
+                            max_overflow = max_overflow.max(target_overflow);
+                        }
+                        if !in_chain[target_idx] {
+                            in_chain[target_idx] = true;
+                            queue.push(target_idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        if max_overflow > 0.001 {
+            let old_w = active.w;
+            active.x += max_overflow;
+            active.w = (active.w - max_overflow).max(min_w);
+            let reduced = old_w - active.w;
+            cur_rects.copy_from_slice(initial_fences);
+            cur_rects[ctx.active_idx] = *active;
+            if reduced <= 0.001 {
+                for (target_idx, rect) in cur_rects.iter_mut().enumerate() {
+                    if target_idx != ctx.active_idx
+                        && !ctx.is_fixed(target_idx)
+                        && rect.x < ctx.screen.x
+                    {
+                        rect.x = ctx.screen.x;
+                    }
+                }
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+fn push_direction_bottom(
+    ctx: &PushContext,
+    active: &mut Rect,
+    cur_rects: &mut [Rect],
+    initial_fences: &[Rect],
+    min_h: f32,
+) {
+    if active.bottom() <= ctx.orig_active.bottom() {
+        return;
+    }
+    for _ in 0..4 {
+        let mut max_overflow = 0.0f32;
+        let mut queue = vec![ctx.active_idx];
+        let mut in_chain = vec![false; cur_rects.len()];
+        in_chain[ctx.active_idx] = true;
+
+        while let Some(pusher_idx) = queue.pop() {
+            let pusher = cur_rects[pusher_idx];
+            for (target_idx, target_rect) in cur_rects.iter_mut().enumerate() {
+                if target_idx == ctx.active_idx || target_idx == pusher_idx {
+                    continue;
+                }
+                if initial_fences[target_idx].y < initial_fences[pusher_idx].y {
+                    continue;
+                }
+                if clearance_x(&pusher, target_rect) >= ctx.gap {
+                    continue;
+                }
+                let req_y = pusher.bottom() + ctx.gap;
+                if target_rect.y < req_y {
+                    let shift = req_y - target_rect.y;
+                    if ctx.is_fixed(target_idx) {
+                        max_overflow = max_overflow.max(shift);
+                    } else {
+                        target_rect.y = req_y;
+                        let target_overflow = target_rect.bottom() - ctx.screen.bottom();
+                        if target_overflow > 0.0 {
+                            max_overflow = max_overflow.max(target_overflow);
+                        }
+                        if !in_chain[target_idx] {
+                            in_chain[target_idx] = true;
+                            queue.push(target_idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        if max_overflow > 0.001 {
+            let old_h = active.h;
+            active.h = (active.h - max_overflow).max(min_h);
+            let reduced = old_h - active.h;
+            cur_rects.copy_from_slice(initial_fences);
+            cur_rects[ctx.active_idx] = *active;
+            if reduced <= 0.001 {
+                for (target_idx, rect) in cur_rects.iter_mut().enumerate() {
+                    if target_idx != ctx.active_idx
+                        && !ctx.is_fixed(target_idx)
+                        && rect.bottom() > ctx.screen.bottom()
+                    {
+                        rect.y = (ctx.screen.bottom() - rect.h).max(ctx.screen.y);
+                    }
+                }
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+fn push_direction_top(
+    ctx: &PushContext,
+    active: &mut Rect,
+    cur_rects: &mut [Rect],
+    initial_fences: &[Rect],
+    min_h: f32,
+) {
+    if active.y >= ctx.orig_active.y {
+        return;
+    }
+    for _ in 0..4 {
+        let mut max_overflow = 0.0f32;
+        let mut queue = vec![ctx.active_idx];
+        let mut in_chain = vec![false; cur_rects.len()];
+        in_chain[ctx.active_idx] = true;
+
+        while let Some(pusher_idx) = queue.pop() {
+            let pusher = cur_rects[pusher_idx];
+            for (target_idx, target_rect) in cur_rects.iter_mut().enumerate() {
+                if target_idx == ctx.active_idx || target_idx == pusher_idx {
+                    continue;
+                }
+                if initial_fences[target_idx].bottom() > initial_fences[pusher_idx].bottom() {
+                    continue;
+                }
+                if clearance_x(&pusher, target_rect) >= ctx.gap {
+                    continue;
+                }
+                let req_bottom = pusher.y - ctx.gap;
+                let req_y = req_bottom - target_rect.h;
+                if target_rect.y > req_y {
+                    let shift = target_rect.y - req_y;
+                    if ctx.is_fixed(target_idx) {
+                        max_overflow = max_overflow.max(shift);
+                    } else {
+                        target_rect.y = req_y;
+                        let target_overflow = ctx.screen.y - target_rect.y;
+                        if target_overflow > 0.0 {
+                            max_overflow = max_overflow.max(target_overflow);
+                        }
+                        if !in_chain[target_idx] {
+                            in_chain[target_idx] = true;
+                            queue.push(target_idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        if max_overflow > 0.001 {
+            let old_h = active.h;
+            active.y += max_overflow;
+            active.h = (active.h - max_overflow).max(min_h);
+            let reduced = old_h - active.h;
+            cur_rects.copy_from_slice(initial_fences);
+            cur_rects[ctx.active_idx] = *active;
+            if reduced <= 0.001 {
+                for (target_idx, rect) in cur_rects.iter_mut().enumerate() {
+                    if target_idx != ctx.active_idx
+                        && !ctx.is_fixed(target_idx)
+                        && rect.y < ctx.screen.y
+                    {
+                        rect.y = ctx.screen.y;
+                    }
+                }
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+/// 缩放尺寸解算（带推挤效果）：
+/// 调整 `active_idx` 栅栏尺寸时，顺应扩张方向推开其它邻近栅栏（支持链式推挤）；
+/// 碰触屏幕工作区边界或固定栅栏时反向阻挡，防止越界。
+pub fn settle_resize_with_push(
+    fences: &[Rect],
+    active_idx: usize,
+    cand: &Rect,
+    config: &ResizePushConfig,
+) -> Vec<Rect> {
+    let n = fences.len();
+    if n == 0 || active_idx >= n {
+        return fences.to_vec();
+    }
+
+    let orig_active = fences[active_idx];
+    let mut active = *cand;
+    apply_min(&mut active, config.free, config.min_w, config.min_h);
+    clamp_resize(&mut active, config.screen, config.free);
+
+    let mut cur_rects = fences.to_vec();
+    cur_rects[active_idx] = active;
+
+    let ctx = PushContext {
+        active_idx,
+        orig_active,
+        screen: config.screen,
+        gap: config.gap,
+        fixed: config.fixed,
+    };
+
+    let active_dx = if config.free.right_free() {
+        (active.right() - orig_active.right()).max(0.0)
+    } else if config.free.left_free() {
+        (orig_active.x - active.x).max(0.0)
+    } else {
+        0.0
+    };
+
+    let active_dy = if config.free.bottom_free() {
+        (active.bottom() - orig_active.bottom()).max(0.0)
+    } else if config.free.top_free() {
+        (orig_active.y - active.y).max(0.0)
+    } else {
+        0.0
+    };
+
+    let do_horizontal = |active: &mut Rect, cur_rects: &mut [Rect]| {
+        let base_fences = cur_rects.to_vec();
+        if config.free.right_free() {
+            push_direction_right(&ctx, active, cur_rects, &base_fences, config.min_w);
+        } else if config.free.left_free() {
+            push_direction_left(&ctx, active, cur_rects, &base_fences, config.min_w);
+        }
+    };
+
+    let do_vertical = |active: &mut Rect, cur_rects: &mut [Rect]| {
+        let base_fences = cur_rects.to_vec();
+        if config.free.bottom_free() {
+            push_direction_bottom(&ctx, active, cur_rects, &base_fences, config.min_h);
+        } else if config.free.top_free() {
+            push_direction_top(&ctx, active, cur_rects, &base_fences, config.min_h);
+        }
+    };
+
+    if active_dy > active_dx {
+        do_vertical(&mut active, &mut cur_rects);
+        do_horizontal(&mut active, &mut cur_rects);
+    } else {
+        do_horizontal(&mut active, &mut cur_rects);
+        do_vertical(&mut active, &mut cur_rects);
+    }
+
+    cur_rects[active_idx] = active;
+    cur_rects
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +919,225 @@ mod tests {
             let settled = settle_move(&cand, &[o], &screen, g);
             // 距屏幕边界足够远：判为阻挡 ⇔ 求解结果确实被改变
             assert_eq!(blocked, settled != cand, "rect={o:?}");
+        }
+    }
+
+    #[test]
+    fn resize_push_single_neighbor_right() {
+        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let g = gap();
+        let a = Rect::new(100.0, 100.0, 200.0, 100.0);
+        let b = Rect::new(350.0, 100.0, 200.0, 100.0);
+        let cand = Rect::new(100.0, 100.0, 300.0, 100.0); // right = 400
+        let out = settle_resize_with_push(
+            &[a, b],
+            0,
+            &cand,
+            &ResizePushConfig {
+                screen: &screen,
+                free: FreeSides::Right,
+                min_w: 80.0,
+                min_h: 60.0,
+                gap: g,
+                fixed: &[false, false],
+            },
+        );
+        assert_eq!(out[0].w, 300.0);
+        assert_eq!(out[0].right(), 400.0);
+        assert_eq!(out[1].x, 400.0 + g);
+        assert_eq!(out[1].w, 200.0);
+    }
+
+    #[test]
+    fn resize_push_chain_right() {
+        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let g = gap();
+        let a = Rect::new(100.0, 100.0, 200.0, 100.0);
+        let b = Rect::new(350.0, 100.0, 200.0, 100.0);
+        let c = Rect::new(570.0, 100.0, 200.0, 100.0);
+        let cand = Rect::new(100.0, 100.0, 300.0, 100.0); // right = 400
+        let out = settle_resize_with_push(
+            &[a, b, c],
+            0,
+            &cand,
+            &ResizePushConfig {
+                screen: &screen,
+                free: FreeSides::Right,
+                min_w: 80.0,
+                min_h: 60.0,
+                gap: g,
+                fixed: &[false, false, false],
+            },
+        );
+        assert_eq!(out[0].right(), 400.0);
+        assert_eq!(out[1].x, 400.0 + g);
+        assert_eq!(out[2].x, out[1].right() + g);
+    }
+
+    #[test]
+    fn resize_push_clamped_at_screen_right() {
+        let screen = Rect::new(0.0, 0.0, 800.0, 600.0);
+        let g = gap();
+        let a = Rect::new(100.0, 100.0, 200.0, 100.0);
+        let b = Rect::new(550.0, 100.0, 200.0, 100.0); // b right max is 800
+        let cand = Rect::new(100.0, 100.0, 600.0, 100.0); // 想扩张到 right = 700
+        let out = settle_resize_with_push(
+            &[a, b],
+            0,
+            &cand,
+            &ResizePushConfig {
+                screen: &screen,
+                free: FreeSides::Right,
+                min_w: 80.0,
+                min_h: 60.0,
+                gap: g,
+                fixed: &[false, false],
+            },
+        );
+        // b 的右边不能超过 800 -> b.x 最大为 600
+        assert_eq!(out[1].right(), 800.0);
+        assert_eq!(out[1].x, 600.0);
+        // a 必须停在 b.x - g
+        assert_eq!(out[0].right(), 600.0 - g);
+    }
+
+    #[test]
+    fn resize_push_clamped_by_fixed_obstacle() {
+        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let g = gap();
+        let a = Rect::new(100.0, 100.0, 200.0, 100.0);
+        let b = Rect::new(400.0, 100.0, 200.0, 100.0); // fixed
+        let cand = Rect::new(100.0, 100.0, 400.0, 100.0); // 想扩张到 500
+        let out = settle_resize_with_push(
+            &[a, b],
+            0,
+            &cand,
+            &ResizePushConfig {
+                screen: &screen,
+                free: FreeSides::Right,
+                min_w: 80.0,
+                min_h: 60.0,
+                gap: g,
+                fixed: &[false, true],
+            },
+        );
+        assert_eq!(out[1].x, 400.0); // fixed 栅栏纹丝不动
+        assert_eq!(out[0].right(), 400.0 - g); // a 被阻挡在其左侧
+    }
+
+    #[test]
+    fn resize_push_bottom_single() {
+        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let g = gap();
+        let a = Rect::new(100.0, 100.0, 200.0, 100.0);
+        let b = Rect::new(100.0, 250.0, 200.0, 100.0);
+        let cand = Rect::new(100.0, 100.0, 200.0, 200.0); // bottom = 300
+        let out = settle_resize_with_push(
+            &[a, b],
+            0,
+            &cand,
+            &ResizePushConfig {
+                screen: &screen,
+                free: FreeSides::Bottom,
+                min_w: 80.0,
+                min_h: 60.0,
+                gap: g,
+                fixed: &[false, false],
+            },
+        );
+        assert_eq!(out[0].bottom(), 300.0);
+        assert_eq!(out[1].y, 300.0 + g);
+    }
+
+    #[test]
+    fn resize_push_shrink_leaves_neighbors_untouched() {
+        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let g = gap();
+        let a = Rect::new(100.0, 100.0, 200.0, 100.0);
+        let b = Rect::new(350.0, 100.0, 200.0, 100.0);
+        let cand = Rect::new(100.0, 100.0, 150.0, 100.0); // 收缩
+        let out = settle_resize_with_push(
+            &[a, b],
+            0,
+            &cand,
+            &ResizePushConfig {
+                screen: &screen,
+                free: FreeSides::Right,
+                min_w: 80.0,
+                min_h: 60.0,
+                gap: g,
+                fixed: &[false, false],
+            },
+        );
+        assert_eq!(out[0].w, 150.0);
+        assert_eq!(out[1], b); // b 保持原样
+    }
+
+    #[test]
+    fn test_user_layout_resize_push() {
+        let screen = Rect::new(0.0, 0.0, 3840.0, 2160.0);
+        let g = 12.0;
+        let f0 = Rect::new(15.0, 732.0, 785.0, 286.0);
+        let f1 = Rect::new(60.0, 0.0, 488.0, 332.0);
+        let f2 = Rect::new(560.0, 80.0, 480.0, 330.0);
+        let f3 = Rect::new(1052.0, 19.0, 480.0, 330.0);
+        let f4 = Rect::new(40.0, 344.0, 480.0, 330.0);
+        let f5 = Rect::new(829.0, 422.0, 540.0, 330.0);
+        let fences = vec![f0, f1, f2, f3, f4, f5];
+        let fixed = vec![false; 6];
+
+        let zones = [
+            FreeSides::Right,
+            FreeSides::Bottom,
+            FreeSides::BottomRight,
+            FreeSides::Left,
+            FreeSides::BottomLeft,
+            FreeSides::TopRight,
+        ];
+
+        for active_idx in 0..6 {
+            for free in zones {
+                for delta in [-200.0, -50.0, 10.0, 50.0, 100.0, 300.0, 800.0, 2000.0] {
+                    let mut cand = fences[active_idx];
+                    match free {
+                        FreeSides::Right => cand.w += delta,
+                        FreeSides::Bottom => cand.h += delta,
+                        FreeSides::BottomRight => {
+                            cand.w += delta;
+                            cand.h += delta;
+                        }
+                        FreeSides::Left => {
+                            cand.x -= delta;
+                            cand.w += delta;
+                        }
+                        FreeSides::BottomLeft => {
+                            cand.x -= delta;
+                            cand.w += delta;
+                            cand.h += delta;
+                        }
+                        FreeSides::TopRight => {
+                            cand.y -= delta;
+                            cand.h += delta;
+                            cand.w += delta;
+                        }
+                        _ => {}
+                    }
+                    let out = settle_resize_with_push(
+                        &fences,
+                        active_idx,
+                        &cand,
+                        &ResizePushConfig {
+                            screen: &screen,
+                            free,
+                            min_w: 180.0,
+                            min_h: 120.0,
+                            gap: g,
+                            fixed: &fixed,
+                        },
+                    );
+                    assert_eq!(out.len(), 6);
+                }
+            }
         }
     }
 }
