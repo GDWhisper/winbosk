@@ -1240,7 +1240,28 @@ unsafe extern "system" fn wnd_proc(
                 return LRESULT(0);
             }
             let state = unsafe { &mut *ptr };
-            let (mx, my) = client_point(lparam);
+
+            // 消息合并 (Coalescing)：高回报率电竞鼠标 (1000Hz+) 高速滑动时会向消息队列注入
+            // 成百上千条 WM_MOUSEMOVE。若不合并，每帧都触发排版、渲染与 WinRT 模糊，会导致
+            // 消息队列雪崩式阻塞并被系统判定为 AppHangB1。通过 PeekMessageW 消费并跳过过时的
+            // 中间鼠标移动，仅对队列中最新的一帧做处理。
+            let mut latest_lparam = lparam;
+            unsafe {
+                let mut peek_msg = std::mem::zeroed();
+                while PeekMessageW(
+                    &mut peek_msg,
+                    Some(hwnd),
+                    WM_MOUSEMOVE,
+                    WM_MOUSEMOVE,
+                    PM_REMOVE,
+                )
+                .as_bool()
+                {
+                    latest_lparam = peek_msg.lParam;
+                }
+            }
+
+            let (mx, my) = client_point(latest_lparam);
             // 请求 WM_MOUSELEAVE：光标离开窗口时清除 Dock 放大（避免放大「粘」住）
             unsafe {
                 let mut tme = TRACKMOUSEEVENT {
@@ -1283,8 +1304,8 @@ unsafe extern "system" fn wnd_proc(
                 state.console_hovered = None;
                 emit_event(hwnd, state, OverlayEvent::ConsoleHover { zone: None });
             }
-            // 光标位置变化 → 连续 Dock 放大（位置未变不上报，避免无谓重绘）
-            if state.last_cursor != Some((mx, my)) {
+            // 光标位置变化 → 连续 Dock 放大（位置未变不上报，拖拽期间禁止上报以避免每帧冗余事件与重绘）
+            if state.drag.is_none() && state.last_cursor != Some((mx, my)) {
                 state.last_cursor = Some((mx, my));
                 emit_event(hwnd, state, OverlayEvent::CursorMove { x: mx, y: my });
             }
