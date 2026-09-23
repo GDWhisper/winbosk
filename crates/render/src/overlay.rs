@@ -27,7 +27,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, EqualRgn, SetBkColor, SetTextColor,
-    SetWindowRgn, HBRUSH, HDC, HRGN, RGN_OR,
+    SetWindowRgn, HBRUSH, HDC, HRGN, RGN_COPY, RGN_ERROR, RGN_OR,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
@@ -940,6 +940,9 @@ impl Drop for OverlayWindow {
             if !st.edit_brush.0.is_null() {
                 let _ = DeleteObject(st.edit_brush.into());
             }
+            if let Some(rgn) = st.last_region {
+                let _ = DeleteObject(rgn.into());
+            }
         }
     }
 }
@@ -1049,14 +1052,30 @@ fn apply_region(hwnd: HWND, model: &HitModel, cached: &mut Option<HRGN>) {
     if let Some(prev) = cached {
         unsafe {
             if EqualRgn(*prev, rgn) == TRUE {
-                // 区域没变：丢弃新句柄，保留旧句柄（仍归窗口所有，系统管理释放）。
+                // 区域没变：丢弃新句柄，保留旧句柄副本。
                 let _ = DeleteObject(rgn.into());
                 return;
             }
         }
     }
-    unsafe { SetWindowRgn(hwnd, Some(rgn), false) };
-    *cached = Some(rgn);
+    unsafe {
+        // 创建一份私有副本存入 cached，供后续 EqualRgn 比对。
+        // 原因：SetWindowRgn 调用成功后，Windows 内核会接管传入 rgn 的所有权，
+        // 并在后续 SetWindowRgn 或窗口销毁时由系统释放该句柄。应用程序绝不能再次
+        // 将该句柄传给 GDI 函数查询或重复 DeleteObject。
+        let copy = CreateRectRgn(0, 0, 0, 0);
+        if CombineRgn(Some(copy), Some(rgn), None, RGN_COPY) != RGN_ERROR {
+            if let Some(old) = cached.replace(copy) {
+                let _ = DeleteObject(old.into());
+            }
+        } else {
+            let _ = DeleteObject(copy.into());
+            if let Some(old) = cached.take() {
+                let _ = DeleteObject(old.into());
+            }
+        }
+        SetWindowRgn(hwnd, Some(rgn), false);
+    };
 }
 
 /// 把全部栅栏矩形 + 侧边栏工具提示 + 内联编辑框 + 占位框 + 控制台面板合并成一个
