@@ -1,8 +1,9 @@
 //! 场景构建：从领域模型 + 主题排布出渲染场景（栅栏/侧边栏/控制台/命中模型）。
 
 use crate::*;
+use winbosk_core::hotkey::{HotkeyAction, HotkeyBinding};
 use winbosk_core::storage::StorageKind;
-use winbosk_render::scene::{ReorderDrag, SceneReserved};
+use winbosk_render::scene::{ReorderDrag, SceneHotkeyRow, SceneReserved, SceneSettingsPage};
 use winbosk_render::theme::DETAIL_SIZE_RATIO;
 pub(crate) fn system_dark_mode() -> bool {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
@@ -414,25 +415,43 @@ fn reserved_frame(fence: usize, rect: Rect, alpha: f32) -> SceneReserved {
     }
 }
 
-/// 控制中心内容总高度（自适应，不含屏幕夹制）。
-pub(crate) fn console_full_height(desk: &Desk, selected: usize, s: f32) -> f32 {
+/// 控制中心设置页面自适应总高度（物理像素）。
+///
+/// 包含：标题栏 + 间隙 (8) + 标题说明区 (48) + 4 行卡片 (4 * 52) + 间隙 (8) + 底部按钮 (CONSOLE_ADD_BTN_H) + 底部留白 (12)。
+pub(crate) fn console_settings_height(s: f32) -> f32 {
     let title_h = CONSOLE_TITLE_H * s;
-    let rows = desk.fences.len().min(CONSOLE_FENCE_MAX_ROWS) as f32 * CONSOLE_FENCE_ROW_H * s;
-    // 详情区行数按选中栅栏的布局/风格动态计算（与 build_console 保持一致）
-    let detail_rows = detail_visible_rows(desk, selected, s);
-    title_h
-        + 8.0 * s
-        + rows
-        + 8.0 * s
-        + detail_rows
-        + 8.0 * s
-        // 添加 / 一键整理 / 删除栅栏 / 切换桌面 四个等宽按钮 + 三处间隙
-        + CONSOLE_ADD_BTN_H * s * 4.0
-        + 8.0 * s * 3.0
-        // 底部留白：面板正好包住内容（`build_console` 的最后一个按钮即止于此）。
-        // 曾误写成 `12.0 * s.clamp(CONSOLE_MIN_H * s, CONSOLE_MAX_H * s)`，clamp 下限
-        // 恒为 170·s，等于给面板底部凭空多加约 170px 空白。
-        + 12.0 * s
+    let header_gap = 8.0 * s;
+    let header_desc_h = 48.0 * s;
+    let rows_h = 4.0 * 52.0 * s + 3.0 * 8.0 * s;
+    let btn_gap = 8.0 * s;
+    let btn_h = CONSOLE_ADD_BTN_H * s;
+    let bottom_pad = 12.0 * s;
+    title_h + header_gap + header_desc_h + rows_h + btn_gap + btn_h + bottom_pad
+}
+
+/// 控制中心内容总高度（自适应，不含屏幕夹制）。
+pub(crate) fn console_full_height(desk: &Desk, selected: usize, s: f32, page: ConsolePage) -> f32 {
+    if page == ConsolePage::Settings {
+        console_settings_height(s)
+    } else {
+        let title_h = CONSOLE_TITLE_H * s;
+        let rows = desk.fences.len().min(CONSOLE_FENCE_MAX_ROWS) as f32 * CONSOLE_FENCE_ROW_H * s;
+        // 详情区行数按选中栅栏的布局/风格动态计算（与 build_console 保持一致）
+        let detail_rows = detail_visible_rows(desk, selected, s);
+        title_h
+            + 8.0 * s
+            + rows
+            + 8.0 * s
+            + detail_rows
+            + 8.0 * s
+            // 添加 / 一键整理 / 删除栅栏 / 切换桌面 四个等宽按钮 + 三处间隙
+            + CONSOLE_ADD_BTN_H * s * 4.0
+            + 8.0 * s * 3.0
+            // 底部留白：面板正好包住内容（`build_console` 的最后一个按钮即止于此）。
+            // 曾误写成 `12.0 * s.clamp(CONSOLE_MIN_H * s, CONSOLE_MAX_H * s)`，clamp 下限
+            // 恒为 170·s，等于给面板底部凭空多加约 170px 空白。
+            + 12.0 * s
+    }
 }
 
 /// 详情区可见行的总高度（行高 30px × 可见行数 + 标签行 24px）。
@@ -478,6 +497,7 @@ pub(crate) fn console_geometry(
     vh: f32,
     panel: f32,
     selected: usize,
+    page: ConsolePage,
 ) -> RectF {
     let s = theme.scale;
     let margin = CONSOLE_MARGIN * s;
@@ -488,7 +508,7 @@ pub(crate) fn console_geometry(
     // 同时保证不小于最小高度——否则小屏上 `avail` 被最小值兜底时，
     // 除以过冲系数后反而低于最小高，面板会被压扁。
     let max_h = (avail / CONSOLE_OVERSHOOT_MAX).max(CONSOLE_MIN_H * s);
-    let auto_full_h = console_full_height(desk, selected, s)
+    let auto_full_h = console_full_height(desk, selected, s, page)
         .min(CONSOLE_MAX_H * s)
         .min(max_h);
     let target_w = if desk.console_advanced {
@@ -497,8 +517,10 @@ pub(crate) fn console_geometry(
         CONSOLE_W * s
     };
     let (w, full_h) = match desk.console_size {
-        Some((_w, h)) => (target_w, h.clamp(CONSOLE_MIN_H * s, max_h)),
-        None => (target_w, auto_full_h),
+        Some((_w, h)) if page != ConsolePage::Settings => {
+            (target_w, h.clamp(CONSOLE_MIN_H * s, max_h))
+        }
+        _ => (target_w, auto_full_h),
     };
     // 允许小幅过冲（展开回弹），CONSOLE_OVERSHOOT_MAX 上限避免面板瞬时过高
     let h = full_h * panel.clamp(0.0, CONSOLE_OVERSHOOT_MAX);
@@ -846,29 +868,172 @@ fn layout_chips_with_add(
     }
 }
 
+/// 设置页面布局算法（纯几何计算，不依赖窗口与渲染句柄）。
+pub(crate) fn layout_settings_page(
+    panel: RectF,
+    s: f32,
+    detail_font: f32,
+    desk: &Desk,
+    recording_hotkey: Option<HotkeyAction>,
+    hotkey_conflicts: &std::collections::HashMap<HotkeyAction, String>,
+) -> SceneSettingsPage {
+    let title_h = CONSOLE_TITLE_H * s;
+    let content_top = panel.y + title_h;
+    let pad = CONSOLE_PAD * s;
+
+    // 容器全宽：吃满面板可用全宽，严禁使用 left_w
+    let settings_w = panel.w - 2.0 * pad;
+
+    let sp_rect = RectF {
+        x: panel.x,
+        y: content_top,
+        w: panel.w,
+        h: panel.h - title_h,
+    };
+
+    let row_w = settings_w;
+    let row_h = 52.0 * s;
+    let row_gap = 8.0 * s;
+    let start_y = content_top + 8.0 * s + 48.0 * s;
+    let key_h = 28.0 * s;
+
+    let mut rows = Vec::with_capacity(HotkeyAction::ALL.len());
+    for (idx, &action) in HotkeyAction::ALL.iter().enumerate() {
+        let row_y = start_y + idx as f32 * (row_h + row_gap);
+        let row_rect = RectF {
+            x: panel.x + pad,
+            y: row_y,
+            w: row_w,
+            h: row_h,
+        };
+
+        let action_str = desk.settings.hotkeys.get_action(action);
+        let key_text = match action_str {
+            Some(str_val) => HotkeyBinding::parse(str_val)
+                .map(|b| b.display_string())
+                .unwrap_or_else(|| str_val.to_string()),
+            None => String::new(),
+        };
+
+        // 药丸按钮内容自适应
+        let est_text_w = winbosk_core::text::estimate_width(&key_text, detail_font);
+        let key_w = (est_text_w + 24.0 * s).clamp(88.0 * s, 160.0 * s);
+
+        // 按需排布清除按钮
+        let right_pad = 10.0 * s;
+        let row_right = row_rect.x + row_rect.w;
+        let (key_x, clear_btn) = if action_str.is_some() {
+            let clear_w = 22.0 * s;
+            let clear_gap = 6.0 * s;
+            let cb_x = row_right - right_pad - clear_w;
+            let cb = RectF {
+                x: cb_x,
+                y: row_rect.y + (row_h - clear_w) / 2.0,
+                w: clear_w,
+                h: clear_w,
+            };
+            let kx = cb_x - clear_gap - key_w;
+            (kx, Some(cb))
+        } else {
+            let kx = row_right - right_pad - key_w;
+            (kx, None)
+        };
+
+        let key_btn = RectF {
+            x: key_x,
+            y: row_rect.y + (row_h - key_h) / 2.0,
+            w: key_w,
+            h: key_h,
+        };
+
+        // 物理安全隔离槽：左侧文本区域最大右边界，文本绝对无法碰触右侧药丸
+        let _text_max_right = key_x - 14.0 * s;
+
+        let is_recording = recording_hotkey == Some(action);
+        let conflict_msg = hotkey_conflicts.get(&action).cloned();
+
+        rows.push(SceneHotkeyRow {
+            action,
+            label: action.label(),
+            desc: action.description(),
+            rect: row_rect,
+            key_btn,
+            clear_btn,
+            key_text,
+            is_recording,
+            conflict_msg,
+        });
+    }
+
+    let rows_bottom_y = start_y + 4.0 * row_h + 3.0 * row_gap;
+    let btn_y = rows_bottom_y + 8.0 * s;
+    let btn_w = settings_w;
+    let btn_h = CONSOLE_ADD_BTN_H * s;
+    let btn_gap = 8.0 * s;
+    let reset_w = ((btn_w - btn_gap) * 0.38).round();
+    let back_w = btn_w - btn_gap - reset_w;
+    let reset_default_btn = RectF {
+        x: panel.x + pad,
+        y: btn_y,
+        w: reset_w,
+        h: btn_h,
+    };
+    let back_btn = RectF {
+        x: reset_default_btn.x + reset_w + btn_gap,
+        y: btn_y,
+        w: back_w,
+        h: btn_h,
+    };
+
+    SceneSettingsPage {
+        rect: sp_rect,
+        rows,
+        reset_default_btn,
+        back_btn,
+    }
+}
+
 /// 构建控制中心面板场景（栅栏管理单页）。关闭后完全隐藏（无胶囊），
 /// 高度按 `anim.panel` 从 0 插值到完整面板。
 pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
     let desk = &rt.desk;
     let theme = &rt.theme;
     let s = theme.scale;
-    let panel = console_geometry(desk, theme, rt.vw, rt.vh, anim.panel, rt.selected_fence);
+    let panel = console_geometry(
+        desk,
+        theme,
+        rt.vw,
+        rt.vh,
+        anim.panel,
+        rt.selected_fence,
+        rt.console_page,
+    );
     let title_h = CONSOLE_TITLE_H * s;
     let content_top = panel.y + title_h;
 
-    // —— 标题栏：关闭 + 模式切换单按钮（简化/高级） ——
-    let mode_btn_w = CONSOLE_CLOSE_W * s;
-    let mode_toggle = RectF {
-        x: panel.x + panel.w - CONSOLE_CLOSE_W * s - 8.0 * s - mode_btn_w - 6.0 * s,
-        y: panel.y + 8.0 * s,
-        w: mode_btn_w,
-        h: CONSOLE_CLOSE_W * s,
-    };
+    // —— 标题栏：关闭 + 模式切换单按钮（简化/高级） + 设置按钮 ——
+    let btn_size = CONSOLE_CLOSE_W * s;
+    let btn_y = panel.y + (title_h - btn_size) / 2.0;
+    let right_margin = 8.0 * s;
+    let btn_gap = 6.0 * s;
+
     let close = RectF {
-        x: panel.x + panel.w - CONSOLE_CLOSE_W * s - 8.0 * s,
-        y: panel.y + 8.0 * s,
-        w: CONSOLE_CLOSE_W * s,
-        h: CONSOLE_CLOSE_W * s,
+        x: panel.x + panel.w - right_margin - btn_size,
+        y: btn_y,
+        w: btn_size,
+        h: btn_size,
+    };
+    let mode_toggle = RectF {
+        x: close.x - btn_gap - btn_size,
+        y: btn_y,
+        w: btn_size,
+        h: btn_size,
+    };
+    let settings_toggle = RectF {
+        x: mode_toggle.x - btn_gap - btn_size,
+        y: btn_y,
+        w: btn_size,
+        h: btn_size,
     };
     // —— 左栏宽度（简化模式为全宽 368，高级模式为左半栏 368） ——
     let left_w = if desk.console_advanced {
@@ -876,497 +1041,535 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
     } else {
         panel.w
     };
-    // —— 栅栏管理页 ——
-    let list_top = content_top + 8.0 * s;
-    let row_h_f = CONSOLE_FENCE_ROW_H * s;
-    let fence_n = desk.fences.len();
-    let fence_shown = fence_n.min(CONSOLE_FENCE_MAX_ROWS);
-    let fence_scroll_max = if fence_n > fence_shown {
-        (fence_n - fence_shown) as f32 * row_h_f
+
+    let is_settings_page: bool;
+    let settings_page: Option<SceneSettingsPage>;
+    let fence_rows: Vec<SceneFenceRow>;
+    let fence_list_view: RectF;
+    let fence_detail: Option<SceneFenceDetail>;
+    let add_fence: RectF;
+    let organize_btn: RectF;
+    let remove_btn: RectF;
+    let desktop_toggle: RectF;
+    let autostart_toggle: RectF;
+    let rule_editor: Option<SceneRuleEditor>;
+
+    if rt.console_page == ConsolePage::Settings {
+        is_settings_page = true;
+        fence_rows = Vec::new();
+        fence_list_view = RectF::default();
+        fence_detail = None;
+        add_fence = RectF::default();
+        organize_btn = RectF::default();
+        remove_btn = RectF::default();
+        desktop_toggle = RectF::default();
+        autostart_toggle = RectF::default();
+        rule_editor = None;
+
+        let detail_font = rt.theme.console_label.size * DETAIL_SIZE_RATIO;
+        settings_page = Some(layout_settings_page(
+            panel,
+            s,
+            detail_font,
+            desk,
+            rt.recording_hotkey,
+            &rt.hotkey_conflicts,
+        ));
     } else {
-        0.0
-    };
-    let fence_scroll = rt.fence_scroll.clamp(0.0, fence_scroll_max);
-    let fence_list_view = RectF {
-        x: panel.x + CONSOLE_PAD * s,
-        y: list_top,
-        w: left_w - 2.0 * CONSOLE_PAD * s,
-        h: fence_shown as f32 * row_h_f,
-    };
-    let sel = rt.selected_fence.min(fence_n.saturating_sub(1));
-    let fence_rows: Vec<SceneFenceRow> = desk
-        .fences
-        .iter()
-        .enumerate()
-        .map(|(i, f)| SceneFenceRow {
-            rect: RectF {
-                x: panel.x + CONSOLE_PAD * s,
-                y: list_top + i as f32 * row_h_f - fence_scroll,
-                w: left_w - 2.0 * CONSOLE_PAD * s,
-                h: row_h_f,
-            },
-            title: f.title.clone().unwrap_or_else(|| format!("栅栏 {}", i + 1)),
-            selected: i == sel,
-        })
-        .collect();
-    let fence_detail = if fence_n > 0 {
-        let d = RectF {
+        is_settings_page = false;
+        settings_page = None;
+        // —— 栅栏管理页 ——
+        let list_top = content_top + 8.0 * s;
+        let row_h_f = CONSOLE_FENCE_ROW_H * s;
+        let fence_n = desk.fences.len();
+        let fence_shown = fence_n.min(CONSOLE_FENCE_MAX_ROWS);
+        let fence_scroll_max = if fence_n > fence_shown {
+            (fence_n - fence_shown) as f32 * row_h_f
+        } else {
+            0.0
+        };
+        let fence_scroll = rt.fence_scroll.clamp(0.0, fence_scroll_max);
+        fence_list_view = RectF {
             x: panel.x + CONSOLE_PAD * s,
-            y: list_top + fence_shown as f32 * row_h_f + 8.0 * s,
+            y: list_top,
             w: left_w - 2.0 * CONSOLE_PAD * s,
-            h: CONSOLE_FENCE_DETAIL_H * s,
+            h: fence_shown as f32 * row_h_f,
         };
-        let app = &desk.fences[sel].appearance;
-        let btn_h = 24.0 * s;
-        let label_w = 40.0 * s;
-        // 动态行号：根据当前布局/风格跳过不适用的行，避免留空白
-        let mut row = 0usize;
-        let row_y = |r: usize| d.y + 24.0 * s + r as f32 * 30.0 * s;
-        // 布局选择（始终显示）
-        let layout_grid = RectF {
-            x: d.x + label_w,
-            y: row_y(row),
-            w: 52.0 * s,
-            h: btn_h,
-        };
-        let layout_list = RectF {
-            x: layout_grid.x + layout_grid.w + 6.0 * s,
-            y: row_y(row),
-            w: 52.0 * s,
-            h: btn_h,
-        };
-        let layout_sidebar = RectF {
-            x: layout_list.x + layout_list.w + 6.0 * s,
-            y: row_y(row),
-            w: 52.0 * s,
-            h: btn_h,
-        };
-        row += 1;
-        // 图标大小（列表布局隐藏；网格/侧边栏显示）
-        let show_size = app.layout != FenceLayout::List;
-        let (size_s, size_m, size_l) = if show_size {
-            let sy = row_y(row);
-            let s_s = RectF {
+        let sel = rt.selected_fence.min(fence_n.saturating_sub(1));
+        fence_rows = desk
+            .fences
+            .iter()
+            .enumerate()
+            .map(|(i, f)| SceneFenceRow {
+                rect: RectF {
+                    x: panel.x + CONSOLE_PAD * s,
+                    y: list_top + i as f32 * row_h_f - fence_scroll,
+                    w: left_w - 2.0 * CONSOLE_PAD * s,
+                    h: row_h_f,
+                },
+                title: f.title.clone().unwrap_or_else(|| format!("栅栏 {}", i + 1)),
+                selected: i == sel,
+            })
+            .collect();
+        fence_detail = if fence_n > 0 {
+            let d = RectF {
+                x: panel.x + CONSOLE_PAD * s,
+                y: list_top + fence_shown as f32 * row_h_f + 8.0 * s,
+                w: left_w - 2.0 * CONSOLE_PAD * s,
+                h: CONSOLE_FENCE_DETAIL_H * s,
+            };
+            let app = &desk.fences[sel].appearance;
+            let btn_h = 24.0 * s;
+            let label_w = 40.0 * s;
+            // 动态行号：根据当前布局/风格跳过不适用的行，避免留空白
+            let mut row = 0usize;
+            let row_y = |r: usize| d.y + 24.0 * s + r as f32 * 30.0 * s;
+            // 布局选择（始终显示）
+            let layout_grid = RectF {
                 x: d.x + label_w,
-                y: sy,
-                w: 40.0 * s,
+                y: row_y(row),
+                w: 52.0 * s,
                 h: btn_h,
             };
-            let s_m = RectF {
-                x: s_s.x + s_s.w + 6.0 * s,
-                y: sy,
-                w: 40.0 * s,
+            let layout_list = RectF {
+                x: layout_grid.x + layout_grid.w + 6.0 * s,
+                y: row_y(row),
+                w: 52.0 * s,
                 h: btn_h,
             };
-            let s_l = RectF {
-                x: s_m.x + s_m.w + 6.0 * s,
-                y: sy,
-                w: 40.0 * s,
+            let layout_sidebar = RectF {
+                x: layout_list.x + layout_list.w + 6.0 * s,
+                y: row_y(row),
+                w: 52.0 * s,
                 h: btn_h,
             };
             row += 1;
-            (s_s, s_m, s_l)
-        } else {
-            (RectF::default(), RectF::default(), RectF::default())
-        };
-        // 背景风格（始终显示）
-        let style_glass = RectF {
-            x: d.x + label_w,
-            y: row_y(row),
-            w: 48.0 * s,
-            h: btn_h,
-        };
-        let style_outline = RectF {
-            x: style_glass.x + style_glass.w + 6.0 * s,
-            y: row_y(row),
-            w: 48.0 * s,
-            h: btn_h,
-        };
-        let style_filled = RectF {
-            x: style_outline.x + style_outline.w + 6.0 * s,
-            y: row_y(row),
-            w: 48.0 * s,
-            h: btn_h,
-        };
-        let style_blur = RectF {
-            x: style_filled.x + style_filled.w + 6.0 * s,
-            y: row_y(row),
-            w: 48.0 * s,
-            h: btn_h,
-        };
-        row += 1;
-        // 背景色调（模糊风格下隐藏——模糊无色调可调）
-        let show_tint = app.bg_style != FenceStyle::Blur;
-        let (tint_default, tints) = if show_tint {
-            let sw = 18.0 * s;
-            let gap = 6.0 * s;
-            let tint_y = row_y(row) + (btn_h - sw) / 2.0;
-            let td = RectF {
-                x: d.x + label_w,
-                y: tint_y,
-                w: sw,
-                h: sw,
+            // 图标大小（列表布局隐藏；网格/侧边栏显示）
+            let show_size = app.layout != FenceLayout::List;
+            let (size_s, size_m, size_l) = if show_size {
+                let sy = row_y(row);
+                let s_s = RectF {
+                    x: d.x + label_w,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                let s_m = RectF {
+                    x: s_s.x + s_s.w + 6.0 * s,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                let s_l = RectF {
+                    x: s_m.x + s_m.w + 6.0 * s,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                row += 1;
+                (s_s, s_m, s_l)
+            } else {
+                (RectF::default(), RectF::default(), RectF::default())
             };
-            let mut ts = Vec::with_capacity(TINT_PRESETS.len());
-            let mut x = td.x + sw + gap;
-            for _ in TINT_PRESETS {
-                ts.push(RectF {
-                    x,
+            // 背景风格（始终显示）
+            let style_glass = RectF {
+                x: d.x + label_w,
+                y: row_y(row),
+                w: 48.0 * s,
+                h: btn_h,
+            };
+            let style_outline = RectF {
+                x: style_glass.x + style_glass.w + 6.0 * s,
+                y: row_y(row),
+                w: 48.0 * s,
+                h: btn_h,
+            };
+            let style_filled = RectF {
+                x: style_outline.x + style_outline.w + 6.0 * s,
+                y: row_y(row),
+                w: 48.0 * s,
+                h: btn_h,
+            };
+            let style_blur = RectF {
+                x: style_filled.x + style_filled.w + 6.0 * s,
+                y: row_y(row),
+                w: 48.0 * s,
+                h: btn_h,
+            };
+            row += 1;
+            // 背景色调（模糊风格下隐藏——模糊无色调可调）
+            let show_tint = app.bg_style != FenceStyle::Blur;
+            let (tint_default, tints) = if show_tint {
+                let sw = 18.0 * s;
+                let gap = 6.0 * s;
+                let tint_y = row_y(row) + (btn_h - sw) / 2.0;
+                let td = RectF {
+                    x: d.x + label_w,
                     y: tint_y,
                     w: sw,
                     h: sw,
-                });
-                x += sw + gap;
+                };
+                let mut ts = Vec::with_capacity(TINT_PRESETS.len());
+                let mut x = td.x + sw + gap;
+                for _ in TINT_PRESETS {
+                    ts.push(RectF {
+                        x,
+                        y: tint_y,
+                        w: sw,
+                        h: sw,
+                    });
+                    x += sw + gap;
+                }
+                row += 1;
+                (td, ts)
+            } else {
+                (RectF::default(), Vec::new())
+            };
+            // —— 文件位置行（占两行，**不可再增行**）——
+            // 值行：标签 + 状态标签（模式）+ 真实落地路径（**零按钮**，路径自身是打开热区）
+            // 动作行：后果提示（左）+ 「更改文件位置…」「恢复默认」（右端对齐）
+            // 该行是用户唯一能得知"文件到底存在哪 / 删除是删副本还是删真身"的入口，故常显。
+            // 几何全部由 `storage_row_geometry` 纯函数推出（含"放不下就不画提示语"的降级），
+            // 以便在内存中单测空间互斥。
+            let storage = winbosk_core::storage::describe(
+                desk.fences[sel].storage_path.as_deref(),
+                &rt.library.to_string_lossy(),
+                rt.desktop_dir.as_deref(),
+            );
+            let row_geo = storage_row_geometry(
+                &d,
+                row_y(row),
+                storage.kind,
+                storage.can_reset,
+                &storage.path,
+                &rt.theme,
+            );
+            let storage_value_row = row_geo.value_row;
+            let storage_chip = row_geo.tag;
+            let storage_path_rect = row_geo.path;
+            let storage_path_text = row_geo.path_text;
+            let storage_path_hit = row_geo.path_hit;
+            let storage_hint_rect = row_geo.hint;
+            let storage_hint_text = row_geo.hint_text;
+            let storage_text_top = row_geo.text_top;
+            row += 1;
+            let storage_btn = row_geo.change;
+            let storage_reset = row_geo.reset;
+            row += 1;
+            // 侧边栏位置按钮（仅侧边栏布局有；网格/列表隐藏）
+            let show_sidebar_pos = app.layout == FenceLayout::Sidebar;
+            let (sidebar_left, sidebar_top, sidebar_right) = if show_sidebar_pos {
+                let sy = row_y(row);
+                let sl = RectF {
+                    x: d.x + label_w,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                let st = RectF {
+                    x: sl.x + sl.w + 6.0 * s,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                let sr = RectF {
+                    x: st.x + st.w + 6.0 * s,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                (sl, st, sr)
+            } else {
+                (RectF::default(), RectF::default(), RectF::default())
+            };
+            if show_sidebar_pos {
+                row += 1;
             }
-            row += 1;
-            (td, ts)
-        } else {
-            (RectF::default(), Vec::new())
-        };
-        // —— 文件位置行（占两行，**不可再增行**）——
-        // 值行：标签 + 状态标签（模式）+ 真实落地路径（**零按钮**，路径自身是打开热区）
-        // 动作行：后果提示（左）+ 「更改文件位置…」「恢复默认」（右端对齐）
-        // 该行是用户唯一能得知"文件到底存在哪 / 删除是删副本还是删真身"的入口，故常显。
-        // 几何全部由 `storage_row_geometry` 纯函数推出（含"放不下就不画提示语"的降级），
-        // 以便在内存中单测空间互斥。
-        let storage = winbosk_core::storage::describe(
-            desk.fences[sel].storage_path.as_deref(),
-            &rt.library.to_string_lossy(),
-            rt.desktop_dir.as_deref(),
-        );
-        let row_geo = storage_row_geometry(
-            &d,
-            row_y(row),
-            storage.kind,
-            storage.can_reset,
-            &storage.path,
-            &rt.theme,
-        );
-        let storage_value_row = row_geo.value_row;
-        let storage_chip = row_geo.tag;
-        let storage_path_rect = row_geo.path;
-        let storage_path_text = row_geo.path_text;
-        let storage_path_hit = row_geo.path_hit;
-        let storage_hint_rect = row_geo.hint;
-        let storage_hint_text = row_geo.hint_text;
-        let storage_text_top = row_geo.text_top;
-        row += 1;
-        let storage_btn = row_geo.change;
-        let storage_reset = row_geo.reset;
-        row += 1;
-        // 侧边栏位置按钮（仅侧边栏布局有；网格/列表隐藏）
-        let show_sidebar_pos = app.layout == FenceLayout::Sidebar;
-        let (sidebar_left, sidebar_top, sidebar_right) = if show_sidebar_pos {
-            let sy = row_y(row);
-            let sl = RectF {
+            // 分类规则按钮（始终显示）：无 / 应用 / 文档 / 媒体 / 压缩 / 目录
+            let rule_btn_w = 38.0 * s;
+            let rule_gap = 4.0 * s;
+            let rule_y = row_y(row);
+            let rule_none = RectF {
                 x: d.x + label_w,
-                y: sy,
-                w: 40.0 * s,
+                y: rule_y,
+                w: 34.0 * s,
                 h: btn_h,
             };
-            let st = RectF {
-                x: sl.x + sl.w + 6.0 * s,
-                y: sy,
-                w: 40.0 * s,
+            let rule_apps = RectF {
+                x: rule_none.x + rule_none.w + rule_gap,
+                y: rule_y,
+                w: rule_btn_w,
                 h: btn_h,
             };
-            let sr = RectF {
-                x: st.x + st.w + 6.0 * s,
-                y: sy,
-                w: 40.0 * s,
+            let rule_docs = RectF {
+                x: rule_apps.x + rule_apps.w + rule_gap,
+                y: rule_y,
+                w: rule_btn_w,
                 h: btn_h,
             };
-            (sl, st, sr)
+            let rule_media = RectF {
+                x: rule_docs.x + rule_docs.w + rule_gap,
+                y: rule_y,
+                w: rule_btn_w,
+                h: btn_h,
+            };
+            let rule_archives = RectF {
+                x: rule_media.x + rule_media.w + rule_gap,
+                y: rule_y,
+                w: rule_btn_w,
+                h: btn_h,
+            };
+            let rule_folders = RectF {
+                x: rule_archives.x + rule_archives.w + rule_gap,
+                y: rule_y,
+                w: rule_btn_w,
+                h: btn_h,
+            };
+            #[allow(unused_assignments)]
+            {
+                row += 1;
+            }
+            Some(SceneFenceDetail {
+                rect: d,
+                title: desk.fences[sel]
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("栅栏 {}", sel + 1)),
+                layout: app.layout,
+                icon_size: app.icon_size,
+                style: app.bg_style,
+                tint: app.tint,
+                layout_grid,
+                layout_list,
+                layout_sidebar,
+                size_s,
+                size_m,
+                size_l,
+                style_glass,
+                style_outline,
+                style_filled,
+                style_blur,
+                tint_default,
+                tints,
+                storage_btn,
+                storage_value_row,
+                storage_kind: storage.kind,
+                storage_path_text,
+                storage_path_rect,
+                storage_chip,
+                storage_path_hit,
+                storage_hint_text,
+                storage_hint_rect,
+                storage_text_top,
+                storage_reset,
+                sidebar_pos: app.sidebar_pos,
+                sidebar_left,
+                sidebar_top,
+                sidebar_right,
+                current_preset: desk.fences[sel].rule.as_ref().and_then(|r| r.preset),
+                rule_none,
+                rule_apps,
+                rule_docs,
+                rule_media,
+                rule_archives,
+                rule_folders,
+            })
         } else {
-            (RectF::default(), RectF::default(), RectF::default())
+            None
         };
-        if show_sidebar_pos {
-            row += 1;
-        }
-        // 分类规则按钮（始终显示）：无 / 应用 / 文档 / 媒体 / 压缩 / 目录
-        let rule_btn_w = 38.0 * s;
-        let rule_gap = 4.0 * s;
-        let rule_y = row_y(row);
-        let rule_none = RectF {
-            x: d.x + label_w,
-            y: rule_y,
-            w: 34.0 * s,
+        // —— 底部操作按钮：添加栅栏 / 一键整理 / 删除栅栏 / 切换桌面（自上而下，等宽等高） ——
+        // —— 底部操作按钮：添加栅栏 / 一键整理 / 删除栅栏 / 切换桌面（自上而下，等宽等高） ——
+        let btn_w = left_w - 2.0 * CONSOLE_PAD * s;
+        let btn_h = CONSOLE_ADD_BTN_H * s;
+        let btn_gap = 8.0 * s;
+        let detail_h = detail_visible_rows(desk, sel, s);
+        let btn_top = list_top + fence_shown as f32 * row_h_f + 8.0 * s + detail_h + 8.0 * s;
+        add_fence = RectF {
+            x: panel.x + CONSOLE_PAD * s,
+            y: btn_top,
+            w: btn_w,
             h: btn_h,
         };
-        let rule_apps = RectF {
-            x: rule_none.x + rule_none.w + rule_gap,
-            y: rule_y,
-            w: rule_btn_w,
+        // 「一键整理」按钮：放在「添加栅栏」正下方，等宽等高。
+        organize_btn = RectF {
+            x: add_fence.x,
+            y: add_fence.y + btn_h + btn_gap,
+            w: btn_w,
             h: btn_h,
         };
-        let rule_docs = RectF {
-            x: rule_apps.x + rule_apps.w + rule_gap,
-            y: rule_y,
-            w: rule_btn_w,
+        // 「删除栅栏」按钮：放在「一键整理」正下方，等宽等高。
+        remove_btn = RectF {
+            x: add_fence.x,
+            y: organize_btn.y + btn_h + btn_gap,
+            w: btn_w,
             h: btn_h,
         };
-        let rule_media = RectF {
-            x: rule_docs.x + rule_docs.w + rule_gap,
-            y: rule_y,
-            w: rule_btn_w,
+        // 「切回桌面 / 切换桌面」与「开机自启」按钮：位于删除栅栏下方，等分左右两半，等高
+        let half_w = ((btn_w - btn_gap) / 2.0).max(0.0);
+        let row4_y = remove_btn.y + btn_h + btn_gap;
+        desktop_toggle = RectF {
+            x: add_fence.x,
+            y: row4_y,
+            w: half_w,
             h: btn_h,
         };
-        let rule_archives = RectF {
-            x: rule_media.x + rule_media.w + rule_gap,
-            y: rule_y,
-            w: rule_btn_w,
+        autostart_toggle = RectF {
+            x: add_fence.x + half_w + btn_gap,
+            y: row4_y,
+            w: half_w,
             h: btn_h,
         };
-        let rule_folders = RectF {
-            x: rule_archives.x + rule_archives.w + rule_gap,
-            y: rule_y,
-            w: rule_btn_w,
-            h: btn_h,
-        };
-        #[allow(unused_assignments)]
-        {
-            row += 1;
-        }
-        Some(SceneFenceDetail {
-            rect: d,
-            title: desk.fences[sel]
-                .title
-                .clone()
-                .unwrap_or_else(|| format!("栅栏 {}", sel + 1)),
-            layout: app.layout,
-            icon_size: app.icon_size,
-            style: app.bg_style,
-            tint: app.tint,
-            layout_grid,
-            layout_list,
-            layout_sidebar,
-            size_s,
-            size_m,
-            size_l,
-            style_glass,
-            style_outline,
-            style_filled,
-            style_blur,
-            tint_default,
-            tints,
-            storage_btn,
-            storage_value_row,
-            storage_kind: storage.kind,
-            storage_path_text,
-            storage_path_rect,
-            storage_chip,
-            storage_path_hit,
-            storage_hint_text,
-            storage_hint_rect,
-            storage_text_top,
-            storage_reset,
-            sidebar_pos: app.sidebar_pos,
-            sidebar_left,
-            sidebar_top,
-            sidebar_right,
-            current_preset: desk.fences[sel].rule.as_ref().and_then(|r| r.preset),
-            rule_none,
-            rule_apps,
-            rule_docs,
-            rule_media,
-            rule_archives,
-            rule_folders,
-        })
-    } else {
-        None
-    };
-    // —— 底部操作按钮：添加栅栏 / 一键整理 / 删除栅栏 / 切换桌面（自上而下，等宽等高） ——
-    // —— 底部操作按钮：添加栅栏 / 一键整理 / 删除栅栏 / 切换桌面（自上而下，等宽等高） ——
-    let btn_w = left_w - 2.0 * CONSOLE_PAD * s;
-    let btn_h = CONSOLE_ADD_BTN_H * s;
-    let btn_gap = 8.0 * s;
-    let detail_h = detail_visible_rows(desk, sel, s);
-    let btn_top = list_top + fence_shown as f32 * row_h_f + 8.0 * s + detail_h + 8.0 * s;
-    let add_fence = RectF {
-        x: panel.x + CONSOLE_PAD * s,
-        y: btn_top,
-        w: btn_w,
-        h: btn_h,
-    };
-    // 「一键整理」按钮：放在「添加栅栏」正下方，等宽等高。
-    let organize_btn = RectF {
-        x: add_fence.x,
-        y: add_fence.y + btn_h + btn_gap,
-        w: btn_w,
-        h: btn_h,
-    };
-    // 「删除栅栏」按钮：放在「一键整理」正下方，等宽等高。
-    let remove_btn = RectF {
-        x: add_fence.x,
-        y: organize_btn.y + btn_h + btn_gap,
-        w: btn_w,
-        h: btn_h,
-    };
-    // 「切回桌面 / 切换桌面」与「开机自启」按钮：位于删除栅栏下方，等分左右两半，等高
-    let half_w = ((btn_w - btn_gap) / 2.0).max(0.0);
-    let row4_y = remove_btn.y + btn_h + btn_gap;
-    let desktop_toggle = RectF {
-        x: add_fence.x,
-        y: row4_y,
-        w: half_w,
-        h: btn_h,
-    };
-    let autostart_toggle = RectF {
-        x: add_fence.x + half_w + btn_gap,
-        y: row4_y,
-        w: half_w,
-        h: btn_h,
-    };
 
-    // —— 高级模式：右栏规则工作台 ——
-    let rule_editor = if desk.console_advanced && fence_n > 0 {
-        let f = &desk.fences[sel];
-        let rule = f.rule.clone().unwrap_or_default();
-        let right_x = panel.x + left_w;
-        let right_w = panel.w - left_w;
-        let pad = CONSOLE_PAD * s;
-        let rx = right_x + pad;
-        let rw = (right_w - 2.0 * pad).max(10.0);
-        let mut cur_y = content_top + 8.0 * s;
+        // —— 高级模式：右栏规则工作台 ——
+        rule_editor = if desk.console_advanced && fence_n > 0 {
+            let f = &desk.fences[sel];
+            let rule = f.rule.clone().unwrap_or_default();
+            let right_x = panel.x + left_w;
+            let right_w = panel.w - left_w;
+            let pad = CONSOLE_PAD * s;
+            let rx = right_x + pad;
+            let rw = (right_w - 2.0 * pad).max(10.0);
+            let mut cur_y = content_top + 8.0 * s;
 
-        // 1. 标题与总开关
-        let toggle_w = 96.0 * s;
-        let toggle_h = 24.0 * s;
-        let toggle_btn = RectF {
-            x: rx + rw - toggle_w,
-            y: cur_y,
-            w: toggle_w,
-            h: toggle_h,
-        };
-        cur_y += 30.0 * s;
-
-        // 2. 预设分类快速选用
-        let presets = [
-            (None, "全部"),
-            (Some(winbosk_core::model::CategoryPreset::Apps), "应用"),
-            (Some(winbosk_core::model::CategoryPreset::Documents), "文档"),
-            (Some(winbosk_core::model::CategoryPreset::Media), "媒体"),
-            (Some(winbosk_core::model::CategoryPreset::Archives), "压缩"),
-            (Some(winbosk_core::model::CategoryPreset::Folders), "目录"),
-        ];
-        let p_gap = 4.0 * s;
-        let p_w = ((rw - 5.0 * p_gap) / 6.0).max(20.0);
-        let mut preset_chips = Vec::new();
-        for (i, (p, _)) in presets.iter().enumerate() {
-            let pr = RectF {
-                x: rx + i as f32 * (p_w + p_gap),
+            // 1. 标题与总开关
+            let toggle_w = 96.0 * s;
+            let toggle_h = 24.0 * s;
+            let toggle_btn = RectF {
+                x: rx + rw - toggle_w,
                 y: cur_y,
-                w: p_w,
-                h: 22.0 * s,
+                w: toggle_w,
+                h: toggle_h,
             };
-            let is_sel = rule.preset == *p;
-            preset_chips.push((*p, pr, is_sel));
-        }
-        cur_y += 30.0 * s;
+            cur_y += 30.0 * s;
 
-        let is_editing_ext = matches!(rt.edit.as_ref().map(|e| e.target), Some(EditTarget::RuleExtension { fence }) if fence == sel);
-        let is_editing_exclude = matches!(rt.edit.as_ref().map(|e| e.target), Some(EditTarget::RuleExcludeExtension { fence }) if fence == sel);
-        let is_editing_pattern = matches!(rt.edit.as_ref().map(|e| e.target), Some(EditTarget::RulePattern { fence }) if fence == sel);
+            // 2. 预设分类快速选用
+            let presets = [
+                (None, "全部"),
+                (Some(winbosk_core::model::CategoryPreset::Apps), "应用"),
+                (Some(winbosk_core::model::CategoryPreset::Documents), "文档"),
+                (Some(winbosk_core::model::CategoryPreset::Media), "媒体"),
+                (Some(winbosk_core::model::CategoryPreset::Archives), "压缩"),
+                (Some(winbosk_core::model::CategoryPreset::Folders), "目录"),
+            ];
+            let p_gap = 4.0 * s;
+            let p_w = ((rw - 5.0 * p_gap) / 6.0).max(20.0);
+            let mut preset_chips = Vec::new();
+            for (i, (p, _)) in presets.iter().enumerate() {
+                let pr = RectF {
+                    x: rx + i as f32 * (p_w + p_gap),
+                    y: cur_y,
+                    w: p_w,
+                    h: 22.0 * s,
+                };
+                let is_sel = rule.preset == *p;
+                preset_chips.push((*p, pr, is_sel));
+            }
+            cur_y += 30.0 * s;
 
-        // 3. 后缀白名单芯片列表 + 添加按钮
-        let ext_layout = layout_chips_with_add(
-            &rule.custom_extensions,
-            "＋ 添加后缀",
-            is_editing_ext,
-            rx,
-            cur_y + 16.0 * s,
-            rw,
-            s,
-            theme.console_label.size * DETAIL_SIZE_RATIO,
-        );
-        cur_y = ext_layout.end_y + 10.0 * s;
+            let is_editing_ext = matches!(rt.edit.as_ref().map(|e| e.target), Some(EditTarget::RuleExtension { fence }) if fence == sel);
+            let is_editing_exclude = matches!(rt.edit.as_ref().map(|e| e.target), Some(EditTarget::RuleExcludeExtension { fence }) if fence == sel);
+            let is_editing_pattern = matches!(rt.edit.as_ref().map(|e| e.target), Some(EditTarget::RulePattern { fence }) if fence == sel);
 
-        // 4. 排除黑名单后缀芯片列表 + 添加按钮
-        let exclude_layout = layout_chips_with_add(
-            &rule.exclude_extensions,
-            "＋ 排除后缀",
-            is_editing_exclude,
-            rx,
-            cur_y + 16.0 * s,
-            rw,
-            s,
-            theme.console_label.size * DETAIL_SIZE_RATIO,
-        );
-        cur_y = exclude_layout.end_y + 10.0 * s;
+            // 3. 后缀白名单芯片列表 + 添加按钮
+            let ext_layout = layout_chips_with_add(
+                &rule.custom_extensions,
+                "＋ 添加后缀",
+                is_editing_ext,
+                rx,
+                cur_y + 16.0 * s,
+                rw,
+                s,
+                theme.console_label.size * DETAIL_SIZE_RATIO,
+            );
+            cur_y = ext_layout.end_y + 10.0 * s;
 
-        // 5. 通配符模式芯片列表 + 添加按钮
-        let pattern_layout = layout_chips_with_add(
-            &rule.name_patterns,
-            "＋ 添加通配符",
-            is_editing_pattern,
-            rx,
-            cur_y + 16.0 * s,
-            rw,
-            s,
-            theme.console_label.size * DETAIL_SIZE_RATIO,
-        );
-        cur_y = pattern_layout.end_y + 12.0 * s;
+            // 4. 排除黑名单后缀芯片列表 + 添加按钮
+            let exclude_layout = layout_chips_with_add(
+                &rule.exclude_extensions,
+                "＋ 排除后缀",
+                is_editing_exclude,
+                rx,
+                cur_y + 16.0 * s,
+                rw,
+                s,
+                theme.console_label.size * DETAIL_SIZE_RATIO,
+            );
+            cur_y = exclude_layout.end_y + 10.0 * s;
 
-        let active_edit_rect = ext_layout
-            .edit_rect
-            .or(exclude_layout.edit_rect)
-            .or(pattern_layout.edit_rect);
+            // 5. 通配符模式芯片列表 + 添加按钮
+            let pattern_layout = layout_chips_with_add(
+                &rule.name_patterns,
+                "＋ 添加通配符",
+                is_editing_pattern,
+                rx,
+                cur_y + 16.0 * s,
+                rw,
+                s,
+                theme.console_label.size * DETAIL_SIZE_RATIO,
+            );
+            cur_y = pattern_layout.end_y + 12.0 * s;
 
-        // 6. 自动捕获开关
-        let auto_capture_toggle = RectF {
-            x: rx,
-            y: cur_y,
-            w: rw,
-            h: 24.0 * s,
+            let active_edit_rect = ext_layout
+                .edit_rect
+                .or(exclude_layout.edit_rect)
+                .or(pattern_layout.edit_rect);
+
+            // 6. 自动捕获开关
+            let auto_capture_toggle = RectF {
+                x: rx,
+                y: cur_y,
+                w: rw,
+                h: 24.0 * s,
+            };
+            cur_y += 30.0 * s;
+
+            // 7. 单栅栏即时整理按钮
+            let apply_btn = RectF {
+                x: rx,
+                y: cur_y,
+                w: rw,
+                h: 26.0 * s,
+            };
+            cur_y += 34.0 * s;
+
+            // 8. 规则提示说明卡片
+            let tip_rect = RectF {
+                x: rx,
+                y: cur_y,
+                w: rw,
+                h: 102.0 * s,
+            };
+
+            Some(SceneRuleEditor {
+                rect: RectF {
+                    x: right_x,
+                    y: content_top,
+                    w: right_w,
+                    h: panel.h - title_h,
+                },
+                fence_title: f
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("栅栏 {}", sel + 1)),
+                rule_enabled: rule.enabled,
+                toggle_btn,
+                preset_chips,
+                ext_chips: ext_layout.chips,
+                add_ext_btn: ext_layout.add_btn,
+                exclude_chips: exclude_layout.chips,
+                add_exclude_btn: exclude_layout.add_btn,
+                pattern_chips: pattern_layout.chips,
+                add_pattern_btn: pattern_layout.add_btn,
+                auto_capture_toggle,
+                auto_capture_val: rule.auto_capture,
+                apply_btn,
+                tip_rect,
+                active_edit_rect,
+            })
+        } else {
+            None
         };
-        cur_y += 30.0 * s;
-
-        // 7. 单栅栏即时整理按钮
-        let apply_btn = RectF {
-            x: rx,
-            y: cur_y,
-            w: rw,
-            h: 26.0 * s,
-        };
-        cur_y += 34.0 * s;
-
-        // 8. 规则提示说明卡片
-        let tip_rect = RectF {
-            x: rx,
-            y: cur_y,
-            w: rw,
-            h: 102.0 * s,
-        };
-
-        Some(SceneRuleEditor {
-            rect: RectF {
-                x: right_x,
-                y: content_top,
-                w: right_w,
-                h: panel.h - title_h,
-            },
-            fence_title: f
-                .title
-                .clone()
-                .unwrap_or_else(|| format!("栅栏 {}", sel + 1)),
-            rule_enabled: rule.enabled,
-            toggle_btn,
-            preset_chips,
-            ext_chips: ext_layout.chips,
-            add_ext_btn: ext_layout.add_btn,
-            exclude_chips: exclude_layout.chips,
-            add_exclude_btn: exclude_layout.add_btn,
-            pattern_chips: pattern_layout.chips,
-            add_pattern_btn: pattern_layout.add_btn,
-            auto_capture_toggle,
-            auto_capture_val: rule.auto_capture,
-            apply_btn,
-            tip_rect,
-            active_edit_rect,
-        })
-    } else {
-        None
-    };
+    }
 
     SceneConsole {
         x: panel.x,
@@ -1397,6 +1600,9 @@ pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
         advanced: desk.console_advanced,
         mode_toggle,
         rule_editor,
+        settings_toggle,
+        is_settings_page,
+        settings_page,
     }
 }
 
@@ -1962,7 +2168,15 @@ pub(crate) fn build_dock_magnify(rt: &mut Runtime, scene_fences: &mut [SceneFenc
     });
     // 光标落在控制中心面板内 → 同样不放大（避免面板上方触发 Dock 工具提示）
     let in_console = rt.desk.console_open && {
-        let cp = console_geometry(&rt.desk, &rt.theme, rt.vw, rt.vh, 1.0, rt.selected_fence);
+        let cp = console_geometry(
+            &rt.desk,
+            &rt.theme,
+            rt.vw,
+            rt.vh,
+            1.0,
+            rt.selected_fence,
+            rt.console_page,
+        );
         mx >= cp.x && mx <= cp.x + cp.w && my >= cp.y && my <= cp.y + cp.h
     };
     // 拖动排序期间保持放大但禁用工具提示（避免 tooltip 反复触发 surface 重建）
@@ -2154,113 +2368,136 @@ pub(crate) fn hit_model_from(theme: &Theme, scene: &Scene, _desk: &Desk) -> HitM
         if c.panel >= 0.5 {
             zones.push((ConsoleZone::Close, c.close));
             zones.push((ConsoleZone::ToggleAdvancedMode, c.mode_toggle));
-            zones.push((ConsoleZone::AddFence, c.add_fence));
-            zones.push((ConsoleZone::AutoOrganize, c.organize_btn));
-            zones.push((ConsoleZone::RemoveFence, c.remove_btn));
-            zones.push((ConsoleZone::DesktopToggle, c.desktop_toggle));
-            zones.push((ConsoleZone::AutostartToggle, c.autostart_toggle));
-            for (i, r) in c.fence_rows.iter().enumerate() {
-                // 滚出可视区的行不参与命中（避免点到详情区时误中隐藏行）
-                if r.rect.y + r.rect.h < c.fence_list_view.y
-                    || r.rect.y > c.fence_list_view.y + c.fence_list_view.h
-                {
-                    continue;
-                }
-                zones.push((ConsoleZone::FenceSelect(i), r.rect));
-            }
-            if let Some(d) = &c.fence_detail {
-                // 值行只有路径可点（= 打开落地目录）；状态标签**不是热区**（它是"状态"不是按钮）。
-                // 此前把路径整块接成 `ChangeStoragePath`，导致"看着像灰字却能点、
-                // 看着像按钮的状态标签却点不动"这对反转，用户读不出哪个是动作。
-                // 现在路径接的是**无害且可逆**的"打开目录"，且 hover 会提亮 + 下划线（见 draw 层），
-                // 所以"可点"这件事是看得见的——与破坏性的"更改文件位置…"彻底分开。
-                // 命中区构造抽在 `storage_zones`（纯函数，单测直接断言这张表）。
-                zones.extend(storage_zones(
-                    d.storage_path_hit,
-                    d.storage_btn,
-                    d.storage_reset,
-                ));
-                zones.push((ConsoleZone::FenceLayout(FenceLayout::Grid), d.layout_grid));
-                zones.push((ConsoleZone::FenceLayout(FenceLayout::List), d.layout_list));
-                zones.push((
-                    ConsoleZone::FenceLayout(FenceLayout::Sidebar),
-                    d.layout_sidebar,
-                ));
-                zones.push((
-                    ConsoleZone::FenceSidebarPos(SidebarPosition::Left),
-                    d.sidebar_left,
-                ));
-                zones.push((
-                    ConsoleZone::FenceSidebarPos(SidebarPosition::Top),
-                    d.sidebar_top,
-                ));
-                zones.push((
-                    ConsoleZone::FenceSidebarPos(SidebarPosition::Right),
-                    d.sidebar_right,
-                ));
-                zones.push((ConsoleZone::FenceIconSize(32.0), d.size_s));
-                zones.push((ConsoleZone::FenceIconSize(48.0), d.size_m));
-                zones.push((ConsoleZone::FenceIconSize(64.0), d.size_l));
-                zones.push((ConsoleZone::FenceStyle(FenceStyle::Glass), d.style_glass));
-                zones.push((
-                    ConsoleZone::FenceStyle(FenceStyle::Outline),
-                    d.style_outline,
-                ));
-                zones.push((ConsoleZone::FenceStyle(FenceStyle::Filled), d.style_filled));
-                zones.push((ConsoleZone::FenceStyle(FenceStyle::Blur), d.style_blur));
-                zones.push((ConsoleZone::FenceTint(None), d.tint_default));
-                for (i, r) in d.tints.iter().enumerate() {
-                    if let Some((_, c)) = TINT_PRESETS.get(i) {
-                        zones.push((ConsoleZone::FenceTint(Some(*c)), *r));
+            zones.push((ConsoleZone::ToggleSettingsPage, c.settings_toggle));
+
+            if c.is_settings_page {
+                if let Some(sp) = &c.settings_page {
+                    for row in &sp.rows {
+                        zones.push((ConsoleZone::HotkeyRecord(row.action), row.key_btn));
+                        if let Some(clear_btn) = row.clear_btn {
+                            zones.push((ConsoleZone::HotkeyClear(row.action), clear_btn));
+                        }
+                    }
+                    if sp.reset_default_btn.w > 0.0 {
+                        zones.push((ConsoleZone::HotkeyResetDefault, sp.reset_default_btn));
+                    }
+                    if sp.back_btn.w > 0.0 {
+                        zones.push((ConsoleZone::ToggleSettingsPage, sp.back_btn));
                     }
                 }
-                zones.push((ConsoleZone::FenceRulePreset(None), d.rule_none));
-                zones.push((
-                    ConsoleZone::FenceRulePreset(Some(winbosk_core::model::CategoryPreset::Apps)),
-                    d.rule_apps,
-                ));
-                zones.push((
-                    ConsoleZone::FenceRulePreset(Some(
-                        winbosk_core::model::CategoryPreset::Documents,
-                    )),
-                    d.rule_docs,
-                ));
-                zones.push((
-                    ConsoleZone::FenceRulePreset(Some(winbosk_core::model::CategoryPreset::Media)),
-                    d.rule_media,
-                ));
-                zones.push((
-                    ConsoleZone::FenceRulePreset(Some(
-                        winbosk_core::model::CategoryPreset::Archives,
-                    )),
-                    d.rule_archives,
-                ));
-                zones.push((
-                    ConsoleZone::FenceRulePreset(Some(
-                        winbosk_core::model::CategoryPreset::Folders,
-                    )),
-                    d.rule_folders,
-                ));
-            }
-            if let Some(re) = &c.rule_editor {
-                zones.push((ConsoleZone::RuleToggleEnabled, re.toggle_btn));
-                for (preset, rect, _) in &re.preset_chips {
-                    zones.push((ConsoleZone::FenceRulePreset(*preset), *rect));
+            } else {
+                zones.push((ConsoleZone::AddFence, c.add_fence));
+                zones.push((ConsoleZone::AutoOrganize, c.organize_btn));
+                zones.push((ConsoleZone::RemoveFence, c.remove_btn));
+                zones.push((ConsoleZone::DesktopToggle, c.desktop_toggle));
+                zones.push((ConsoleZone::AutostartToggle, c.autostart_toggle));
+                for (i, r) in c.fence_rows.iter().enumerate() {
+                    // 滚出可视区的行不参与命中（避免点到详情区时误中隐藏行）
+                    if r.rect.y + r.rect.h < c.fence_list_view.y
+                        || r.rect.y > c.fence_list_view.y + c.fence_list_view.h
+                    {
+                        continue;
+                    }
+                    zones.push((ConsoleZone::FenceSelect(i), r.rect));
                 }
-                for (i, (_, _, del_btn)) in re.ext_chips.iter().enumerate() {
-                    zones.push((ConsoleZone::RuleDeleteExtension(i), *del_btn));
+                if let Some(d) = &c.fence_detail {
+                    // 值行只有路径可点（= 打开落地目录）；状态标签**不是热区**（它是"状态"不是按钮）。
+                    // 此前把路径整块接成 `ChangeStoragePath`，导致"看着像灰字却能点、
+                    // 看着像按钮的状态标签却点不动"这对反转，用户读不出哪个是动作。
+                    // 现在路径接的是**无害且可逆**的"打开目录"，且 hover 会提亮 + 下划线（见 draw 层），
+                    // 所以"可点"这件事是看得见的——与破坏性的"更改文件位置…"彻底分开。
+                    // 命中区构造抽在 `storage_zones`（纯函数，单测直接断言这张表）。
+                    zones.extend(storage_zones(
+                        d.storage_path_hit,
+                        d.storage_btn,
+                        d.storage_reset,
+                    ));
+                    zones.push((ConsoleZone::FenceLayout(FenceLayout::Grid), d.layout_grid));
+                    zones.push((ConsoleZone::FenceLayout(FenceLayout::List), d.layout_list));
+                    zones.push((
+                        ConsoleZone::FenceLayout(FenceLayout::Sidebar),
+                        d.layout_sidebar,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceSidebarPos(SidebarPosition::Left),
+                        d.sidebar_left,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceSidebarPos(SidebarPosition::Top),
+                        d.sidebar_top,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceSidebarPos(SidebarPosition::Right),
+                        d.sidebar_right,
+                    ));
+                    zones.push((ConsoleZone::FenceIconSize(32.0), d.size_s));
+                    zones.push((ConsoleZone::FenceIconSize(48.0), d.size_m));
+                    zones.push((ConsoleZone::FenceIconSize(64.0), d.size_l));
+                    zones.push((ConsoleZone::FenceStyle(FenceStyle::Glass), d.style_glass));
+                    zones.push((
+                        ConsoleZone::FenceStyle(FenceStyle::Outline),
+                        d.style_outline,
+                    ));
+                    zones.push((ConsoleZone::FenceStyle(FenceStyle::Filled), d.style_filled));
+                    zones.push((ConsoleZone::FenceStyle(FenceStyle::Blur), d.style_blur));
+                    zones.push((ConsoleZone::FenceTint(None), d.tint_default));
+                    for (i, r) in d.tints.iter().enumerate() {
+                        if let Some((_, c)) = TINT_PRESETS.get(i) {
+                            zones.push((ConsoleZone::FenceTint(Some(*c)), *r));
+                        }
+                    }
+                    zones.push((ConsoleZone::FenceRulePreset(None), d.rule_none));
+                    zones.push((
+                        ConsoleZone::FenceRulePreset(Some(
+                            winbosk_core::model::CategoryPreset::Apps,
+                        )),
+                        d.rule_apps,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceRulePreset(Some(
+                            winbosk_core::model::CategoryPreset::Documents,
+                        )),
+                        d.rule_docs,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceRulePreset(Some(
+                            winbosk_core::model::CategoryPreset::Media,
+                        )),
+                        d.rule_media,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceRulePreset(Some(
+                            winbosk_core::model::CategoryPreset::Archives,
+                        )),
+                        d.rule_archives,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceRulePreset(Some(
+                            winbosk_core::model::CategoryPreset::Folders,
+                        )),
+                        d.rule_folders,
+                    ));
                 }
-                zones.push((ConsoleZone::RuleAddExtension, re.add_ext_btn));
-                for (i, (_, _, del_btn)) in re.exclude_chips.iter().enumerate() {
-                    zones.push((ConsoleZone::RuleDeleteExcludeExtension(i), *del_btn));
+                if let Some(re) = &c.rule_editor {
+                    zones.push((ConsoleZone::RuleToggleEnabled, re.toggle_btn));
+                    for (preset, rect, _) in &re.preset_chips {
+                        zones.push((ConsoleZone::FenceRulePreset(*preset), *rect));
+                    }
+                    for (i, (_, _, del_btn)) in re.ext_chips.iter().enumerate() {
+                        zones.push((ConsoleZone::RuleDeleteExtension(i), *del_btn));
+                    }
+                    zones.push((ConsoleZone::RuleAddExtension, re.add_ext_btn));
+                    for (i, (_, _, del_btn)) in re.exclude_chips.iter().enumerate() {
+                        zones.push((ConsoleZone::RuleDeleteExcludeExtension(i), *del_btn));
+                    }
+                    zones.push((ConsoleZone::RuleAddExcludeExtension, re.add_exclude_btn));
+                    for (i, (_, _, del_btn)) in re.pattern_chips.iter().enumerate() {
+                        zones.push((ConsoleZone::RuleDeletePattern(i), *del_btn));
+                    }
+                    zones.push((ConsoleZone::RuleAddPattern, re.add_pattern_btn));
+                    zones.push((ConsoleZone::RuleToggleAutoCapture, re.auto_capture_toggle));
+                    zones.push((ConsoleZone::RuleApplyFence, re.apply_btn));
                 }
-                zones.push((ConsoleZone::RuleAddExcludeExtension, re.add_exclude_btn));
-                for (i, (_, _, del_btn)) in re.pattern_chips.iter().enumerate() {
-                    zones.push((ConsoleZone::RuleDeletePattern(i), *del_btn));
-                }
-                zones.push((ConsoleZone::RuleAddPattern, re.add_pattern_btn));
-                zones.push((ConsoleZone::RuleToggleAutoCapture, re.auto_capture_toggle));
-                zones.push((ConsoleZone::RuleApplyFence, re.apply_btn));
             }
         }
         console = Some(ConsoleHit {
@@ -2568,7 +2805,7 @@ mod tests {
         use winbosk_core::{config::AppSettings, model::Desk};
         let desk = Desk::new(AppSettings::default());
         let s = 1.0_f32;
-        let full = console_full_height(&desk, 0, s);
+        let full = console_full_height(&desk, 0, s, ConsolePage::Fences);
         // 内容底部 = 标题 + 列表(0 行) + 详情 + 四个按钮 + 三处间隙
         let detail = detail_visible_rows(&desk, 0, s);
         let rows_h =
@@ -2608,14 +2845,14 @@ mod tests {
         };
         let vw = 3840.0_f32;
         let vh = 2160.0_f32;
-        let full_h = console_full_height(&desk, 0, 1.0);
+        let full_h = console_full_height(&desk, 0, 1.0, ConsolePage::Fences);
 
         // 折叠：panel=0 完全不渲染
-        let zero = console_geometry(&desk, &theme, vw, vh, 0.0, 0);
+        let zero = console_geometry(&desk, &theme, vw, vh, 0.0, 0, ConsolePage::Fences);
         assert_eq!(zero.h, 0.0, "panel=0 应完全折叠");
 
         // 展开中：panel=0.5 高度恰为 full_h * 0.5
-        let half = console_geometry(&desk, &theme, vw, vh, 0.5, 0);
+        let half = console_geometry(&desk, &theme, vw, vh, 0.5, 0, ConsolePage::Fences);
         assert!(
             (half.h - full_h * 0.5).abs() < 1e-3,
             "panel=0.5 高度={}, 期望={}",
@@ -2624,7 +2861,7 @@ mod tests {
         );
 
         // 稳态：panel=1 高度 = 内容高度
-        let full = console_geometry(&desk, &theme, vw, vh, 1.0, 0);
+        let full = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Fences);
         assert!(
             (full.h - full_h).abs() < 1e-3,
             "panel=1 高度={}, 期望={}",
@@ -2635,7 +2872,7 @@ mod tests {
 
         // 过冲钳制：panel=2.0（理论过冲 100%）被钳到 max_h，
         // 面板底边绝不越出屏幕
-        let over = console_geometry(&desk, &theme, vw, vh, 2.0, 0);
+        let over = console_geometry(&desk, &theme, vw, vh, 2.0, 0, ConsolePage::Fences);
         let max_h = ((vh - 2.0 * CONSOLE_MARGIN) / CONSOLE_OVERSHOOT_MAX).max(CONSOLE_MIN_H);
         assert!(
             over.h <= max_h + 1e-3,
@@ -2651,7 +2888,7 @@ mod tests {
         );
 
         // 极小屏：max_h 被 MIN_H 兜底，面板仍可交互
-        let tiny = console_geometry(&desk, &theme, 800.0, 100.0, 1.0, 0);
+        let tiny = console_geometry(&desk, &theme, 800.0, 100.0, 1.0, 0, ConsolePage::Fences);
         assert!(
             tiny.h >= CONSOLE_MIN_H,
             "小屏高度 {} 小于最小高 {}",
@@ -3250,17 +3487,168 @@ mod tests {
 
         // 默认简化模式：宽为 CONSOLE_W (368.0)
         assert!(!desk.console_advanced);
-        let simple_geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0);
+        let simple_geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Fences);
         assert_eq!(simple_geom.w, CONSOLE_W);
         assert!(simple_geom.x + simple_geom.w <= vw);
 
         // 切换高级模式：宽展开为 CONSOLE_ADVANCED_W (736.0)
         desk.console_advanced = true;
-        let adv_geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0);
+        let adv_geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Fences);
         assert_eq!(adv_geom.w, CONSOLE_ADVANCED_W);
         assert!(adv_geom.x + adv_geom.w <= vw);
         // 验证展开后依然在屏幕右侧贴边预留 margin
         assert_eq!(adv_geom.x, vw - CONSOLE_ADVANCED_W - CONSOLE_MARGIN);
+    }
+
+    /// 验证控制中心设置页面自适应面板高度计算与贴合契约
+    #[test]
+    fn console_settings_page_height_contract() {
+        use winbosk_core::{config::AppSettings, model::Desk};
+        let desk = Desk::new(AppSettings::default());
+        let s = 1.0_f32;
+        let h = console_full_height(&desk, 0, s, ConsolePage::Settings);
+        // 期望高度包含：title_h(40) + 间隙(8) + 标题说明区(48) + 4行卡片(208+24=232) + 间隙(8) + 按钮(34) + 留白(12) = 382
+        assert!((h - 382.0).abs() < 1e-3, "设置页高度期望 382.0，实际 {h}");
+        assert_eq!(h, console_settings_height(s));
+    }
+
+    /// 验证高级模式（双栏）下设置页占满全宽与长按键（"Ctrl + Shift + F10"）药丸宽度自适应
+    #[test]
+    fn console_settings_advanced_mode_full_width_and_pill_adaptive() {
+        use std::collections::HashMap;
+        use winbosk_core::{config::AppSettings, hotkey::HotkeyAction, model::Desk};
+        use winbosk_render::theme::Theme;
+
+        let mut desk = Desk::new(AppSettings::default());
+        desk.console_advanced = true;
+        // 配置一个超长快捷键
+        desk.settings.hotkeys.console_toggle = Some("Ctrl + Shift + F10".into());
+        // 清除一个快捷键用以验证无快捷键时的靠右对齐与 clear_btn 为 None
+        desk.settings.hotkeys.desktop_toggle = None;
+
+        let theme = Theme {
+            scale: 1.0,
+            ..Theme::default()
+        };
+        let s = theme.scale;
+        let pad = CONSOLE_PAD * s;
+        let vw = 1920.0_f32;
+        let vh = 1080.0_f32;
+
+        let geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Settings);
+        // 高级模式下总宽应为 CONSOLE_ADVANCED_W (736.0)
+        assert_eq!(geom.w, CONSOLE_ADVANCED_W * s);
+
+        let detail_font = theme.console_label.size * DETAIL_SIZE_RATIO;
+        let conflicts = HashMap::new();
+        let sp = layout_settings_page(geom, s, detail_font, &desk, None, &conflicts);
+
+        let expected_settings_w = geom.w - 2.0 * pad;
+        assert_eq!(sp.rect.w, geom.w, "设置页容器宽度应占满面板全宽");
+
+        // 验证每行卡片均吃满 settings_w，而不是被限制在 left_w (368.0)
+        for row in &sp.rows {
+            assert_eq!(
+                row.rect.w, expected_settings_w,
+                "高级模式下设置行卡片应吃满全宽 {}",
+                expected_settings_w
+            );
+            assert_eq!(row.rect.x, geom.x + pad);
+            assert_eq!(row.rect.h, 52.0 * s, "行高应为 52.0 * s");
+        }
+
+        // 验证超长按键 "Ctrl + Shift + F10" 药丸宽度自适应（大于旧版 104.0 并 clamp 在 160.0 以内）
+        let console_row = sp
+            .rows
+            .iter()
+            .find(|r| r.action == HotkeyAction::ConsoleToggle)
+            .expect("应存在控制中心快捷键行");
+        assert_eq!(console_row.key_text, "Ctrl + Shift + F10");
+        let est_w = winbosk_core::text::estimate_width(&console_row.key_text, detail_font);
+        let expected_key_w = (est_w + 24.0 * s).clamp(88.0 * s, 160.0 * s);
+        assert_eq!(console_row.key_btn.w, expected_key_w);
+        assert!(
+            console_row.key_btn.w > 104.0 * s,
+            "长按键宽度 {} 应大于旧版硬编码 104.0",
+            console_row.key_btn.w
+        );
+        assert!(console_row.clear_btn.is_some(), "有快捷键时应有清除按钮");
+        let cb = console_row.clear_btn.unwrap();
+        // 清除按钮紧随右侧内边距 10.0 * s
+        assert_eq!(
+            cb.x + cb.w,
+            console_row.rect.x + console_row.rect.w - 10.0 * s
+        );
+        // 药丸按钮在清除按钮左侧，间隙为 6.0 * s
+        assert_eq!(
+            console_row.key_btn.x + console_row.key_btn.w + 6.0 * s,
+            cb.x
+        );
+
+        // 验证无快捷键项：clear_btn 为 None，药丸按钮直接靠右内边距（10.0 * s）对齐
+        let desktop_row = sp
+            .rows
+            .iter()
+            .find(|r| r.action == HotkeyAction::DesktopToggle)
+            .expect("应存在切换桌面快捷键行");
+        assert!(
+            desktop_row.clear_btn.is_none(),
+            "无快捷键时清除按钮应为 None"
+        );
+        assert_eq!(
+            desktop_row.key_btn.x + desktop_row.key_btn.w,
+            desktop_row.rect.x + desktop_row.rect.w - 10.0 * s,
+            "无快捷键时药丸按钮应靠右内边距 10.0 * s 对齐"
+        );
+
+        // 验证物理安全隔离槽
+        for row in &sp.rows {
+            let isolation = row.key_btn.x - (row.rect.x + 14.0 * s);
+            assert!(
+                isolation > 0.0,
+                "左侧文本到药丸按钮应保持物理安全隔离，实际隔离距离 {}",
+                isolation
+            );
+        }
+
+        // 验证底部双联按钮黄金分割与全宽契约
+        let btn_gap = 8.0 * s;
+        let expected_reset_w = ((expected_settings_w - btn_gap) * 0.38).round();
+        let expected_back_w = expected_settings_w - btn_gap - expected_reset_w;
+        assert_eq!(sp.reset_default_btn.w, expected_reset_w);
+        assert_eq!(sp.back_btn.w, expected_back_w);
+        assert_eq!(
+            sp.reset_default_btn.w + btn_gap + sp.back_btn.w,
+            expected_settings_w,
+            "两按钮加间距应精确吃满全宽 settings_w"
+        );
+    }
+
+    /// 验证当 page == ConsolePage::Settings 时，忽略 desk.console_size 的高度记忆，强制使用 auto_full_h
+    #[test]
+    fn console_geometry_settings_ignores_console_size_height() {
+        use winbosk_core::{config::AppSettings, model::Desk};
+        use winbosk_render::theme::Theme;
+
+        let mut desk = Desk::new(AppSettings::default());
+        let theme = Theme::default();
+        let vw = 1920.0_f32;
+        let vh = 1080.0_f32;
+
+        // 模拟用户在栅栏管理页手动拉伸控制中心面板到 650.0 高
+        desk.console_size = Some((CONSOLE_W, 650.0));
+
+        // 栅栏管理页遵从手动缩放
+        let fences_geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Fences);
+        assert_eq!(fences_geom.h, 650.0);
+
+        // 设置页忽略 650.0 高度记忆，强制使用自适应高度 auto_full_h
+        let settings_geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Settings);
+        let expected_h = console_settings_height(theme.scale);
+        assert_eq!(
+            settings_geom.h, expected_h,
+            "设置页应忽略 manual console_size 高度，强制自适应贴合内容"
+        );
     }
 
     /// 验证规则芯片流式自动换行排版函数 layout_chips_with_add：

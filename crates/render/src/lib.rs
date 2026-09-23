@@ -38,11 +38,12 @@ pub use device::RenderDevice;
 pub use draw::{draw_scene, IconStore, TextFormats};
 pub use overlay::{
     run_message_loop, ConsoleHit, ConsoleZone, FenceHit, HitModel, IconHit, OverlayEvent,
-    OverlayWindow, RectF, ResizeZone, GRIP_SIZE, WM_APP_QUIT, WM_WINBOSK_INJECT,
+    OverlayWindow, RectF, ResizeZone, GRIP_SIZE, HOTKEY_AUTO_ORGANIZE, HOTKEY_CONSOLE,
+    HOTKEY_DESKTOP, HOTKEY_QUIT, WM_APP_QUIT, WM_WINBOSK_INJECT,
 };
 pub use scene::{
     ListColumns, Scene, SceneConsole, SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow,
-    SceneIcon, SceneRuleEditor,
+    SceneHotkeyRow, SceneIcon, SceneRuleEditor, SceneSettingsPage,
 };
 pub use surface::{CompositionSurface, Frame};
 pub use theme::{Theme, GRID_CAPTION_H_MULT};

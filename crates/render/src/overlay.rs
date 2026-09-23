@@ -42,8 +42,8 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus,
-    TrackMouseEvent, MOD_ALT, MOD_CONTROL, MOD_SHIFT, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL,
-    VK_F10,
+    TrackMouseEvent, UnregisterHotKey, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL, VK_LWIN, VK_MENU,
+    VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, Shell_NotifyIconW, HDROP,
@@ -65,10 +65,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY, WM_IME_COMPOSITION,
     WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
-    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_TIMER, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_SYSKEYDOWN, WM_TIMER,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
+use winbosk_core::hotkey::HotkeyAction;
 use winbosk_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
 
 /// 托盘左键单击去重用：上次派发 `TrayToggle` 的时刻（Unix 纪元毫秒）。
@@ -116,12 +117,11 @@ pub const WM_APP_ANIM_TICK: u32 = 0x8000 + 4;
 /// 托盘图标 ID（进程内唯一）。
 const TRAY_ID: u32 = 1;
 
-/// 全局退出热键：Ctrl+Shift+F10。GUI 版没有控制台，Ctrl+C 不可用，
-/// 必须有一个干净退出的入口（否则只能杀进程，桌面图标无法恢复）。
-const QUIT_HOTKEY_ID: i32 = 1;
-
-/// 控制台（插件面板）开关热键：Ctrl+Alt+T。
-const CONSOLE_HOTKEY_ID: i32 = 2;
+/// 系统热键 ID 常量。
+pub const HOTKEY_QUIT: i32 = 1;
+pub const HOTKEY_CONSOLE: i32 = 2;
+pub const HOTKEY_DESKTOP: i32 = 3;
+pub const HOTKEY_AUTO_ORGANIZE: i32 = 4;
 
 /// 库同步定时器 ID：周期触发 `SyncLibrary`，App 检查库文件夹中已被外部删除的
 /// 文件，同步移除栅栏对应项（「库内删除 → 栅栏项消失」）。
@@ -261,6 +261,14 @@ pub enum ConsoleZone {
     RuleToggleAutoCapture,
     /// 规则编辑：针对当前栅栏立即应用规则重新整理。
     RuleApplyFence,
+    /// 控制中心：切换设置页面与栅栏管理页面。
+    ToggleSettingsPage,
+    /// 控制中心设置页：开始录制指定动作的快捷键。
+    HotkeyRecord(HotkeyAction),
+    /// 控制中心设置页：清除指定动作的快捷键。
+    HotkeyClear(HotkeyAction),
+    /// 控制中心设置页：恢复默认快捷键。
+    HotkeyResetDefault,
 }
 
 /// 控制台（插件面板）的命中数据：整体矩形（窗口区域 + 命中判定范围）、
@@ -386,11 +394,21 @@ pub enum OverlayEvent {
     ConsoleResize { rect: (f32, f32, f32, f32) },
     /// 控制台缩放拖拽结束（App 在此持久化尺寸）。
     ConsoleResizeEnd,
-    /// 全局热键 Ctrl+Alt+T：切换控制台开关。
+    /// 全局热键：切换控制台开关。
     ConsoleToggle,
-    /// 键盘按下（overlay 获得焦点时）：`vk` 虚拟键码，`ctrl` 是否按住 Ctrl。
+    /// 全局热键：在原生桌面与栅栏之间切换。
+    DesktopToggle,
+    /// 全局热键：一键整理桌面图标。
+    AutoOrganize,
+    /// 键盘按下（overlay 获得焦点时）：`vk` 虚拟键码，各修饰键按下状态。
     /// 文本字符走 `Char`（经 TranslateMessage 转换）。
-    KeyDown { vk: u32, ctrl: bool },
+    KeyDown {
+        vk: u32,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        win: bool,
+    },
     /// 文本字符（非 IME 合成路径的普通输入）。
     Char { ch: u16 },
     /// IME 开始合成。
@@ -663,6 +681,28 @@ impl OverlayWindow {
         with_foreground_lock(f);
     }
 
+    /// 注册底层全局热键（供 App 层统一动态配置）。
+    pub fn register_hotkey_raw(
+        &self,
+        id: i32,
+        modifiers: u32,
+        vk: u32,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            RegisterHotKey(
+                Some(self.hwnd),
+                id,
+                windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(modifiers),
+                vk,
+            )
+        }
+    }
+
+    /// 注销底层全局热键。
+    pub fn unregister_hotkey_raw(&self, id: i32) -> windows::core::Result<()> {
+        unsafe { UnregisterHotKey(Some(self.hwnd), id) }
+    }
+
     /// 在桌面壳层下创建覆盖整个虚拟屏幕的 overlay 窗口。
     pub fn create(parent: HWND) -> Result<Self> {
         let hmodule = unsafe { GetModuleHandleW(None)? };
@@ -763,24 +803,6 @@ impl OverlayWindow {
         let empty = unsafe { CreateRectRgn(0, 0, 0, 0) };
         unsafe { SetWindowRgn(hwnd, Some(empty), false) };
 
-        // 全局退出热键（Ctrl+Shift+F10）：绑定到 overlay 窗口，主线程处理 WM_HOTKEY
-        let _ = unsafe {
-            RegisterHotKey(
-                Some(hwnd),
-                QUIT_HOTKEY_ID,
-                MOD_CONTROL | MOD_SHIFT,
-                VK_F10.0 as u32, // VIRTUAL_KEY 是 u16 newtype，转 u32
-            )
-        };
-        // 控制台开关热键（Ctrl+Alt+T）：切换插件面板
-        let _ = unsafe {
-            RegisterHotKey(
-                Some(hwnd),
-                CONSOLE_HOTKEY_ID,
-                MOD_CONTROL | MOD_ALT,
-                b'T' as u32,
-            )
-        };
         let _shown = unsafe { ShowWindow(hwnd, SW_SHOWNA) };
 
         // 隐藏焦点代理：独立顶层窗口（离屏 1×1，不进任务栏），只负责让进程成为前台，
@@ -1370,17 +1392,32 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-        // 全局退出热键触发：与 WM_APP_QUIT 相同，走干净退出
-        WM_HOTKEY if wparam.0 as i32 == QUIT_HOTKEY_ID => {
+        // 全局热键触发
+        WM_HOTKEY if wparam.0 as i32 == HOTKEY_QUIT => {
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
-        // 控制台开关热键（Ctrl+Alt+T）：交给 App 切换插件面板
-        WM_HOTKEY if wparam.0 as i32 == CONSOLE_HOTKEY_ID => {
+        WM_HOTKEY if wparam.0 as i32 == HOTKEY_CONSOLE => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if !ptr.is_null() {
                 let state = unsafe { &mut *ptr };
                 emit_event(hwnd, state, OverlayEvent::ConsoleToggle);
+            }
+            LRESULT(0)
+        }
+        WM_HOTKEY if wparam.0 as i32 == HOTKEY_DESKTOP => {
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ptr.is_null() {
+                let state = unsafe { &mut *ptr };
+                emit_event(hwnd, state, OverlayEvent::DesktopToggle);
+            }
+            LRESULT(0)
+        }
+        WM_HOTKEY if wparam.0 as i32 == HOTKEY_AUTO_ORGANIZE => {
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ptr.is_null() {
+                let state = unsafe { &mut *ptr };
+                emit_event(hwnd, state, OverlayEvent::AutoOrganize);
             }
             LRESULT(0)
         }
@@ -1460,8 +1497,8 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-        // —— 内联文本编辑：键盘与 IME 直达 App（overlay 获得焦点时）——
-        WM_KEYDOWN => {
+        // —— 键盘输入与快捷键录制：键盘直达 App（overlay 获得焦点时）——
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if !ptr.is_null() {
                 let state = unsafe { &mut *ptr };
@@ -1471,6 +1508,9 @@ unsafe extern "system" fn wnd_proc(
                     OverlayEvent::KeyDown {
                         vk: wparam.0 as u32,
                         ctrl: is_ctrl_down(),
+                        shift: is_shift_down(),
+                        alt: is_alt_down(),
+                        win: is_win_down(),
                     },
                 );
             }
@@ -1820,6 +1860,21 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
 /// Ctrl 是否处于按下状态（框选/多选判定）。
 fn is_ctrl_down() -> bool {
     unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
+}
+
+/// Shift 是否处于按下状态。
+fn is_shift_down() -> bool {
+    unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 }
+}
+
+/// Alt 是否处于按下状态。
+fn is_alt_down() -> bool {
+    unsafe { GetKeyState(VK_MENU.0 as i32) < 0 }
+}
+
+/// Win 徽标键是否处于按下状态。
+fn is_win_down() -> bool {
+    unsafe { GetKeyState(VK_LWIN.0 as i32) < 0 || GetKeyState(VK_RWIN.0 as i32) < 0 }
 }
 
 /// 两个矩形是否相交（含边接触）——框选命中判定。
@@ -2789,6 +2844,11 @@ mod tests {
             // 目前不会被 zones.push 的死控件：默认 fail-safe 拒绝
             ConsoleZone::Expand,
             ConsoleZone::Tab(1),
+            // 设置页与快捷键控件
+            ConsoleZone::ToggleSettingsPage,
+            ConsoleZone::HotkeyRecord(winbosk_core::hotkey::HotkeyAction::ConsoleToggle),
+            ConsoleZone::HotkeyClear(winbosk_core::hotkey::HotkeyAction::ConsoleToggle),
+            ConsoleZone::HotkeyResetDefault,
         ] {
             assert!(!console_zone_is_repeatable(zone), "{zone:?} 不得被重复触发");
         }

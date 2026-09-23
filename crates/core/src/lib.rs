@@ -15,6 +15,7 @@ pub mod config;
 pub mod details;
 pub mod error;
 pub mod event;
+pub mod hotkey;
 pub mod layout;
 pub mod magnet;
 pub mod model;
@@ -22,3 +23,4 @@ pub mod storage;
 pub mod text;
 
 pub use error::{CoreError, Result};
+pub use hotkey::{HotkeyAction, HotkeyBinding};

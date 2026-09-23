@@ -18,10 +18,19 @@ mod anim;
 mod context_menu;
 mod editing;
 mod file_ops;
+mod hotkeys;
 mod logging;
 mod memory;
 mod scene;
 mod shell_menu;
+
+/// 控制中心当前页面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsolePage {
+    #[default]
+    Fences,
+    Settings,
+}
 
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::collections::HashMap;
@@ -128,8 +137,8 @@ pub(crate) const CONSOLE_MIN_H: f32 = 170.0;
 pub(crate) const CONSOLE_MARGIN: f32 = 24.0;
 /// 标题栏高度（拖动把手；关闭按钮位于其中）。
 pub(crate) const CONSOLE_TITLE_H: f32 = 40.0;
-/// 关闭按钮边长。
-pub(crate) const CONSOLE_CLOSE_W: f32 = 32.0;
+/// 关闭/标题栏操作按钮边长。
+pub(crate) const CONSOLE_CLOSE_W: f32 = 28.0;
 /// 待办列表距面板左右的内边距。
 pub(crate) const CONSOLE_PAD: f32 = 12.0;
 /// 组件页：添加按钮高度。
@@ -295,6 +304,18 @@ pub(crate) struct Runtime {
     pub(crate) resize_session: Option<ResizeSession>,
     /// 栅栏平滑滚动阻尼补间。
     pub(crate) scroll_tweens: Vec<ScrollTween>,
+    /// 控制中心当前页面（栅栏管理 / 全局设置）。
+    pub(crate) console_page: ConsolePage,
+    /// 当前正在录制快捷键的动作（None = 未处于录制状态）。
+    pub(crate) recording_hotkey: Option<winbosk_core::hotkey::HotkeyAction>,
+    /// 热键冲突提示表（动作 → 冲突/占用原因描述）。
+    pub(crate) hotkey_conflicts: HashMap<winbosk_core::hotkey::HotkeyAction, String>,
+}
+
+impl Runtime {
+    pub(crate) fn overlay(&self) -> &OverlayWindow {
+        unsafe { &*self.overlay_ptr }
+    }
 }
 
 // 事件处理器再入守卫：`handle_event` 打开模态菜单/属性页（`TrackPopupMenu`、Shell 动词
@@ -587,7 +608,11 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
         drag_hint: None,
         resize_session: None,
         scroll_tweens: Vec::new(),
+        console_page: ConsolePage::default(),
+        recording_hotkey: None,
+        hotkey_conflicts: HashMap::new(),
     };
+    hotkeys::apply_all_hotkeys(&mut rt);
     // 双向同步：启动时清一次——内部库被外部删除的文件、链接文件夹与栅栏的差集，
     // 都同步进栅栏（链接文件夹的预置文件启动即出现）。
     if reconcile_fences(&mut rt) {
@@ -1511,6 +1536,30 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             ConsoleZone::DesktopToggle => {
                 toggle_desktop(rt);
             }
+            ConsoleZone::ToggleSettingsPage => {
+                rt.console_page = match rt.console_page {
+                    ConsolePage::Fences => ConsolePage::Settings,
+                    ConsolePage::Settings => ConsolePage::Fences,
+                };
+                rt.recording_hotkey = None;
+            }
+            ConsoleZone::HotkeyRecord(action) => {
+                rt.recording_hotkey = Some(action);
+                focus_overlay(rt);
+            }
+            ConsoleZone::HotkeyClear(action) => {
+                if rt.recording_hotkey == Some(action) {
+                    rt.recording_hotkey = None;
+                }
+                rt.desk.settings.hotkeys.set_action(action, None);
+                hotkeys::apply_all_hotkeys(rt);
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::HotkeyResetDefault => {
+                rt.desk.settings.hotkeys = winbosk_core::config::HotkeyConfig::default();
+                hotkeys::apply_all_hotkeys(rt);
+                let _ = rt.store.save(&rt.desk);
+            }
             ConsoleZone::AutostartToggle => {
                 let next = !rt.desk.settings.autostart;
                 if let Ok(exe) = std::env::current_exe() {
@@ -1844,8 +1893,62 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             // 控件悬停：存下供下一帧绘制高亮（仅展开面板内上报）
             rt.console_hover = zone;
         }
-        OverlayEvent::KeyDown { vk, ctrl } => {
-            edit_key(rt, vk, ctrl);
+        OverlayEvent::KeyDown {
+            vk,
+            ctrl,
+            shift,
+            alt,
+            win,
+        } => {
+            if rt.recording_hotkey.is_some() {
+                if vk == 0x1B {
+                    // VK_ESCAPE: 取消录制
+                    rt.recording_hotkey = None;
+                } else if (vk == 0x08 || vk == 0x2E) && !ctrl && !shift && !alt && !win {
+                    // VK_BACK / VK_DELETE 且无修饰键：清除该快捷键
+                    let action = rt.recording_hotkey.take().unwrap();
+                    rt.desk.settings.hotkeys.set_action(action, None);
+                    hotkeys::apply_all_hotkeys(rt);
+                    let _ = rt.store.save(&rt.desk);
+                } else if vk == 0x11
+                    || vk == 0x10
+                    || vk == 0x12
+                    || vk == 0x5B
+                    || vk == 0x5C
+                    || (0xA0..=0xA5).contains(&vk)
+                {
+                    // 纯修饰键按下时（如 VK_CONTROL/VK_SHIFT/VK_MENU/VK_LWIN/VK_RWIN）：忽略不提交
+                } else if let Some(key_name) = hotkeys::vk_to_key_name(vk) {
+                    let binding =
+                        winbosk_core::hotkey::HotkeyBinding::new(ctrl, alt, shift, win, key_name);
+                    let recording_act = rt.recording_hotkey.unwrap();
+                    let mut conflict_label = None;
+                    for act in winbosk_core::hotkey::HotkeyAction::ALL {
+                        if act != recording_act {
+                            if let Some(other_b) = rt.desk.settings.hotkeys.get_binding(act) {
+                                if other_b == binding {
+                                    conflict_label = Some(act.label());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(label) = conflict_label {
+                        rt.hotkey_conflicts
+                            .insert(recording_act, format!("与{}快捷键冲突", label));
+                    } else {
+                        let action = rt.recording_hotkey.take().unwrap();
+                        rt.desk
+                            .settings
+                            .hotkeys
+                            .set_action(action, Some(binding.to_string()));
+                        hotkeys::apply_all_hotkeys(rt);
+                        let _ = rt.store.save(&rt.desk);
+                    }
+                }
+            } else {
+                edit_key(rt, vk, ctrl);
+            }
         }
         OverlayEvent::Char { ch } => {
             edit_char(rt, ch);
@@ -1885,6 +1988,9 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             }
         }
         OverlayEvent::OverlayFocusLost => {
+            if rt.recording_hotkey.is_some() {
+                rt.recording_hotkey = None;
+            }
             // 焦点离开 overlay：内联编辑失焦（待办输入/便签提交文本，重命名提交）
             dismiss_edit(rt);
         }
@@ -1925,6 +2031,12 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
         OverlayEvent::ConsoleToggle => {
             // 热键 Ctrl+Alt+T：唤出/收起面板（与托盘左键同语义）
             set_console_open(rt, !rt.desk.console_open);
+        }
+        OverlayEvent::DesktopToggle => {
+            toggle_desktop(rt);
+        }
+        OverlayEvent::AutoOrganize => {
+            execute_auto_organize(rt);
         }
         OverlayEvent::TrayToggle => {
             // 托盘图标左键单击：切换控制中心开合（与 Ctrl+Alt+T 相同）
@@ -2445,7 +2557,10 @@ mod tests {
         }));
         assert!(keeps_drag_hint(&OverlayEvent::KeyDown {
             vk: 27,
-            ctrl: false
+            ctrl: false,
+            shift: false,
+            alt: false,
+            win: false,
         }));
         assert!(keeps_drag_hint(&OverlayEvent::AnimTick));
         assert!(keeps_drag_hint(&OverlayEvent::SyncLibrary));

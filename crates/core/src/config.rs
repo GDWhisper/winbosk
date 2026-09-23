@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::hotkey::{HotkeyAction, HotkeyBinding};
 use crate::model::Desk;
 
 /// 全局设置，随 `Desk` 一起持久化。
@@ -32,12 +33,67 @@ impl Default for AppSettings {
     }
 }
 
-/// 全局热键配置。值为可解析的键位描述（如 `"Ctrl+Shift+F"`）。
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// 全局热键配置。值为可解析的键位描述（如 `"Ctrl+Alt+T"`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HotkeyConfig {
+    /// 打开/关闭控制中心（默认 "Ctrl+Alt+T"）
+    pub console_toggle: Option<String>,
+    /// 切换原生桌面 / 栅栏（默认 "Ctrl+Alt+D"）
+    pub desktop_toggle: Option<String>,
+    /// 一键整理桌面（默认 None）
+    pub auto_organize: Option<String>,
+    /// 全局紧急安全退出（默认 "Ctrl+Shift+F10"）
+    pub quit: Option<String>,
+
+    // 兼容旧配置中的字段，反序列化时忽略不报错
+    #[serde(default, skip_serializing)]
     pub collapse_all: Option<String>,
+    #[serde(default, skip_serializing)]
     pub expand_all: Option<String>,
+    #[serde(default, skip_serializing)]
     pub search: Option<String>,
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            console_toggle: Some("Ctrl+Alt+T".to_string()),
+            desktop_toggle: Some("Ctrl+Alt+D".to_string()),
+            auto_organize: None,
+            quit: Some("Ctrl+Shift+F10".to_string()),
+            collapse_all: None,
+            expand_all: None,
+            search: None,
+        }
+    }
+}
+
+impl HotkeyConfig {
+    /// 获取指定热键动作对应的键位字符串引用。
+    pub fn get_action(&self, action: HotkeyAction) -> Option<&str> {
+        match action {
+            HotkeyAction::ConsoleToggle => self.console_toggle.as_deref(),
+            HotkeyAction::DesktopToggle => self.desktop_toggle.as_deref(),
+            HotkeyAction::AutoOrganize => self.auto_organize.as_deref(),
+            HotkeyAction::Quit => self.quit.as_deref(),
+        }
+    }
+
+    /// 设置指定热键动作的键位字符串。
+    pub fn set_action(&mut self, action: HotkeyAction, val: Option<String>) {
+        match action {
+            HotkeyAction::ConsoleToggle => self.console_toggle = val,
+            HotkeyAction::DesktopToggle => self.desktop_toggle = val,
+            HotkeyAction::AutoOrganize => self.auto_organize = val,
+            HotkeyAction::Quit => self.quit = val,
+        }
+    }
+
+    /// 获取指定动作已解析的热键绑定模型。
+    pub fn get_binding(&self, action: HotkeyAction) -> Option<HotkeyBinding> {
+        self.get_action(action).and_then(HotkeyBinding::parse)
+    }
 }
 
 /// 配置读写器：负责 `Desk` 的加载、保存与版本迁移。
@@ -147,5 +203,67 @@ mod tests {
         let json = r#"{"show_free_area":true,"free_area_height":90.0,"hotkeys":{}}"#;
         let settings: AppSettings = serde_json::from_str(json).expect("旧配置应能正常反序列化");
         assert!(!settings.autostart, "缺失 autostart 字段时应默认为 false");
+    }
+
+    #[test]
+    fn hotkey_config_defaults_and_accessors() {
+        let mut cfg = HotkeyConfig::default();
+        assert_eq!(
+            cfg.get_action(HotkeyAction::ConsoleToggle),
+            Some("Ctrl+Alt+T")
+        );
+        assert_eq!(
+            cfg.get_action(HotkeyAction::DesktopToggle),
+            Some("Ctrl+Alt+D")
+        );
+        assert_eq!(cfg.get_action(HotkeyAction::AutoOrganize), None);
+        assert_eq!(cfg.get_action(HotkeyAction::Quit), Some("Ctrl+Shift+F10"));
+
+        let binding = cfg.get_binding(HotkeyAction::ConsoleToggle).unwrap();
+        assert!(binding.ctrl && binding.alt && binding.key == "T");
+
+        cfg.set_action(HotkeyAction::AutoOrganize, Some("Ctrl+Shift+O".into()));
+        assert_eq!(
+            cfg.get_action(HotkeyAction::AutoOrganize),
+            Some("Ctrl+Shift+O")
+        );
+
+        cfg.set_action(HotkeyAction::ConsoleToggle, None);
+        assert_eq!(cfg.get_action(HotkeyAction::ConsoleToggle), None);
+        assert_eq!(cfg.get_binding(HotkeyAction::ConsoleToggle), None);
+    }
+
+    #[test]
+    fn hotkey_config_backward_compatibility() {
+        // 1. 空 JSON 对象应反序列化为默认值
+        let empty_json = "{}";
+        let cfg: HotkeyConfig = serde_json::from_str(empty_json).expect("空配置应能正常反序列化");
+        assert_eq!(cfg, HotkeyConfig::default());
+
+        // 2. 含有旧字段的 JSON 应能成功反序列化并自动填补默认值
+        let old_json = r#"{"collapse_all":"Ctrl+1","expand_all":"Ctrl+2","search":"Ctrl+F"}"#;
+        let old_cfg: HotkeyConfig =
+            serde_json::from_str(old_json).expect("含旧字段配置应能正常反序列化");
+        assert_eq!(old_cfg.console_toggle, Some("Ctrl+Alt+T".to_string()));
+        assert_eq!(old_cfg.desktop_toggle, Some("Ctrl+Alt+D".to_string()));
+        assert_eq!(old_cfg.auto_organize, None);
+        assert_eq!(old_cfg.quit, Some("Ctrl+Shift+F10".to_string()));
+        assert_eq!(old_cfg.collapse_all, Some("Ctrl+1".to_string()));
+
+        // 3. 序列化时旧字段被忽略，只序列化新字段
+        let serialized = serde_json::to_string(&old_cfg).expect("序列化应成功");
+        assert!(!serialized.contains("collapse_all"));
+        assert!(!serialized.contains("expand_all"));
+        assert!(!serialized.contains("search"));
+        assert!(serialized.contains("console_toggle"));
+
+        // 4. 用户显式覆写字段
+        let custom_json = r#"{"console_toggle":null,"auto_organize":"Ctrl+Alt+O"}"#;
+        let custom_cfg: HotkeyConfig =
+            serde_json::from_str(custom_json).expect("自定义配置反序列化");
+        assert_eq!(custom_cfg.console_toggle, None);
+        assert_eq!(custom_cfg.auto_organize, Some("Ctrl+Alt+O".to_string()));
+        assert_eq!(custom_cfg.desktop_toggle, Some("Ctrl+Alt+D".to_string()));
+        assert_eq!(custom_cfg.quit, Some("Ctrl+Shift+F10".to_string()));
     }
 }

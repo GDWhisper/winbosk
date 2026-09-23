@@ -35,7 +35,7 @@ use winbosk_shell::icons::IconData;
 use crate::overlay::{ConsoleZone, RectF};
 use crate::scene::{
     ListColumns, Scene, SceneConsole, SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow,
-    SceneReserved, SceneRuleEditor,
+    SceneReserved, SceneRuleEditor, SceneSettingsPage,
 };
 use crate::theme::{detail_style, TextStyle, Theme, GRID_CAPTION_H_MULT};
 
@@ -339,11 +339,16 @@ fn draw_console(
         radiusX: 14.0 * s,
         radiusY: 14.0 * s,
     };
+    let fill_a = if c.is_settings_page {
+        0.98
+    } else {
+        c.fill_color[3]
+    };
     let fill = [
         c.fill_color[0],
         c.fill_color[1],
         c.fill_color[2],
-        c.fill_color[3] * a,
+        fill_a * a,
     ];
     let bg = unsafe { target.CreateSolidColorBrush(&color(fill), None)? };
     unsafe { target.FillRoundedRectangle(&panel, &bg) };
@@ -369,6 +374,210 @@ fn draw_console(
     let drawn = draw_console_content(target, theme, c, brushes, formats, a, accent);
     unsafe { target.PopAxisAlignedClip() };
     drawn
+}
+
+/// 绘制控制中心标题栏「✕」关闭图标（绝对中心对齐）
+fn draw_vector_close_icon(
+    target: &ID2D1RenderTarget,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    stroke_w: f32,
+    brush: &ID2D1SolidColorBrush,
+) {
+    let p1 = windows_numerics::Vector2 {
+        X: cx - r,
+        Y: cy - r,
+    };
+    let p2 = windows_numerics::Vector2 {
+        X: cx + r,
+        Y: cy + r,
+    };
+    let p3 = windows_numerics::Vector2 {
+        X: cx + r,
+        Y: cy - r,
+    };
+    let p4 = windows_numerics::Vector2 {
+        X: cx - r,
+        Y: cy + r,
+    };
+    unsafe {
+        target.DrawLine(p1, p2, brush, stroke_w, None);
+        target.DrawLine(p3, p4, brush, stroke_w, None);
+    }
+}
+
+/// 绘制控制中心标题栏「⚙」设置图标（绝对中心对齐，Fluent 6 齿齿轮）
+fn draw_vector_settings_icon(
+    target: &ID2D1RenderTarget,
+    cx: f32,
+    cy: f32,
+    s: f32,
+    brush: &ID2D1SolidColorBrush,
+) {
+    let r_mid = 3.6 * s;
+    let r_outer = 5.6 * s;
+    let stroke_w = (1.35 * s).max(1.0);
+    let tooth_w = (2.0 * s).max(1.5);
+
+    // 中心空心圆环
+    let circle = D2D1_ELLIPSE {
+        point: windows_numerics::Vector2 { X: cx, Y: cy },
+        radiusX: r_mid,
+        radiusY: r_mid,
+    };
+    unsafe {
+        target.DrawEllipse(&circle, brush, stroke_w, None);
+    }
+
+    // 6 个向外辐射的齿
+    for i in 0..6 {
+        let angle = i as f32 * std::f32::consts::PI / 3.0;
+        let (sin, cos) = angle.sin_cos();
+        let p1 = windows_numerics::Vector2 {
+            X: cx + r_mid * cos,
+            Y: cy + r_mid * sin,
+        };
+        let p2 = windows_numerics::Vector2 {
+            X: cx + r_outer * cos,
+            Y: cy + r_outer * sin,
+        };
+        unsafe {
+            target.DrawLine(p1, p2, brush, tooth_w, None);
+        }
+    }
+}
+
+/// 绘制控制中心标题栏模式切换图标（绝对中心对齐，对角双向展开 / 收缩箭头）
+fn draw_vector_mode_icon(
+    target: &ID2D1RenderTarget,
+    cx: f32,
+    cy: f32,
+    s: f32,
+    advanced: bool,
+    brush: &ID2D1SolidColorBrush,
+) {
+    let r = 4.6 * s;
+    let stroke_w = (1.35 * s).max(1.0);
+    if !advanced {
+        // 简化模式（提示展开为高级模式）：对角双向朝外展开箭头
+        let wing = 2.8 * s;
+        let p_bl = windows_numerics::Vector2 {
+            X: cx - r,
+            Y: cy + r,
+        };
+        let p_tr = windows_numerics::Vector2 {
+            X: cx + r,
+            Y: cy - r,
+        };
+        unsafe {
+            target.DrawLine(p_bl, p_tr, brush, stroke_w, None);
+            target.DrawLine(
+                p_bl,
+                windows_numerics::Vector2 {
+                    X: cx - r + wing,
+                    Y: cy + r,
+                },
+                brush,
+                stroke_w,
+                None,
+            );
+            target.DrawLine(
+                p_bl,
+                windows_numerics::Vector2 {
+                    X: cx - r,
+                    Y: cy + r - wing,
+                },
+                brush,
+                stroke_w,
+                None,
+            );
+            target.DrawLine(
+                p_tr,
+                windows_numerics::Vector2 {
+                    X: cx + r - wing,
+                    Y: cy - r,
+                },
+                brush,
+                stroke_w,
+                None,
+            );
+            target.DrawLine(
+                p_tr,
+                windows_numerics::Vector2 {
+                    X: cx + r,
+                    Y: cy - r + wing,
+                },
+                brush,
+                stroke_w,
+                None,
+            );
+        }
+    } else {
+        // 高级模式（提示收缩为简化模式）：对角双向朝内收缩箭头
+        let wing = 2.8 * s;
+        let inner_d = 1.0 * s;
+        let p_inner_bl = windows_numerics::Vector2 {
+            X: cx - inner_d,
+            Y: cy + inner_d,
+        };
+        let p_outer_bl = windows_numerics::Vector2 {
+            X: cx - r,
+            Y: cy + r,
+        };
+        let p_inner_tr = windows_numerics::Vector2 {
+            X: cx + inner_d,
+            Y: cy - inner_d,
+        };
+        let p_outer_tr = windows_numerics::Vector2 {
+            X: cx + r,
+            Y: cy - r,
+        };
+        unsafe {
+            target.DrawLine(p_outer_bl, p_inner_bl, brush, stroke_w, None);
+            target.DrawLine(p_outer_tr, p_inner_tr, brush, stroke_w, None);
+            target.DrawLine(
+                p_inner_bl,
+                windows_numerics::Vector2 {
+                    X: cx - inner_d - wing,
+                    Y: cy + inner_d,
+                },
+                brush,
+                stroke_w,
+                None,
+            );
+            target.DrawLine(
+                p_inner_bl,
+                windows_numerics::Vector2 {
+                    X: cx - inner_d,
+                    Y: cy + inner_d + wing,
+                },
+                brush,
+                stroke_w,
+                None,
+            );
+            target.DrawLine(
+                p_inner_tr,
+                windows_numerics::Vector2 {
+                    X: cx + inner_d + wing,
+                    Y: cy - inner_d,
+                },
+                brush,
+                stroke_w,
+                None,
+            );
+            target.DrawLine(
+                p_inner_tr,
+                windows_numerics::Vector2 {
+                    X: cx + inner_d,
+                    Y: cy - inner_d - wing,
+                },
+                brush,
+                stroke_w,
+                None,
+            );
+        }
+    }
 }
 
 /// 控制中心面板内容（标题栏 + 栅栏管理页）：调用方已按面板矩形裁切。
@@ -409,23 +618,74 @@ fn draw_console_content(
                 right: c.close.x + c.close.w,
                 bottom: c.close.y + c.close.h,
             },
-            radiusX: 8.0 * s,
-            radiusY: 8.0 * s,
+            radiusX: 6.0 * s,
+            radiusY: 6.0 * s,
         };
         let hov_bg =
-            unsafe { target.CreateSolidColorBrush(&color([0.85, 0.28, 0.28, 0.30 * a]), None)? };
+            unsafe { target.CreateSolidColorBrush(&color([0.85, 0.28, 0.28, 0.35 * a]), None)? };
         unsafe { target.FillRoundedRectangle(&hov, &hov_bg) };
     }
-    let xw = text_estimate_width("✕", theme.console_title.size);
-    let close_lr = D2D_RECT_F {
-        left: c.close.x + (c.close.w - xw) / 2.0,
-        top: c.close.y + (c.close.h - theme.console_title.size * 1.6) / 2.0,
-        right: c.close.x + c.close.w,
-        bottom: c.close.y + c.close.h,
+    let close_color = if close_hover {
+        [1.0, 1.0, 1.0, 0.95 * a]
+    } else {
+        [1.0, 1.0, 1.0, 0.65 * a]
     };
-    let close_brush =
-        unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.62 * a]), None)? };
-    draw_text(target, "✕", &formats.console_close, close_lr, &close_brush);
+    let close_brush = unsafe { target.CreateSolidColorBrush(&color(close_color), None)? };
+    let close_cx = c.close.x + c.close.w / 2.0;
+    let close_cy = c.close.y + c.close.h / 2.0;
+    draw_vector_close_icon(
+        target,
+        close_cx,
+        close_cy,
+        4.2 * s,
+        (1.35 * s).max(1.0),
+        &close_brush,
+    );
+
+    // 标题栏：设置按钮（⚙ 全局设置 / 返回栅栏管理，位于模式切换按钮左侧）
+    let settings_hover = matches!(c.hover_zone, Some(ConsoleZone::ToggleSettingsPage));
+    if c.settings_toggle.w > 0.0 {
+        let btn_rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: c.settings_toggle.x,
+                top: c.settings_toggle.y,
+                right: c.settings_toggle.x + c.settings_toggle.w,
+                bottom: c.settings_toggle.y + c.settings_toggle.h,
+            },
+            radiusX: 6.0 * s,
+            radiusY: 6.0 * s,
+        };
+        if settings_hover {
+            let hov_bg =
+                unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.15 * a]), None)? };
+            unsafe { target.FillRoundedRectangle(&btn_rr, &hov_bg) };
+        } else if c.is_settings_page {
+            let act_bg = unsafe {
+                target.CreateSolidColorBrush(
+                    &color([accent[0], accent[1], accent[2], 0.22 * a]),
+                    None,
+                )?
+            };
+            unsafe { target.FillRoundedRectangle(&btn_rr, &act_bg) };
+        }
+
+        let icon_color = if settings_hover {
+            [1.0, 1.0, 1.0, 0.95 * a]
+        } else if c.is_settings_page {
+            [
+                accent[0] * 0.4 + 0.6,
+                accent[1] * 0.4 + 0.6,
+                accent[2] * 0.4 + 0.6,
+                0.95 * a,
+            ]
+        } else {
+            [1.0, 1.0, 1.0, 0.65 * a]
+        };
+        let icon_brush = unsafe { target.CreateSolidColorBrush(&color(icon_color), None)? };
+        let set_cx = c.settings_toggle.x + c.settings_toggle.w / 2.0;
+        let set_cy = c.settings_toggle.y + c.settings_toggle.h / 2.0;
+        draw_vector_settings_icon(target, set_cx, set_cy, s, &icon_brush);
+    }
 
     // 标题栏：模式切换单按钮（⤢ 高级模式 / ⤡ 简化模式）
     let mode_hover = matches!(c.hover_zone, Some(ConsoleZone::ToggleAdvancedMode));
@@ -437,8 +697,8 @@ fn draw_console_content(
                 right: c.mode_toggle.x + c.mode_toggle.w,
                 bottom: c.mode_toggle.y + c.mode_toggle.h,
             },
-            radiusX: 8.0 * s,
-            radiusY: 8.0 * s,
+            radiusX: 6.0 * s,
+            radiusY: 6.0 * s,
         };
         if mode_hover {
             let hov_bg =
@@ -454,14 +714,6 @@ fn draw_console_content(
             unsafe { target.FillRoundedRectangle(&btn_rr, &act_bg) };
         }
 
-        let mode_icon = if c.advanced { "⤡" } else { "⤢" };
-        let iw = text_estimate_width(mode_icon, theme.console_title.size);
-        let icon_lr = D2D_RECT_F {
-            left: c.mode_toggle.x + (c.mode_toggle.w - iw) / 2.0,
-            top: c.mode_toggle.y + (c.mode_toggle.h - theme.console_title.size * 1.6) / 2.0,
-            right: c.mode_toggle.x + c.mode_toggle.w,
-            bottom: c.mode_toggle.y + c.mode_toggle.h,
-        };
         let icon_color = if mode_hover {
             [1.0, 1.0, 1.0, 0.95 * a]
         } else if c.advanced {
@@ -472,41 +724,88 @@ fn draw_console_content(
                 0.95 * a,
             ]
         } else {
-            [1.0, 1.0, 1.0, 0.62 * a]
+            [1.0, 1.0, 1.0, 0.65 * a]
         };
         let icon_brush = unsafe { target.CreateSolidColorBrush(&color(icon_color), None)? };
-        draw_text(
-            target,
-            mode_icon,
-            &formats.console_close,
-            icon_lr,
-            &icon_brush,
-        );
+        let mode_cx = c.mode_toggle.x + c.mode_toggle.w / 2.0;
+        let mode_cy = c.mode_toggle.y + c.mode_toggle.h / 2.0;
+        draw_vector_mode_icon(target, mode_cx, mode_cy, s, c.advanced, &icon_brush);
     }
 
-    // 栅栏管理页（左栏）
-    draw_fences_page(target, theme, c, formats, a, accent)?;
-
-    // 高级模式：右栏工作台
-    if c.advanced {
-        let div_x = if let Some(re) = &c.rule_editor {
-            re.rect.x
-        } else {
-            c.x + c.width / 2.0
-        };
-        let div_brush =
-            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.12 * a]), None)? };
-        let div_rect = D2D_RECT_F {
-            left: div_x,
-            top: c.y + title_h + 8.0 * s,
-            right: div_x + 1.0,
-            bottom: c.y + c.height - 12.0 * s,
-        };
-        unsafe { target.FillRectangle(&div_rect, &div_brush) };
-
-        if let Some(re) = &c.rule_editor {
-            draw_rule_editor(target, theme, c, re, formats, a, accent)?;
+    if c.is_settings_page {
+        if let Some(sp) = &c.settings_page {
+            draw_settings_page(target, theme, c, sp, formats, a, accent)?;
         }
+    } else {
+        // 栅栏管理页（左栏）
+        draw_fences_page(target, theme, c, formats, a, accent)?;
+
+        // 高级模式：右栏工作台
+        if c.advanced {
+            let div_x = if let Some(re) = &c.rule_editor {
+                re.rect.x
+            } else {
+                c.x + c.width / 2.0
+            };
+            let div_brush =
+                unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.12 * a]), None)? };
+            let div_rect = D2D_RECT_F {
+                left: div_x,
+                top: c.y + title_h + 8.0 * s,
+                right: div_x + 1.0,
+                bottom: c.y + c.height - 12.0 * s,
+            };
+            unsafe { target.FillRectangle(&div_rect, &div_brush) };
+
+            if let Some(re) = &c.rule_editor {
+                draw_rule_editor(target, theme, c, re, formats, a, accent)?;
+            }
+        }
+    }
+
+    // 设置按钮悬停提示气泡：置顶绘制在整个控制面板最上层
+    if settings_hover && c.settings_toggle.w > 0.0 {
+        let tip_text = if c.is_settings_page {
+            "返回栅栏管理"
+        } else {
+            "全局设置"
+        };
+        let font_size = theme.label.size;
+        let pad_x = 8.0 * s;
+        let pad_y = 5.0 * s;
+        let tw = text_estimate_width(tip_text, font_size) + pad_x * 2.0;
+        let th = font_size * 1.6 + pad_y * 2.0;
+        let mut tx = c.settings_toggle.x + c.settings_toggle.w / 2.0 - tw / 2.0;
+        tx = tx.clamp(c.x + 8.0 * s, c.x + c.width - tw - 8.0 * s);
+        let ty = c.settings_toggle.y + c.settings_toggle.h + 4.0 * s;
+
+        let tip_rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: tx,
+                top: ty,
+                right: tx + tw,
+                bottom: ty + th,
+            },
+            radiusX: 6.0 * s,
+            radiusY: 6.0 * s,
+        };
+        let tip_bg =
+            unsafe { target.CreateSolidColorBrush(&color([0.10, 0.12, 0.18, 0.96 * a]), None)? };
+        let tip_border =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.35 * a]), None)? };
+        let tip_brush =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.95 * a]), None)? };
+        unsafe {
+            target.FillRoundedRectangle(&tip_rr, &tip_bg);
+            target.DrawRoundedRectangle(&tip_rr, &tip_border, 1.0 * s, None);
+        }
+        let text_lr = D2D_RECT_F {
+            left: tx + pad_x,
+            top: ty + pad_y,
+            right: tx + tw - pad_x,
+            bottom: ty + th - pad_y,
+        };
+        draw_text(target, tip_text, &formats.label, text_lr, &tip_brush);
     }
 
     // 模式切换悬停提示气泡：置顶绘制在整个控制面板最上层
@@ -1015,6 +1314,287 @@ fn draw_rule_editor(
 
     // 8. 提示卡片
     draw_rule_tip_card(target, theme, re.tip_rect, formats);
+
+    Ok(())
+}
+
+/// 控制中心全局设置页面（快捷键配置等）。
+#[allow(clippy::too_many_arguments)]
+fn draw_settings_page(
+    target: &ID2D1RenderTarget,
+    theme: &Theme,
+    c: &SceneConsole,
+    sp: &SceneSettingsPage,
+    formats: &TextFormats,
+    full_t: f32,
+    accent: [f32; 4],
+) -> Result<()> {
+    let s = theme.scale;
+    let label_font = theme.console_label.size;
+    let detail_font = label_font * crate::theme::DETAIL_SIZE_RATIO;
+
+    // 1. 分区标题与说明文本
+    let title_x = sp.rect.x + 16.0 * s;
+    let title_y = sp.rect.y + 6.0 * s;
+    let title_b =
+        unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.92 * full_t]), None)? };
+    let desc_b =
+        unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.50 * full_t]), None)? };
+
+    let title_w = text_estimate_width("全局快捷键", label_font);
+    let title_lr = D2D_RECT_F {
+        left: title_x,
+        top: title_y,
+        right: title_x + title_w,
+        bottom: title_y + label_font * 1.6,
+    };
+    draw_text(
+        target,
+        "全局快捷键",
+        &formats.console_label,
+        title_lr,
+        &title_b,
+    );
+
+    let desc_lr = D2D_RECT_F {
+        left: title_x + title_w + 12.0 * s,
+        top: title_y + (label_font * 1.6 - detail_font * 1.6) / 2.0,
+        right: sp.rect.x + sp.rect.w - 16.0 * s,
+        bottom: title_y + label_font * 1.6,
+    };
+    draw_text(
+        target,
+        "点击快捷键按键可直接录制，按 Esc 取消",
+        &formats.console_detail,
+        desc_lr,
+        &desc_b,
+    );
+
+    // 2. 逐行绘制快捷键
+    for r in &sp.rows {
+        // 行底卡片与层次描边
+        let row_rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: r.rect.x,
+                top: r.rect.y,
+                right: r.rect.x + r.rect.w,
+                bottom: r.rect.y + r.rect.h,
+            },
+            radiusX: 8.0 * s,
+            radiusY: 8.0 * s,
+        };
+        let row_bg =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.05 * full_t]), None)? };
+        let row_border =
+            unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.08 * full_t]), None)? };
+        unsafe {
+            target.FillRoundedRectangle(&row_rr, &row_bg);
+            target.DrawRoundedRectangle(&row_rr, &row_border, 1.0 * s, None);
+        }
+
+        // 行左侧文本：标签与描述
+        let text_left = r.rect.x + 16.0 * s;
+        let text_max_right = r.key_btn.x - 14.0 * s;
+        let has_sub_line = r.rect.h >= 34.0 * s;
+
+        if has_sub_line {
+            // 上行：功能标签
+            let top1 = r.rect.y + 7.5 * s;
+            let h1 = label_font * 1.25;
+            let lbl_lr = D2D_RECT_F {
+                left: text_left,
+                top: top1,
+                right: text_max_right,
+                bottom: top1 + h1,
+            };
+            let lbl_b = unsafe {
+                target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.92 * full_t]), None)?
+            };
+            draw_text(target, r.label, &formats.console_label, lbl_lr, &lbl_b);
+
+            // 下行：描述文本或冲突提示（行距 4.0*s，高度留足 16.5*s，汉字笔画饱满不切底）
+            let v_gap = 4.0 * s;
+            let top2 = top1 + h1 + v_gap;
+            let h2 = (detail_font * 1.4).max(16.5 * s);
+            let sub_lr = D2D_RECT_F {
+                left: text_left,
+                top: top2,
+                right: text_max_right,
+                bottom: top2 + h2,
+            };
+            if let Some(conflict) = &r.conflict_msg {
+                let warn_text = format!("⚠ {}", conflict);
+                let warn_b = unsafe {
+                    target.CreateSolidColorBrush(&color([0.96, 0.42, 0.24, 0.95 * full_t]), None)?
+                };
+                draw_text(target, &warn_text, &formats.console_detail, sub_lr, &warn_b);
+            } else {
+                let desc_b = unsafe {
+                    target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.50 * full_t]), None)?
+                };
+                draw_text(target, r.desc, &formats.console_detail, sub_lr, &desc_b);
+            }
+        } else {
+            let lbl_lr = D2D_RECT_F {
+                left: text_left,
+                top: r.rect.y + (r.rect.h - label_font * 1.6) / 2.0,
+                right: text_max_right,
+                bottom: r.rect.y + r.rect.h,
+            };
+            let lbl_b = unsafe {
+                target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.92 * full_t]), None)?
+            };
+            draw_text(target, r.label, &formats.console_label, lbl_lr, &lbl_b);
+        }
+
+        // 药丸形按键按钮
+        let key_hover =
+            matches!(c.hover_zone, Some(ConsoleZone::HotkeyRecord(act)) if act == r.action);
+        let pill_rr = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: r.key_btn.x,
+                top: r.key_btn.y,
+                right: r.key_btn.x + r.key_btn.w,
+                bottom: r.key_btn.y + r.key_btn.h,
+            },
+            radiusX: r.key_btn.h / 2.0,
+            radiusY: r.key_btn.h / 2.0,
+        };
+
+        let (fill_c, edge_c, text_c, key_display) = if r.is_recording {
+            // 录制中：背景高亮动画/提示“按组合键...”
+            (
+                [accent[0], accent[1], accent[2], 0.35 * full_t],
+                [accent[0], accent[1], accent[2], 0.95 * full_t],
+                [1.0, 1.0, 1.0, 0.95 * full_t],
+                "按组合键...",
+            )
+        } else if r.conflict_msg.is_some() {
+            // 冲突时：显示红/橙色警告字样与边框
+            let warn = [0.95, 0.35, 0.20];
+            let alpha = if key_hover { 0.25 } else { 0.12 };
+            (
+                [warn[0], warn[1], warn[2], alpha * full_t],
+                [warn[0], warn[1], warn[2], 0.85 * full_t],
+                [warn[0], warn[1] * 1.2, warn[2] * 1.2, 0.95 * full_t],
+                if r.key_text.is_empty() {
+                    "[未设置]"
+                } else {
+                    r.key_text.as_str()
+                },
+            )
+        } else if key_hover {
+            (
+                [1.0, 1.0, 1.0, 0.16 * full_t],
+                [1.0, 1.0, 1.0, 0.35 * full_t],
+                [1.0, 1.0, 1.0, 0.95 * full_t],
+                if r.key_text.is_empty() {
+                    "[未设置]"
+                } else {
+                    r.key_text.as_str()
+                },
+            )
+        } else {
+            let has_key = !r.key_text.is_empty();
+            let bg_a = if has_key { 0.09 } else { 0.05 };
+            let border_a = if has_key { 0.20 } else { 0.12 };
+            let text_a = if has_key { 0.88 } else { 0.40 };
+            (
+                [1.0, 1.0, 1.0, bg_a * full_t],
+                [1.0, 1.0, 1.0, border_a * full_t],
+                [1.0, 1.0, 1.0, text_a * full_t],
+                if has_key {
+                    r.key_text.as_str()
+                } else {
+                    "[未设置]"
+                },
+            )
+        };
+
+        let pill_bg = unsafe { target.CreateSolidColorBrush(&color(fill_c), None)? };
+        let pill_edge = unsafe { target.CreateSolidColorBrush(&color(edge_c), None)? };
+        let pill_text_b = unsafe { target.CreateSolidColorBrush(&color(text_c), None)? };
+
+        unsafe {
+            target.FillRoundedRectangle(&pill_rr, &pill_bg);
+            target.DrawRoundedRectangle(&pill_rr, &pill_edge, 1.0 * s, None);
+        }
+
+        let key_lr = D2D_RECT_F {
+            left: r.key_btn.x,
+            top: r.key_btn.y + (r.key_btn.h - detail_font * 1.6) / 2.0,
+            right: r.key_btn.x + r.key_btn.w,
+            bottom: r.key_btn.y + r.key_btn.h,
+        };
+        draw_text_centered(
+            target,
+            key_display,
+            &formats.console_detail,
+            key_lr,
+            &pill_text_b,
+        );
+
+        // 清除按钮 ✕
+        if let Some(cb) = r.clear_btn {
+            let clear_hover =
+                matches!(c.hover_zone, Some(ConsoleZone::HotkeyClear(act)) if act == r.action);
+            let clear_rr = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: cb.x,
+                    top: cb.y,
+                    right: cb.x + cb.w,
+                    bottom: cb.y + cb.h,
+                },
+                radiusX: 6.0 * s,
+                radiusY: 6.0 * s,
+            };
+            if clear_hover {
+                let clr_bg = unsafe {
+                    target.CreateSolidColorBrush(&color([0.85, 0.28, 0.28, 0.30 * full_t]), None)?
+                };
+                unsafe { target.FillRoundedRectangle(&clear_rr, &clr_bg) };
+            }
+            let clr_text_c = if clear_hover {
+                [0.95, 0.40, 0.40, 0.95 * full_t]
+            } else {
+                [1.0, 1.0, 1.0, 0.45 * full_t]
+            };
+            let clr_b = unsafe { target.CreateSolidColorBrush(&color(clr_text_c), None)? };
+            let clr_cx = cb.x + cb.w / 2.0;
+            let clr_cy = cb.y + cb.h / 2.0;
+            draw_vector_close_icon(target, clr_cx, clr_cy, 3.2 * s, (1.2 * s).max(1.0), &clr_b);
+        }
+    }
+
+    // 3. 底部「恢复默认快捷键」按钮
+    if sp.reset_default_btn.w > 0.0 {
+        let reset_hover = matches!(c.hover_zone, Some(ConsoleZone::HotkeyResetDefault));
+        draw_segmented_button(
+            target,
+            theme,
+            sp.reset_default_btn,
+            "恢复默认",
+            false,
+            reset_hover,
+            formats,
+            accent,
+        );
+    }
+
+    // 4. 底部「← 返回栅栏管理」按钮
+    if sp.back_btn.w > 0.0 {
+        let back_hover = matches!(c.hover_zone, Some(ConsoleZone::ToggleSettingsPage));
+        draw_segmented_button(
+            target,
+            theme,
+            sp.back_btn,
+            "返回栅栏管理",
+            false,
+            back_hover,
+            formats,
+            accent,
+        );
+    }
 
     Ok(())
 }
@@ -3014,5 +3594,204 @@ mod tests {
         }
         ended.expect("EndDraw 应成功");
         drawn.expect("含占位框的场景必须绘制成功（这是拖动收起栅栏的必经路径）");
+    }
+
+    #[test]
+    fn draw_scene_with_settings_page_succeeds() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct2D::{
+            D2D1CreateFactory, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
+            D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+        };
+        use windows::Win32::Graphics::DirectWrite::{
+            DWriteCreateFactory, DWRITE_FACTORY_TYPE_ISOLATED,
+        };
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
+            BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
+        };
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+
+        use crate::scene::{SceneHotkeyRow, SceneSettingsPage};
+        use winbosk_core::hotkey::HotkeyAction;
+
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
+        }
+
+        let theme = Theme::default();
+        const W: i32 = 600;
+        const H: i32 = 500;
+
+        let mem_dc = unsafe { CreateCompatibleDC(None) };
+        let mut bmi: BITMAPINFO = unsafe { core::mem::zeroed() };
+        bmi.bmiHeader.biSize = core::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = W;
+        bmi.bmiHeader.biHeight = -H;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+        let dib: HBITMAP =
+            unsafe { CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) }
+                .expect("DIB 应可创建");
+        let old = unsafe { SelectObject(mem_dc, HGDIOBJ(dib.0)) };
+
+        let factory: ID2D1Factory =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
+                .expect("D2D 工厂应可创建");
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            usage: D2D1_RENDER_TARGET_USAGE_NONE,
+            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        let dc_target =
+            unsafe { factory.CreateDCRenderTarget(&props) }.expect("DC 渲染目标应可创建");
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: W,
+            bottom: H,
+        };
+        unsafe { dc_target.BindDC(mem_dc, &rect) }.expect("绑定 DC 应成功");
+
+        let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
+            .expect("DWrite 工厂应可创建");
+        let formats = TextFormats::new(&dwrite, &theme).expect("文本格式应可创建");
+
+        let mut scene = Scene::new(W as f32, H as f32);
+        let settings_page = SceneSettingsPage {
+            rect: RectF {
+                x: 10.0,
+                y: 50.0,
+                w: 480.0,
+                h: 400.0,
+            },
+            rows: vec![
+                SceneHotkeyRow {
+                    action: HotkeyAction::ConsoleToggle,
+                    label: "控制中心",
+                    desc: "打开或关闭控制中心",
+                    rect: RectF {
+                        x: 20.0,
+                        y: 80.0,
+                        w: 460.0,
+                        h: 40.0,
+                    },
+                    key_btn: RectF {
+                        x: 340.0,
+                        y: 85.0,
+                        w: 100.0,
+                        h: 30.0,
+                    },
+                    clear_btn: Some(RectF {
+                        x: 445.0,
+                        y: 87.0,
+                        w: 26.0,
+                        h: 26.0,
+                    }),
+                    key_text: "Ctrl + Alt + T".into(),
+                    is_recording: false,
+                    conflict_msg: None,
+                },
+                SceneHotkeyRow {
+                    action: HotkeyAction::DesktopToggle,
+                    label: "切换桌面",
+                    desc: "在原生桌面与栅栏之间切换",
+                    rect: RectF {
+                        x: 20.0,
+                        y: 130.0,
+                        w: 460.0,
+                        h: 40.0,
+                    },
+                    key_btn: RectF {
+                        x: 340.0,
+                        y: 135.0,
+                        w: 100.0,
+                        h: 30.0,
+                    },
+                    clear_btn: None,
+                    key_text: "".into(),
+                    is_recording: true,
+                    conflict_msg: Some("快捷键冲突".into()),
+                },
+            ],
+            reset_default_btn: RectF {
+                x: 20.0,
+                y: 440.0,
+                w: 100.0,
+                h: 30.0,
+            },
+            back_btn: RectF {
+                x: 360.0,
+                y: 440.0,
+                w: 120.0,
+                h: 30.0,
+            },
+        };
+
+        scene.console = Some(SceneConsole {
+            x: 10.0,
+            y: 10.0,
+            width: 500.0,
+            height: 480.0,
+            title_h: 36.0,
+            close: RectF {
+                x: 470.0,
+                y: 16.0,
+                w: 24.0,
+                h: 24.0,
+            },
+            desktop_toggle: RectF::default(),
+            autostart_toggle: RectF::default(),
+            fence_rows: vec![],
+            fence_list_view: RectF::default(),
+            fence_detail: None,
+            add_fence: RectF::default(),
+            organize_btn: RectF::default(),
+            remove_btn: RectF::default(),
+            fill_color: [0.1, 0.1, 0.1, 0.9],
+            border_color: [0.3, 0.3, 0.3, 0.9],
+            panel: 1.0,
+            fade: 1.0,
+            hover_zone: None,
+            desktop_mode: false,
+            autostart: false,
+            advanced: false,
+            mode_toggle: RectF {
+                x: 440.0,
+                y: 16.0,
+                w: 24.0,
+                h: 24.0,
+            },
+            rule_editor: None,
+            settings_toggle: RectF {
+                x: 410.0,
+                y: 16.0,
+                w: 24.0,
+                h: 24.0,
+            },
+            is_settings_page: true,
+            settings_page: Some(settings_page),
+        });
+
+        let target: &ID2D1RenderTarget = &dc_target;
+        unsafe { target.BeginDraw() };
+        let drawn = draw_scene(target, &theme, &scene, &IconStore::new(), &formats);
+        let ended = unsafe { target.EndDraw(None, None) };
+
+        unsafe {
+            let _ = SelectObject(mem_dc, old);
+            let _ = DeleteObject(HGDIOBJ(dib.0));
+            let _ = DeleteDC(mem_dc);
+        }
+        ended.expect("EndDraw 应成功");
+        drawn.expect("含设置页的场景必须绘制成功");
     }
 }

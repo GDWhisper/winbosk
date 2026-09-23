@@ -2,6 +2,7 @@
 //!
 //! 坐标全部为**物理像素**（虚拟屏幕坐标），与 overlay 窗口客户端坐标一致。
 
+use winbosk_core::hotkey::HotkeyAction;
 use winbosk_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPosition};
 use winbosk_core::storage::StorageKind;
 
@@ -291,6 +292,35 @@ pub struct SceneConsole {
     pub mode_toggle: RectF,
     /// 栅栏高级规则编辑器（高级模式右栏；无选中栅栏时为 None）。
     pub rule_editor: Option<SceneRuleEditor>,
+    /// 标题栏设置按钮（⚙，模式切换按钮左侧）。
+    pub settings_toggle: RectF,
+    /// 当前是否处于设置页面。
+    pub is_settings_page: bool,
+    /// 设置页面内容几何。
+    pub settings_page: Option<SceneSettingsPage>,
+}
+
+/// 全局设置页（快捷键配置等）。
+#[derive(Debug, Clone)]
+pub struct SceneSettingsPage {
+    pub rect: RectF,
+    pub rows: Vec<SceneHotkeyRow>,
+    pub reset_default_btn: RectF,
+    pub back_btn: RectF,
+}
+
+/// 设置页中的单个快捷键行。
+#[derive(Debug, Clone)]
+pub struct SceneHotkeyRow {
+    pub action: HotkeyAction,
+    pub label: &'static str,
+    pub desc: &'static str,
+    pub rect: RectF,
+    pub key_btn: RectF,
+    pub clear_btn: Option<RectF>,
+    pub key_text: String,
+    pub is_recording: bool,
+    pub conflict_msg: Option<String>,
 }
 
 /// 高级模式下的栅栏规则编辑器（右栏工作台）。
