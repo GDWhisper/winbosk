@@ -52,6 +52,18 @@ $env:WINBOSK_AUTOSTOP_MS="2000"; .\target\debug\winbosk.exe
 
 （另：**不要把两条 `cargo` 命令并行跑**——同一个 `target/` 目录会互相踩增量构建，偶发 `拒绝访问 (os error 5)` 甚至 rustc ICE。）
 
+**构建环境硬约束（2026-09-23 实测补齐）**：
+
+- **agent 会话跑 `cargo`（build / test / clippy）必须在「无文件系统沙箱」下执行**。沙箱的文件系统拦截会让 cargo 的增量会话收尾写入被拒——
+  `error copying object file …deps\lib×.rmeta to …\incremental\<crate>-<hash>\s-<hash>-working\metadata.rmeta: 拒绝访问。 (os error 5)`；
+  而 cargo 只打 warning 就照旧 finalize，会话目录于是被**半写**，下一次真编译 rustc 直接 ICE（见下条）。
+  **证据**：同一份构建沙箱内 37~46s、无沙箱 2~5s（慢 8 倍）；清空增量缓存后，无沙箱连跑两次真重建**零告警零 ICE**，沙箱内第二次必 ICE。排除项：长路径形式 `\\?\G:\…` 与 ACL 均正常（无沙箱实测 copy 两种形式都成功），不是权限问题。
+- **cargo 会对 fresh（未重编译）的单元重放缓存的旧诊断**：一次 0.15s 全 fresh 的 `cargo build` 也会刷出
+  `拒绝访问` 告警，甚至点名**早已被删掉**的 lock 文件与不存在的 `-working` 目录。
+  **判据**：先看有没有 `Compiling` 行、告警里的会话随机名是不是本轮的——**别把重放的旧告警当成新故障**去改代码。
+- **ICE 处置（顺序固定）**：确认没有其它 `cargo` 在跑 → `rm -rf target/debug/incremental`（本项目实测曾累积到
+  **771MB / 78 个残留 lock**）→ **无沙箱**重新构建。仅删缓存而不脱离沙箱，会立刻再写坏一次。
+
 **改完代码必须自己跑构建与门禁，不许「只改不验」**：
 
 - 任何代码改动，收尾前**至少要让 `cargo build --workspace` 编过**（含 `winbosk-app`）。编译错误不许留给用户去发现。
@@ -59,10 +71,11 @@ $env:WINBOSK_AUTOSTOP_MS="2000"; .\target\debug\winbosk.exe
 - **构建前先退出正在运行的 WinBosk**：Windows 会锁住正在运行的可执行映像，链接阶段会报 `LNK1104: 无法打开文件 …\winbosk.exe`。要么先退出实例，要么只构建不被占用的 profile（如 `--release`）。同理，桌面验证前也别让旧实例留着（它还持有单实例互斥，新实例会静默退出）。
 - 构建/门禁命令能跑但受环境限制（如受限沙箱）时，**必须在结论里显式写出「哪一步没跑、为什么」**，不允许默不作声地跳过。
 - **看到 `the compiler unexpectedly panicked` 先别改代码**：`rustc_metadata\src\rmeta\encoder.rs: no entry found for key`
-  这类 ICE 是 `target\<profile>\incremental` **增量缓存损坏**，与业务代码无关（多为多个会话/进程共用同一个
-  `target/` 并发构建所致，本项目常有多个 agent 会话并存）。处置：先确认没有其它 `cargo` 在跑 → 删掉
-  `target\debug\incremental`（或 `cargo clean`）→ 重新构建。根治办法二选一：给并发会话各设独立的
-  `CARGO_TARGET_DIR`，或在 `.cargo/config.toml` 里关掉增量（`[build] incremental = false`）。
+  这类 ICE 是 `target\<profile>\incremental` **增量缓存损坏**，与业务代码无关——**可能炸在你根本没改过的 crate 上**
+  （2026-09-23 实测：改动只在 `render`，ICE 出现在 `core`）。成因是沙箱内构建 / 多会话共用同一个 `target/` 并发构建
+  （本项目常有多个 agent 会话并存）。处置见上文「ICE 处置（顺序固定）」：**清 `target\debug\incremental` + 无沙箱重建**。
+  根治首选「agent 会话无沙箱构建」（也顺带拿回 8 倍构建速度）；确有并发会话时再给它们各设独立的 `CARGO_TARGET_DIR`。
+  **不推荐**用 `.cargo/config.toml` 的 `[build] incremental = false` 兜底——会把开发期的秒级增量构建打成全量重编。
 
 ---
 
