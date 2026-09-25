@@ -272,20 +272,37 @@ cargo fmt --all -- --check
 
 ## 7. 已知缺口 (Known Gaps)
 
-### #5 桌面「虚拟壳项」未镜像（含回收站）
+### #5 桌面「虚拟壳项」未镜像（含回收站）—— 已按 plan 10.1 实施（2026-09-24）
 
 - **现状**：桌面镜像栅栏按 plan 08 修复后，内容 = 用户桌面文件 + 公共桌面文件；实测真实桌面
-  （`SysListView32` 只读读取，140 项）= 用户桌面 105 + 公共桌面 34 + **虚拟项 1（回收站）**，
-  即**只差回收站**这 1 项。
-- **为何没一并做**：
-  1. 虚拟项的 shell 属性**不置** `SFGAO_HIDDEN`/`GHOSTED`（实测 此电脑/网络/控制面板/用户文件夹/
-     库/图库/Linux… 全是 `attrs=0x20000000`），无法用属性区分「Windows 是否把它显示在桌面上」；
-     判定需要读 `HKCU\...\HideDesktopIcons\{NewStartPanel,ClassicStartMenu}` 的 per-CLSID 开关，
-     并处理「值缺失时按 Windows 内建默认」的语义（实测本机仅 `{5C899A03-…}=1`，而 DefView 只显示了
-     回收站 → 说明缺失即默认，且默认并非「一律显示」）。
-  2. 更要紧的是：**无路径项在栅栏里是死图标**——`DesktopItem::launch()` 对 `path == None` 直接返回
-     （`crates/shell/src/items.rs:50-53`），双击毫无反应；右键也只落到简版菜单。放进来会让用户
-     以为回收站坏了。
-- **补齐所需**：① 虚拟项可见性判定（CLSID + 注册表开关 + 内建默认表）；② 无路径项的打开与右键
-  （PIDL 级 `ShellExecuteEx` / `IContextMenu`）；③ 虚拟项没有文件系统路径 → 孤儿回收分支不能按其
-  处理（它们恒存在，需单独白名单）。
+  （`SysListView32` 只读读取）比栅栏内容多出的全是**虚拟壳项**（无 `path`、`kind == Unknown`、
+  `id = "<显示名>"`）。
+- **plan 10 已固化的 ground truth（`docs/plans/10-virtual-shell-items-mirror.md` §0）**：
+  - `enumerate_desktop_items()` = **166** 项；有路径 157；**无路径虚拟项 9**（此电脑 / 回收站 /
+    控制面板 ×2 / 库 / Linux / 图库 / 网络 / 主文件夹）。
+  - 真实性源 = `scripts/desktop-probe.py`（读 DefView）。虚拟项里**只有回收站 1 个**显示在桌面上，
+    其判定**不能**靠 shell 属性位（历史假设已否证：`attrs` 全是 `0x20000000`）。
+  - 权威口径改为「**白名单准入 + 注册表否决**」：注册表只能「保守隐藏」，**不能**「放行」
+    （实例：控制面板 `{26EE0668-…}` 两边注册表都缺值，而 DefView 不显示它 —— 缺值 ≠ 显示）。
+  - **「无路径项是死图标」的旧担忧已不成立**：图标提取 9/9 成功（回收站 0ms）；
+    双击走 `ShellExecuteEx` + `SEE_MASK_INVOKEIDLIST` + `lpIDList`（一手文档背书）；
+    右键走 `SHCreateItemFromParsingName` + `BindToHandler(BHID_SFUIObject)`（实测 4/4 成功，
+    回收站冷启 191ms → 必须预热，否则首次右击卡到 AppHang 阈值）。
+  - **`enumerate_desktop_items()` 禁止进 4s 心跳**：实测 11.9~14.9 ms，会把 4~7 ms 的心跳
+    预算撑爆；虚拟项同步用「启动一次注册表快照 + 内存集合比较」。
+- **已实施（plan 10.1，`docs/plans/10.1-exec-brief.md`）**：
+  1. `crates/core/src/shell_items.rs`：`is_virtual_id` / `PolicyValue` 三态 / `policy_hidden` 四态口径；
+  2. `crates/shell/src/virtual_items.rs`：`MIRRORABLE_VIRTUAL_ITEMS`（仅回收站）+ 注册表裁决 +
+     PIDL 复刻 + `open_shell_item`；
+  3. `crates/app/src/file_ops.rs`：`sync_virtual_items`（启动一次，**不进 4s 心跳**）、
+     旧口径死元数据按快照差集清池；
+  4. `crates/core/src/model.rs`：两个整理入口的候选集排除 `shell:` 前缀；
+  5. `remove_fence_intent` 直接拒绝虚拟项移出；`prime_startup` 收虚拟项解析名预热。
+- **plan 10 的三个关键决策（已逐条落地）**：
+  1. `MIRRORABLE_VIRTUAL_ITEMS` 白名单逐条带实测依据；`{26EE0668-…}` **故意不入表**。
+  2. `item_id` 虚拟项回退键改为 `<小写显示名>-<clsid 前 8 位>`（实测有两个同名「控制面板」会撞 id）；
+     旧 id 靠启动时的快照差集清池 + `validate()` 自愈。
+  3. `auto_organize_all` / `organize_icons_by_rules` 候选集排除 `shell:` 前缀，虚拟项**只**留在
+     【桌面】栅栏。
+- **待补（如后续有需求，另立 plan）**：用户在控制中心手动「刷新」虚拟项快照；新增虚拟壳项
+  的内建默认集合（比如未来 Windows 加入新入口）需扩表白名单。

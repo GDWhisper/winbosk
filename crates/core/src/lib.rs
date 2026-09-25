@@ -19,6 +19,7 @@ pub mod hotkey;
 pub mod layout;
 pub mod magnet;
 pub mod model;
+pub mod shell_items;
 pub mod storage;
 pub mod text;
 

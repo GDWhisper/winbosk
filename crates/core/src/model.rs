@@ -947,6 +947,11 @@ impl Desk {
 
         let mut moved = Vec::new();
         for item_id in candidates {
+            // 虚拟壳项（回收站等）不得被任何分类规则/预设搬进分类栅栏：它们不属于
+            // 「文件分类」这一语义，且用户栅栏的 name_patterns 可以直接命中显示名。
+            if crate::shell_items::is_virtual_id(&item_id) {
+                continue;
+            }
             let Some(icon) = self.icons.get(&item_id) else {
                 continue;
             };
@@ -987,10 +992,22 @@ impl Desk {
         };
 
         // 1. 收集待整理候选图标
-        let mut candidates: Vec<ItemId> = self.free_icons.clone();
+        let mut candidates: Vec<ItemId> = self
+            .free_icons
+            .iter()
+            .filter(|id| !crate::shell_items::is_virtual_id(id))
+            .cloned()
+            .collect();
         if let Some(src_id) = source_fence_id {
             if let Some(src_fence) = self.fence(src_id) {
                 for id in &src_fence.icon_ids {
+                    // 虚拟壳项（回收站等）整体排除：它们是候选（不含自身不匹配的成员都进
+                    // 候选），但 `classify_icon` 对它们返回 None 只是巧合——显示名带点的
+                    // 本地化名会切出假扩展名，用户栅栏的 `name_patterns` 更可以直接命中
+                    // 显示名（规则匹配不看 kind）。故必须显式排除（纯规则口径不可省）。
+                    if crate::shell_items::is_virtual_id(id) {
+                        continue;
+                    }
                     let keep = src_fence
                         .rule
                         .as_ref()
@@ -1707,5 +1724,184 @@ mod tests {
         let mut icon_tmp = Icon::new("5".into(), "important_backup.tmp".into(), ItemKind::Doc);
         icon_tmp.path = Some("C:\\important_backup.tmp".into());
         assert!(!rule.matches_icon(&icon_tmp));
+    }
+
+    // ---- 虚拟壳项（回收站等）不得被归类搬走（plan 10.1 Step 4） ----
+
+    /// 建一个「桌面」栅栏（无自身规则）+ 一个用户分类栅栏。
+    fn desk_with_desktop_fence() -> (Desk, u64, u64) {
+        let mut d = desk();
+        let desktop_fid = d.next_fence_id();
+        d.fences.push(Fence {
+            id: desktop_fid,
+            title: Some("桌面".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed: false,
+        });
+        (d, desktop_fid, 0)
+    }
+
+    /// 回收站图标元数据（虚拟壳项：无路径、kind=Unknown）。
+    fn recycle_bin() -> Icon {
+        let mut ic = Icon::new(
+            crate::shell_items::VIRTUAL_ID_PREFIX.to_string() + "回收站-645ff040",
+            "回收站".into(),
+            ItemKind::Unknown,
+        );
+        ic.path = None;
+        ic
+    }
+
+    #[test]
+    fn organize_by_rules_keeps_virtual_items_in_place() {
+        let (mut d, desktop_fid, _) = desk_with_desktop_fence();
+        let doc_fid = d.next_fence_id();
+        d.fences.push(Fence {
+            id: doc_fid,
+            title: Some("文档".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: Some(FenceRule {
+                enabled: true,
+                preset: Some(CategoryPreset::Documents),
+                ..Default::default()
+            }),
+            collapsed: false,
+        });
+
+        // 回收站是「桌面」栅栏成员（真实候选：自身规则缺失 ⇒ 全部成员进候选）
+        let bin_id = recycle_bin().id.clone();
+        d.icons.insert(bin_id.clone(), recycle_bin());
+        d.fences[0].icon_ids.push(bin_id.clone());
+        // 同时放一个真文件，证明整理本身仍工作
+        let mut ic_doc = icon("doc1");
+        ic_doc.path = Some("C:\\Users\\Desktop\\report.docx".into());
+        d.icons.insert("doc1".into(), ic_doc);
+        d.fences[0].icon_ids.push("doc1".into());
+
+        let moved = d.organize_icons_by_rules(Some(desktop_fid));
+        assert_eq!(moved, vec![("doc1".to_string(), doc_fid)]);
+        assert_eq!(
+            d.icon_location(&bin_id),
+            Some(IconLocation::Fence(desktop_fid)),
+            "回收站必须留在桌面栅栏"
+        );
+    }
+
+    /// 硬回归：用户栅栏 `name_patterns=["回收站"]` 直接命中显示名（规则匹配不看 kind）。
+    #[test]
+    fn name_pattern_cannot_capture_virtual_item() {
+        let (mut d, desktop_fid, _) = desk_with_desktop_fence();
+        let bin_fid = d.next_fence_id();
+        d.fences.push(Fence {
+            id: bin_fid,
+            title: Some("系统项".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: Some(FenceRule {
+                enabled: true,
+                preset: None,
+                name_patterns: vec!["回收站".into()],
+                ..Default::default()
+            }),
+            collapsed: false,
+        });
+
+        let bin = recycle_bin();
+        let bin_id = bin.id.clone();
+        d.icons.insert(bin_id.clone(), bin.clone());
+        // 规则**确实**能匹配上（否则这条测试是空转）
+        assert!(d.fences[1].rule.as_ref().unwrap().matches_icon(&bin));
+        d.fences[0].icon_ids.push(bin_id.clone());
+
+        let moved = d.organize_icons_by_rules(Some(desktop_fid));
+        assert!(moved.is_empty(), "虚拟壳项不得被 name_patterns 命中搬走");
+        assert_eq!(
+            d.icon_location(&bin_id),
+            Some(IconLocation::Fence(desktop_fid))
+        );
+    }
+
+    #[test]
+    fn auto_organize_keeps_virtual_items_in_place() {
+        let (mut d, desktop_fid, _) = desk_with_desktop_fence();
+        let bin = recycle_bin();
+        let bin_id = bin.id.clone();
+        d.icons.insert(bin_id.clone(), bin);
+        d.fences[0].icon_ids.push(bin_id.clone());
+        // 一个可被预设分类的文件，证明整理仍在跑
+        let mut ic_pic = icon("pic1");
+        ic_pic.path = Some("C:\\Users\\Desktop\\wallpaper.jpg".into());
+        d.icons.insert("pic1".into(), ic_pic);
+        d.fences[0].icon_ids.push("pic1".into());
+
+        let wa = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let report = d.auto_organize_all(Some(desktop_fid), wa, 1.0);
+        assert_eq!(report.moved_icons, 1, "只搬真文件，回收站不动");
+        assert_eq!(d.icon_location(&"pic1".into()).unwrap().fence_id(), {
+            let f = d.fences.iter().find(|f| f.id != desktop_fid).unwrap();
+            Some(f.id)
+        });
+        assert_eq!(
+            d.icon_location(&bin_id),
+            Some(IconLocation::Fence(desktop_fid)),
+            "自动整理也不得把回收站搬走"
+        );
+    }
+
+    /// `free_icons` 里的虚拟壳项同样不得被搬（未分组区也是候选来源）。
+    #[test]
+    fn free_virtual_item_is_not_a_candidate() {
+        let (mut d, _, _) = desk_with_desktop_fence();
+        let pic_fid = d.next_fence_id();
+        d.fences.push(Fence {
+            id: pic_fid,
+            title: Some("图片媒体".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: Some(FenceRule {
+                enabled: true,
+                preset: Some(CategoryPreset::Media),
+                ..Default::default()
+            }),
+            collapsed: false,
+        });
+        let bin = recycle_bin();
+        let bin_id = bin.id.clone();
+        d.icons.insert(bin_id.clone(), bin);
+        d.free_icons.push(bin_id.clone());
+
+        let moved = d.organize_icons_by_rules(None);
+        assert!(moved.is_empty());
+        assert_eq!(d.icon_location(&bin_id), Some(IconLocation::Free));
+        let report = d.auto_organize_all(None, Rect::new(0.0, 0.0, 1920.0, 1080.0), 1.0);
+        assert_eq!(report.moved_icons, 0);
+        assert_eq!(d.fences.len(), 2, "回收站不得触发新建分类栅栏");
     }
 }

@@ -97,6 +97,7 @@ pub(crate) use winbosk_render::{
 pub(crate) use winbosk_shell::icons::IconData;
 pub(crate) use winbosk_shell::items::DesktopItem;
 pub(crate) use winbosk_shell::takeover::DesktopHierarchy;
+pub(crate) use winbosk_shell::virtual_items::VirtualItemSnapshot;
 
 use crate::anim::*;
 use crate::context_menu::*;
@@ -620,6 +621,13 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
         reanchor_fences(&mut rt);
         let _ = rt.store.save(&rt.desk);
     }
+    // 虚拟壳项（回收站）一次性同步：必须在首帧布局之前，否则虚拟项入场会让侧边栏
+    // 宽度突变、闪一下。绝不挂进 SyncLibrary(4s)/reconcile_fences（H1/H2）。
+    let vsnap = winbosk_shell::virtual_items::mirrorable_virtual_snapshot();
+    if !vsnap.is_empty() && sync_virtual_items(&mut rt, &vsnap) {
+        reanchor_fences(&mut rt);
+        let _ = rt.store.save(&rt.desk);
+    }
     // 高度策略：`bounds.h == 0` 表示未手动缩放，按内容自适应（增删应用自动长高）。
     // 不在此冻结高度——用户拖边缘/角缩放后才落为具体值。
     let mut scene = build_scene(&mut rt, Instant::now());
@@ -650,7 +658,9 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
             .values()
             .filter_map(|ic| ic.path.clone())
             .collect();
-        shell_menu::prime_startup(&paths);
+        // 虚拟壳项没有路径，另走解析名 + `virtual:` 类型键（假扩展名会让预热静默失效）
+        let parsing: Vec<String> = vsnap.iter().map(|s| s.parsing_name.clone()).collect();
+        shell_menu::prime_startup(&paths, &parsing);
     }
     // 启动期一次性分配已就绪：把不再活跃的内存页换出工作集（D3D/场景构建等），
     // 降低常驻内存。GPU 侧资源由驱动管理不受影响，用到时自动换回。
@@ -2270,7 +2280,11 @@ fn launch_fence_icon(rt: &mut Runtime, fence: usize, icon: usize) {
         .and_then(|&i| rt.items.get(i));
     if let Some(item) = target {
         tracing::info!(name = %item.display_name, "打开桌面图标");
-        item.launch();
+        // 虚拟壳项（回收站）走 PIDL 路线，失败必须留日志——静默失败在 UI 上
+        // 表现为「点了没反应」。
+        if let Err(e) = item.launch() {
+            tracing::warn!(name = %item.display_name, "打开失败: {e}");
+        }
     }
 }
 
@@ -2288,24 +2302,58 @@ fn remove_fence_icon(rt: &mut Runtime, fence: usize, icon: usize) {
     let _ = rt.store.save(&rt.desk);
 }
 
+/// 「移出栅栏」的意图裁决（**纯判定**，只读 `Desk`，便于单测）。
+///
+/// 虚拟壳项（`shell:` 前缀）单独一个变体：它们不在磁盘上、也没有「移出」语义——
+/// 回收站移出栅栏不等于从桌面消失，用户看到的是「点了没反应」。`remove_fence_icon`
+/// / `remove_selected` 都经 `remove_fence_icon_by_id`，天然覆盖两条入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoveFenceIntent {
+    /// 虚拟壳项：拒绝移出。
+    Reject,
+    /// 管理区新增项：删引用（必要时先删磁盘文件）。
+    DeleteAdded,
+    /// 真实桌面项：移回未分组区。
+    ToFree,
+}
+
+pub(crate) fn remove_fence_intent(desk: &Desk, id: &str) -> RemoveFenceIntent {
+    if winbosk_core::shell_items::is_virtual_id(id) {
+        return RemoveFenceIntent::Reject;
+    }
+    // `added` 缺失的 id（元数据已被清）按真实桌面项处理：最坏只是移回未分组区，
+    // 不会误删磁盘文件。
+    if desk.icons.get(id).map(|i| i.added).unwrap_or(false) {
+        RemoveFenceIntent::DeleteAdded
+    } else {
+        RemoveFenceIntent::ToFree
+    }
+}
+
 /// 按 id 移出栅栏：内部库项直接删除（引用，库文件由「删除」动作负责）；链接文件夹的
 /// 镜像项**删除文件**（栅栏即文件夹，否则同步会把图标加回来，用户已确认此语义）；
-/// 桌面图标移回未分组区。
+/// 桌面图标移回未分组区。虚拟壳项直接拒绝（见 [`remove_fence_intent`]）。
 fn remove_fence_icon_by_id(rt: &mut Runtime, id: &String) {
-    if rt.desk.icons.get(id).map(|i| i.added).unwrap_or(false) {
-        if rt
-            .desk
-            .icons
-            .get(id)
-            .and_then(|ic| ic.path.clone())
-            .map(|p| is_linked_path(rt, &p))
-            .unwrap_or(false)
-        {
-            delete_managed_file(rt, id);
+    match remove_fence_intent(&rt.desk, id) {
+        RemoveFenceIntent::Reject => {
+            tracing::info!(id, "虚拟壳项不支持移出栅栏");
         }
-        remove_icon_entirely(rt, id);
-    } else {
-        rt.desk.move_icon(id, None);
+        RemoveFenceIntent::DeleteAdded => {
+            if rt
+                .desk
+                .icons
+                .get(id)
+                .and_then(|ic| ic.path.clone())
+                .map(|p| is_linked_path(rt, &p))
+                .unwrap_or(false)
+            {
+                delete_managed_file(rt, id);
+            }
+            remove_icon_entirely(rt, id);
+        }
+        RemoveFenceIntent::ToFree => {
+            rt.desk.move_icon(id, None);
+        }
     }
 }
 
@@ -2640,6 +2688,63 @@ mod tests {
         assert_eq!(rule.preset, None);
         assert_eq!(rule.custom_extensions, vec!["bat".to_string()]);
         assert!(rule.is_effective());
+    }
+
+    /// 虚拟壳项「移出栅栏」必须被拒绝：`remove_fence_icon` / `remove_selected` 都经
+    /// `remove_fence_icon_by_id`，天然覆盖两条入口。同时不得过度拒绝真实桌面项
+    /// / 管理区新增项——那会把用户 desktop.ini 之外的合法移出行为打挂。
+    #[test]
+    fn remove_fence_intent_rejects_virtual_only() {
+        let mut desk = Desk::new(AppSettings::default());
+        // 虚拟壳项（回收站）：added=true 但必须拒
+        let mut bin = make_icon_for_intent("shell:回收站-645ff040", true);
+        bin.path = None; // H4：虚拟项无路径
+        desk.icons.insert(bin.id.clone(), bin);
+        // 真实桌面项
+        let native = make_icon_for_intent(r"c:\users\me\desktop\a.txt", false);
+        desk.icons.insert(native.id.clone(), native);
+        // 管理区新增项
+        let added = make_icon_for_intent(r"c:\app\data\library\copy.txt", true);
+        desk.icons.insert(added.id.clone(), added);
+
+        assert_eq!(
+            remove_fence_intent(&desk, "shell:回收站-645ff040"),
+            RemoveFenceIntent::Reject,
+            "虚拟壳项不得被移出（即使 added=true）"
+        );
+        assert_eq!(
+            remove_fence_intent(&desk, r"c:\users\me\desktop\a.txt"),
+            RemoveFenceIntent::ToFree
+        );
+        assert_eq!(
+            remove_fence_intent(&desk, r"c:\app\data\library\copy.txt"),
+            RemoveFenceIntent::DeleteAdded
+        );
+        // 元数据缺失的 id：不得误伤，也不得误删盘上文件
+        assert_eq!(
+            remove_fence_intent(&desk, "ghost-id"),
+            RemoveFenceIntent::ToFree
+        );
+    }
+
+    fn make_icon_for_intent(id: &str, added: bool) -> Icon {
+        let mut ic = Icon::new(id.to_ascii_lowercase(), id.into(), ItemKind::Unknown);
+        ic.path = Some(id.to_string());
+        ic.added = added;
+        ic
+    }
+
+    /// 同步前后 `free_icons` / 池 / 成员不被误改的边界：虚拟 id 前缀判定只认 `shell:`。
+    #[test]
+    fn virtual_id_prefix_does_not_swallow_real_paths() {
+        // 普通路径（含 "shell" 字样）不是虚拟 id
+        assert!(!winbosk_core::shell_items::is_virtual_id(
+            r"c:\tools\shell\run.exe"
+        ));
+        assert!(!winbosk_core::shell_items::is_virtual_id(r"c:\a\shell.lnk"));
+        assert!(winbosk_core::shell_items::is_virtual_id(
+            "shell:回收站-645ff040"
+        ));
     }
 
     /// 验证跨栅栏规则冲突检测：

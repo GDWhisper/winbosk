@@ -122,18 +122,68 @@ fn primed_set() -> std::sync::MutexGuard<'static, HashSet<String>> {
 pub fn show(rt: &Runtime, path: &str, sx: i32, sy: i32, managed: bool) -> ShellMenuResult {
     // 类型未预热则后台预热；等待期间泵送消息，窗口保持可响应（不触发 AppHang）
     ensure_primed(path, rt.hwnd);
-    run_menu(rt, path, sx, sy, managed)
+    // 路径 → IShellItem（真实 Shell 菜单的入口）
+    let item: IShellItem = match unsafe {
+        SHCreateItemFromParsingName::<PCWSTR, Option<&IBindCtx>, IShellItem>(
+            PCWSTR(wide(path).as_ptr()),
+            None,
+        )
+    } {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(path, "SHCreateItemFromParsingName 失败: {e}");
+            return ShellMenuResult::Failed;
+        }
+    };
+    run_menu(rt, &item, path, sx, sy, managed)
+}
+
+/// 从已构造的 `IShellItem` 弹真实 Shell 右键菜单并执行选中命令。
+///
+/// 给**虚拟壳项**（回收站等无路径项）用：它没有文件系统路径，`SHCreateItemFromParsingName`
+/// 吃不下，只能由调用方用 `SHCreateItemFromIDList` 从 `DesktopItem.pidl` 构造。
+///
+/// `parsing_name`（`::{645FF040-…}`）是预热口径的键源：类型键走 `virtual:<clsid 小写>`，
+/// 与 `prime_startup` / `ensure_primed` 完全同源 —— 少这一环，`prime_startup` 插进
+/// `primed_set()` 的 `virtual:` 键没人查，回收站冷启那 191 ms 一次都没省下。
+/// `label` 仅用于日志。
+pub fn show_item(
+    rt: &Runtime,
+    item: &IShellItem,
+    parsing_name: &str,
+    label: &str,
+    sx: i32,
+    sy: i32,
+    managed: bool,
+) -> ShellMenuResult {
+    // 虚拟壳项尚未预热则后台预热（等待期间泵消息，不触发 AppHang）
+    ensure_primed_virtual(parsing_name, rt.hwnd);
+    run_menu(rt, item, label, sx, sy, managed)
 }
 
 /// 启动时预热：把栅栏里已有文件类型的 Shell 扩展在后台加载并初始化。
 /// 每个类型挑一个真实路径做一次 `QueryContextMenu`（就是这一步加载扩展、
 /// 触发慢首次初始化），把成本移到用户交互之前。
-pub fn prime_startup(paths: &[String]) {
-    let keys = unique_type_keys(paths);
+///
+/// `parsing_names`：**虚拟壳项的解析名**（`::{645FF040-…}`），单独收、单独打类型键。
+/// 不能混进 `paths`：`unique_type_keys` 按 `std::path` 口径推键，而解析名尾部是 `}`，
+/// `Path::extension()` 取不到任何东西 ⇒ 落到 `"\0file"` 键（和真实文件相撞）。
+/// 键不同口径 ⇒ 预热静默失效（它正是为修回收站冷启 191 ms 而加的）。
+pub fn prime_startup(paths: &[String], parsing_names: &[String]) {
+    let mut keys = unique_type_keys(paths);
+    // 虚拟项：键 = `virtual:<clsid 小写>`，值 = 解析名（`prime_one` 直接吃解析名）
+    let mut by_key: HashMap<String, String> =
+        paths.iter().map(|p| (type_key(p), p.clone())).collect();
+    for name in parsing_names {
+        let key = virtual_type_key(name);
+        if !by_key.contains_key(&key) {
+            by_key.insert(key.clone(), name.clone());
+            keys.push(key);
+        }
+    }
     if keys.is_empty() {
         return;
     }
-    let by_key: HashMap<String, String> = paths.iter().map(|p| (type_key(p), p.clone())).collect();
     let _ = std::thread::Builder::new()
         .name("winbosk-menu-prime".into())
         .spawn(move || {
@@ -147,6 +197,44 @@ pub fn prime_startup(paths: &[String]) {
         });
 }
 
+/// 虚拟壳项的类型键：`virtual:<clsid 小写>`。
+///
+/// 与 `unique_type_keys` 的按路径推键完全隔离——解析名尾部是 `}`，`Path::extension()`
+/// 取不到任何东西，会退化成「无扩展名文件」键。
+fn virtual_type_key(parsing_name: &str) -> String {
+    format!("virtual:{}", parsing_name.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 键口径必须与「按路径推键」隔离。
+    ///
+    /// 回归锁：解析名 `::{645FF040-…}` 的尾部 `}` 让 `std::path::Path::extension()`
+    /// 取不到任何东西（本机实测），`type_key` 于是回落到 `"\0file"`——**和真实文件撞同一个
+    /// 键**。两个不同的虚拟壳项也互相撞。若 `prime_startup` 用这个口径，
+    /// `primed_set()` 里的键没人查得到，回收站冷启那 191 ms 一次都省不下。
+    #[test]
+    fn virtual_type_key_is_isolated_from_path_extension_keys() {
+        let parsing = "::{645FF040-5081-101B-9F08-00AA002F954E}";
+        let vk = virtual_type_key(parsing);
+        assert_eq!(vk, "virtual:::{645ff040-5081-101b-9f08-00aa002f954e}");
+        // 按路径推键：解析名退化成「无扩展名文件」键 —— 与真实文件相撞
+        assert_eq!(type_key(parsing), "\u{0}file");
+        assert_ne!(vk, type_key(parsing));
+    }
+
+    /// 大小写 / 同名虚拟项：解析名唯一 ⇒ 键唯一，不会互相顶掉预热。
+    #[test]
+    fn virtual_type_key_distinguishes_same_display_name() {
+        assert_ne!(
+            virtual_type_key("::{26EE0668-A00A-44D7-9371-BEB064C98683}"),
+            virtual_type_key("::{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}")
+        );
+    }
+}
+
 /// 该类型的 Shell 菜单尚未预热：后台预热，并在等待期间泵送消息。
 /// 预热完成（或线程创建失败）后返回；调用方随后直接走主线程菜单。
 fn ensure_primed(path: &str, hwnd: HWND) {
@@ -154,23 +242,46 @@ fn ensure_primed(path: &str, hwnd: HWND) {
     if primed_set().contains(&key) {
         return;
     }
-    let Some(rx) = prime_path_async(path, hwnd) else {
+    let Some(rx) = prime_path_async(key, path, hwnd) else {
+        return; // 线程创建失败：照常弹菜单（罕见，退化为旧行为）
+    };
+    let _ = pump_until(rx);
+}
+
+/// 虚拟壳项的 `ensure_primed` 版本：键走 `virtual:<解析名小写>` 口径。
+///
+/// 与 `ensure_primed` **不是**同一个键空间——按解析名推扩展名会切出
+/// `00aa002f954e}` 这类假扩展名，两边键不同 ⇒ 预热静默失效。
+/// `prime_one` 直接吃解析名（`SHCreateItemFromParsingName` 认 `::{…}`），故预热本身
+/// 无需改动，只有键的口径要分开。
+fn ensure_primed_virtual(parsing_name: &str, hwnd: HWND) {
+    let key = virtual_type_key(parsing_name);
+    if primed_set().contains(&key) {
+        return;
+    }
+    let Some(rx) = prime_path_async(key, parsing_name, hwnd) else {
         return; // 线程创建失败：照常弹菜单（罕见，退化为旧行为）
     };
     let _ = pump_until(rx);
 }
 
 /// 后台预热单个文件类型，完成时发一个空消息唤醒等待方的消息泵。
-fn prime_path_async(path: &str, hwnd: HWND) -> Option<std::sync::mpsc::Receiver<()>> {
-    let key = type_key(path);
-    let path = path.to_string();
+///
+/// `key` 由调用方给定（路径项 = `type_key`，虚拟项 = `virtual_type_key`）：
+/// 这里不能再自己推——按解析名推扩展名会切出假扩展名，与查询侧键不同口径。
+fn prime_path_async(
+    key: String,
+    parsing: &str,
+    hwnd: HWND,
+) -> Option<std::sync::mpsc::Receiver<()>> {
+    let parsing = parsing.to_string();
     let hwnd_usize = hwnd.0 as usize;
     let (tx, rx) = std::sync::mpsc::channel();
     let ok = std::thread::Builder::new()
         .name("winbosk-menu-prime".into())
         .spawn(move || {
             let _ = winbosk_shell::com::init();
-            let _ = std::panic::catch_unwind(|| prime_one(&path));
+            let _ = std::panic::catch_unwind(|| prime_one(&parsing));
             primed_set().insert(key);
             let _ = tx.send(());
             // 唤醒等待方的消息泵（等待方阻塞在 GetMessage 上时）
@@ -295,29 +406,26 @@ fn pump_until<T>(rx: std::sync::mpsc::Receiver<T>) -> Option<T> {
 /// 菜单宿主窗口的前置/还原需要 overlay 的焦点代理（`with_foreground_lock`），
 /// 因此这里收的是整个 `Runtime`：overlay 句柄用于 Shell 动词的父窗口，overlay
 /// 指针用于绕过前台锁。
-fn run_menu(rt: &Runtime, path: &str, sx: i32, sy: i32, managed: bool) -> ShellMenuResult {
+///
+/// `item` 已由调用方构造（路径项走 `SHCreateItemFromParsingName`，虚拟壳项走
+/// `SHCreateItemFromIDList`——两者都要真实 Shell 菜单，只是入口不同）；`label`
+/// 仅用于日志。
+fn run_menu(
+    rt: &Runtime,
+    item: &IShellItem,
+    label: &str,
+    sx: i32,
+    sy: i32,
+    managed: bool,
+) -> ShellMenuResult {
     let hwnd = rt.hwnd;
     let overlay = rt.overlay_ptr;
-    let wide_path = wide(path);
-    // 路径 → IShellItem → 默认上下文菜单
-    let item: IShellItem = match unsafe {
-        SHCreateItemFromParsingName::<PCWSTR, Option<&IBindCtx>, IShellItem>(
-            PCWSTR(wide_path.as_ptr()),
-            None,
-        )
-    } {
-        Ok(i) => i,
-        Err(e) => {
-            tracing::warn!(path, "SHCreateItemFromParsingName 失败: {e}");
-            return ShellMenuResult::Failed;
-        }
-    };
     let ctx: IContextMenu = match unsafe {
         item.BindToHandler::<Option<&IBindCtx>, IContextMenu>(None, &BHID_SFUIObject)
     } {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(path, "BindToHandler(IContextMenu) 失败: {e}");
+            tracing::warn!(label, "BindToHandler(IContextMenu) 失败: {e}");
             return ShellMenuResult::Failed;
         }
     };
@@ -329,15 +437,15 @@ fn run_menu(rt: &Runtime, path: &str, sx: i32, sy: i32, managed: bool) -> ShellM
     let ctx2: IContextMenu2 = match ctx.cast::<IContextMenu2>() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(path, "获取 IContextMenu2 失败: {e}");
+            tracing::warn!(label, "获取 IContextMenu2 失败: {e}");
             return ShellMenuResult::Failed;
         }
     };
-    tracing::debug!(path, ctx3 = ctx3.is_some(), "Shell 菜单接口就绪");
+    tracing::debug!(label, ctx3 = ctx3.is_some(), "Shell 菜单接口就绪");
 
     let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
     if menu.is_invalid() {
-        tracing::warn!(path, "创建 Shell 菜单句柄失败");
+        tracing::warn!(label, "创建 Shell 菜单句柄失败");
         return ShellMenuResult::Failed;
     }
 
@@ -382,7 +490,7 @@ fn run_menu(rt: &Runtime, path: &str, sx: i32, sy: i32, managed: bool) -> ShellM
     let hinst = match unsafe { GetModuleHandleW(None) } {
         Ok(m) => HINSTANCE(m.0),
         Err(e) => {
-            tracing::warn!(path, "获取模块句柄失败: {e}");
+            tracing::warn!(label, "获取模块句柄失败: {e}");
             unsafe {
                 let _ = DestroyMenu(menu);
             }

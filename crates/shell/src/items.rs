@@ -15,7 +15,7 @@ use windows::Win32::UI::Shell::Common::{
 };
 use windows::Win32::UI::Shell::{
     IShellFolder, SHGetDesktopFolder, SHGetPathFromIDListW, SHParseDisplayName, ShellExecuteW,
-    SHCONTF_FOLDERS, SHCONTF_NONFOLDERS, SHGDNF,
+    SHCONTF_FOLDERS, SHCONTF_NONFOLDERS, SHGDNF, SHGDN_FORPARSING,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -46,22 +46,50 @@ impl Drop for DesktopItem {
 }
 
 impl DesktopItem {
-    /// 用系统默认动作打开该项（等价于桌面双击）。虚拟项（无路径）跳过。
-    pub fn launch(&self) {
-        let Some(path) = self.path.as_deref() else {
-            return;
-        };
-        let file = wide(path);
-        unsafe {
-            let _ = ShellExecuteW(
-                None, // 无父窗口
-                None, // 默认动作（open）
-                PCWSTR(file.as_ptr()),
-                None,
-                None,
-                SW_SHOWNORMAL,
-            );
+    /// 用系统默认动作打开该项（等价于桌面双击）。
+    ///
+    /// - 有路径 → `ShellExecuteW`（原有路线）；
+    /// - 无路径且 pidl 非空 → `SEE_MASK_INVOKEIDLIST` 走 PIDL（虚拟壳项，如回收站）；
+    /// - 两者都不可用 → `Err`。
+    ///
+    /// 返回错误而不是丢弃：静默失败在 UI 上表现为「点了没反应」，调用方至少能留一行日志。
+    pub fn launch(&self) -> windows::core::Result<()> {
+        if let Some(path) = self.path.as_deref() {
+            let file = wide(path);
+            let r = unsafe {
+                ShellExecuteW(
+                    None, // 无父窗口
+                    None, // 默认动作（open）
+                    PCWSTR(file.as_ptr()),
+                    None,
+                    None,
+                    SW_SHOWNORMAL,
+                )
+            };
+            // ShellExecuteW 的返回是 HINSTANCE 口径（错误码落在 0..=32），不是 GetLastError。
+            return if (r.0 as isize) > 32 {
+                Ok(())
+            } else {
+                Err(windows::core::Error::from_hresult(HRESULT(
+                    r.0 as i32 & 0xFFFF,
+                )))
+            };
         }
+        if self.pidl.is_null() {
+            return Err(windows::core::Error::from_hresult(HRESULT(E_ENUM_EMPTY)));
+        }
+        match crate::virtual_items::open_shell_item(self.pidl) {
+            true => Ok(()),
+            false => Err(windows::core::Error::from_hresult(HRESULT(E_ENUM_EMPTY))),
+        }
+    }
+
+    /// 解析名（`::{645FF040-…}`）——虚拟壳项 Shell 菜单预热 / 打开的键源。
+    ///
+    /// 文件系统项同样返回自己的解析名（等于路径），但调用方只对虚拟项用得上
+    /// （文件项有 `path`）。PIDL 为空或查询失败时返回空串。
+    pub fn parsing_name(&self) -> String {
+        crate::virtual_items::parsing_name_of(self.pidl)
     }
 }
 
@@ -141,7 +169,7 @@ pub fn item_from_path(path: &str) -> windows::core::Result<DesktopItem> {
     }
     let display_name = display_name_from_path(path);
     let kind = kind_from(0, false, Some(path), &display_name);
-    let id = item_id(Some(path.into()), &display_name);
+    let id = item_id(Some(path.into()), &display_name, None);
     Ok(DesktopItem {
         id,
         display_name,
@@ -170,8 +198,15 @@ fn display_name_from_path(path: &str) -> String {
 fn build_item(desktop: &IShellFolder, pidl: *mut ITEMIDLIST) -> Option<DesktopItem> {
     let display_name = display_name_of(desktop, pidl)?;
     let path = path_of(pidl);
+    // 虚拟项（无路径）额外取一次解析名切出 CLSID 片段：同名虚拟项必须拿到不同 id。
+    // 只对虚拟项调（有路径项仍走小写路径口径）；实测单项 0.5~1.5 µs，可忽略。
+    let clsid = if path.is_none() {
+        parsing_name_of(desktop, pidl).as_deref().and_then(clsid_of)
+    } else {
+        None
+    };
     let kind = kind_of(desktop, pidl, &display_name, path.as_deref());
-    let id = item_id(path.clone(), &display_name);
+    let id = item_id(path.clone(), &display_name, clsid.as_deref());
 
     Some(DesktopItem {
         id,
@@ -180,6 +215,26 @@ fn build_item(desktop: &IShellFolder, pidl: *mut ITEMIDLIST) -> Option<DesktopIt
         path,
         pidl,
     })
+}
+
+/// 从解析名 `::{XXXX-…}` 中切出 CLSID（`{XXXX-…}`，首尾大括号齐全）。
+fn clsid_of(parsing_name: &str) -> Option<String> {
+    let start = parsing_name.find('{')?;
+    let end = parsing_name.rfind('}')?;
+    (end > start)
+        .then(|| parsing_name[start..=end].to_string())
+        .filter(|s| s.len() >= 10)
+}
+
+/// 获取解析名（`SHGDN_FORPARSING`）——虚拟项的 CLSID 来源。
+fn parsing_name_of(desktop: &IShellFolder, pidl: *const ITEMIDLIST) -> Option<String> {
+    let mut strret = STRRET::default();
+    unsafe {
+        desktop
+            .GetDisplayNameOf(pidl, SHGDN_FORPARSING, &mut strret)
+            .ok()?;
+    }
+    Some(strret_to_string(&strret))
 }
 
 /// 获取显示名称（SHGDNF_NORMAL）。
@@ -258,14 +313,20 @@ fn kind_from(attrs: u32, attrs_ok: bool, path: Option<&str>, name: &str) -> Item
     ItemKind::Unknown
 }
 
-/// 稳定标识符：文件系统项用小写路径，虚拟项退回显示名。
-fn item_id(path: Option<String>, display_name: &str) -> ItemId {
-    path.map(|p| p.to_ascii_lowercase())
-        .unwrap_or_else(|| format!("shell:{}", display_name))
+/// 稳定标识符：文件系统项用小写路径，虚拟项退回 `shell:<显示名>-<clsid 前 8 位>`（H5）。
+fn item_id(path: Option<String>, display_name: &str, clsid: Option<&str>) -> ItemId {
+    match path {
+        Some(p) => p.to_ascii_lowercase(),
+        None => match clsid {
+            Some(c) => crate::virtual_items::virtual_item_id(display_name, c),
+            // 解析名都取不到时退回显示名（保底可用，仅影响极端失败路径）
+            None => format!("shell:{}", display_name),
+        },
+    }
 }
 
 /// 把 STRRET 转换为 String，并释放 COM 分配的宽字符串。
-fn strret_to_string(strret: &STRRET) -> String {
+pub(crate) fn strret_to_string(strret: &STRRET) -> String {
     let ty = STRRET_TYPE(strret.uType as i32);
     if ty == STRRET_WSTR {
         let ptr = unsafe { strret.Anonymous.pOleStr };
@@ -325,10 +386,46 @@ mod tests {
     #[test]
     fn item_id_prefers_lowercase_path() {
         assert_eq!(
-            item_id(Some(r"C:\Docs\A.Exe".into()), "A"),
+            item_id(Some(r"C:\Docs\A.Exe".into()), "A", None),
             "c:\\docs\\a.exe"
         );
-        assert_eq!(item_id(None, "回收站"), "shell:回收站");
+        // 虚拟项：clsid 在 → H5 口径；不在 → 退回显示名
+        assert_eq!(
+            item_id(
+                None,
+                "回收站",
+                Some("{645FF040-5081-101B-9F08-00AA002F954E}")
+            ),
+            "shell:回收站-645ff040"
+        );
+        assert_eq!(item_id(None, "回收站", None), "shell:回收站");
+    }
+
+    #[test]
+    fn clsid_of_slices_parsing_name() {
+        assert_eq!(
+            clsid_of("::{645FF040-5081-101B-9F08-00AA002F954E}"),
+            Some("{645FF040-5081-101B-9F08-00AA002F954E}".to_string())
+        );
+        // 不带大括号 / 太短 / 空 → None（调用方退回显示名口径）
+        assert_eq!(clsid_of("645FF040-5081"), None);
+        assert_eq!(clsid_of(""), None);
+    }
+
+    #[test]
+    fn virtual_id_distinguishes_same_display_name() {
+        // 两个同名「控制面板」：CLSID 不同 → id 不同（旧口径 `shell:<显示名>` 会撞）
+        let a = item_id(
+            None,
+            "控制面板",
+            Some("{5399E694-F7B0-4E1B-9B0C-1F3E2D4C5B6A}"),
+        );
+        let b = item_id(
+            None,
+            "控制面板",
+            Some("{21EC2020-3AEA-1069-A2DD-08002B30309D}"),
+        );
+        assert_ne!(a, b);
     }
 
     #[test]

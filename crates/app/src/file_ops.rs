@@ -162,6 +162,201 @@ pub(crate) fn register_fence_item(rt: &mut Runtime, fence: usize, path: &str) ->
     true
 }
 
+/// 虚拟壳项的「池」视图：`Runtime` 里与虚拟项登记相关的那几块字段。
+///
+/// 单独抽象出来的唯一原因是**可单测**：真实 `Runtime` 需要 GPU `Compositor` /
+/// overlay 窗口句柄，单元测试里造不出来；而本模块的判定口径（清池差集、幂等、
+/// 位图槽单调、不入 `free_icons`）必须锁死。字段与 `Runtime` 一一对应，`Runtime`
+/// 版本只是转发。
+pub(crate) struct VirtualPool<'a> {
+    pub(crate) desk: &'a mut Desk,
+    pub(crate) items: &'a mut Vec<DesktopItem>,
+    pub(crate) item_index: &'a mut HashMap<String, usize>,
+    pub(crate) bitmap_ids: &'a mut HashMap<String, u64>,
+}
+
+impl<'a> VirtualPool<'a> {
+    /// 与 `remove_icon_entirely` 同口径：从池/未分组区/位图表/`items` 里整体摘除。
+    fn remove(&mut self, id: &str) {
+        self.desk.icons.remove(id);
+        self.desk.free_icons.retain(|x| x != id);
+        for f in &mut self.desk.fences {
+            f.icon_ids.retain(|x| x != id);
+        }
+        self.bitmap_ids.remove(id);
+        if let Some(i) = self.items.iter().position(|it| it.id == *id) {
+            self.items.remove(i);
+        }
+        *self.item_index = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| (it.id.clone(), i))
+            .collect();
+    }
+
+    /// 位图槽分配：**单调递增**，不用 `items.len()`（`remove` 会重建下标，`len()`
+    /// 会与既有槽号重合，导致新项覆盖旧项位图）。
+    fn next_bitmap_slot(&self) -> u64 {
+        self.bitmap_ids.values().copied().max().unwrap_or(0) + 1
+    }
+
+    /// 把一个虚拟壳项快照注册进指定栅栏（下标）。
+    ///
+    /// 与 `register_fence_item` 同款事务口径（`items` / `item_index` / `bitmap_ids`
+    /// 同帧对齐），但有两点本质差异：
+    ///
+    /// 1. **`Icon.path == None`**（H4）。虚拟项不在任何管理区：`movable_items` 不会
+    ///    把它当文件搬，`file_extension` 不会从 `::{…}` 切出假扩展名，
+    ///    `is_managed_path` 恒 false（删除只走原生动词，WinBosk 绝不直删）。
+    /// 2. 位图槽单调且**不与既有槽号重合**（见 [`Self::next_bitmap_slot`]）。
+    ///
+    /// 三块状态（元数据 / DesktopItem / 位图槽）各自独立补齐：它们可能单独缺失
+    /// （`validate()` 剔元数据、启动枚举重建 items 池），只判一个会让另一种缺失时
+    /// 成员挂上去又被静默剔掉。
+    ///
+    /// 抽图失败只 warn、不阻断注册（图标缺帧可后续补，栅栏成员不能丢）。
+    /// 返回是否真的新增（已在本栅栏 → false，供调用方判定幂等）。
+    fn register(
+        &mut self,
+        fence: usize,
+        snap: &VirtualItemSnapshot,
+        pending: &mut Vec<(u64, IconData)>,
+    ) -> bool {
+        let id = winbosk_shell::virtual_items::virtual_item_id(&snap.display_name, &snap.clsid);
+
+        // 分开判「元数据在不在」与「DesktopItem 在不在」：两者都可能单独缺失
+        // （`validate()` 会剔除池里没有元数据的成员引用；启动枚举会重建 items 池）。
+        // 只判一个会让另一种缺失时既不补元数据也不补 PIDL —— 成员挂上去后被
+        // `validate()` 静默剔掉，回收站时有时无。
+        let has_meta = self.desk.icons.contains_key(&id);
+        let has_item = self.item_index.contains_key(&id);
+        if !has_meta {
+            let mut ic = Icon::new(
+                id.clone(),
+                snap.display_name.clone(),
+                winbosk_core::model::ItemKind::Unknown,
+            );
+            ic.path = None; // H4：显式 None，绝不从解析名派生
+            ic.added = true; // 非真实桌面文件：不走镜像回收语义
+            self.desk.icons.insert(id.clone(), ic);
+        }
+        if !has_item {
+            let item = winbosk_shell::virtual_items::virtual_item(snap);
+            self.items.push(item);
+            let idx = self.items.len() - 1;
+            self.item_index.insert(id.clone(), idx);
+        }
+        // 位图槽 + 抽图以 `bitmap_ids` 为准（渲染层真正的查表口径）：缺槽才补，
+        // 缺槽**不一定**伴随缺 DesktopItem。
+        let slot = self.next_bitmap_slot();
+        if !self.bitmap_ids.contains_key(&id) {
+            self.bitmap_ids.insert(id.clone(), slot);
+            if let Some(&idx) = self.item_index.get(&id) {
+                // 抽图（进 pending_uploads，随首帧一起上传）；失败不阻断注册
+                match winbosk_shell::icons::extract_icon(&self.items[idx], ICON_EXTRACT_SIZE) {
+                    Ok(data) => pending.push((slot, data)),
+                    Err(e) => tracing::warn!(id, "虚拟壳项图标提取失败: {e}"),
+                }
+            }
+        }
+        // **两条路径都要强制 `added = true`**：启动时的元数据补齐循环会把枚举到的
+        // 每一项无条件写成 `added = false`（`main.rs` 的 `for it in &items`），而回收站
+        // 就在枚举结果里 —— 若这里不纠正，「删除」会走 `move_icon(id, None)` 把它丢进
+        // 没有绘制入口的未分组区，图标凭空消失；Shell 菜单还会注入一个空转的「移出栅栏」。
+        if let Some(ic) = self.desk.icons.get_mut(&id) {
+            ic.added = true;
+            ic.path = None; // 同样强制：不得被任何回填逻辑塞进文件路径
+        }
+
+        let Some(f) = self.desk.fences.get_mut(fence) else {
+            return false;
+        };
+        if f.icon_ids.contains(&id) {
+            return false;
+        }
+        f.icon_ids.push(id.clone());
+        // 状态全集校验：虚拟项与文件项一样，不能「既在未分组区又在栅栏里」。
+        self.desk.free_icons.retain(|x| x != &id);
+        true
+    }
+
+    /// 虚拟壳项一次性同步：清池 → 注册 → 移除。
+    ///
+    /// 绝不要挂进 `SyncLibrary`(4s)，也绝不要并进 `reconcile_fences`：
+    /// `mirror_converged` 的三个入参全派生自磁盘，`mirror_existing_paths` 首句
+    /// `.filter_map(|ic| ic.path.as_deref())` 会丢弃所有 `path == None` 的项 ⇒
+    /// 虚拟项永远进不了 `owned` ⇒ 每 4s 恒不收敛 ⇒ 早退失效、每轮跑全池
+    /// `Path::exists()`（本机 173 次 stat）。详见 H1/H2。
+    fn sync(&mut self, snap: &[VirtualItemSnapshot], pending: &mut Vec<(u64, IconData)>) -> bool {
+        // 1. 清池（先清后注册）：任何旧口径死元数据一次性清掉。
+        //    判据用「快照差集」而非按 CLSID 反查旧 id——现网 desk.json 已有 15 条死元数据，
+        //    其中 6 条是英文 locale 名且不含 CLSID，反查无效（H3）。
+        let live: HashSet<String> = snap
+            .iter()
+            .map(|s| winbosk_shell::virtual_items::virtual_item_id(&s.display_name, &s.clsid))
+            .collect();
+        let stale: Vec<String> = self
+            .desk
+            .icons
+            .iter()
+            .filter(|(id, ic)| ic.path.is_none() && winbosk_core::shell_items::is_virtual_id(id))
+            .filter(|(id, _)| !live.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut changed = false;
+        for id in stale {
+            self.remove(&id);
+            changed = true;
+        }
+
+        // 2. 注册：目标栅栏 = 桌面栅栏（复用 `resolve_desktop_fence` 口径）
+        let target = resolve_desktop_fence(self.desk, None);
+        let Some(fid) = target else {
+            tracing::warn!("未找到桌面栅栏，虚拟壳项同步跳过（本切片不兜底创建栅栏）");
+            return false;
+        };
+        let Some(idx) = self.desk.fences.iter().position(|f| f.id == fid) else {
+            return false;
+        };
+        for s in snap {
+            if self.register(idx, s, pending) {
+                changed = true;
+            }
+        }
+
+        // 3. 移除：栅栏成员里`是虚拟 id`但不在快照里 → 从成员移除（不删任何磁盘内容）
+        for f in &mut self.desk.fences {
+            let before = f.icon_ids.len();
+            f.icon_ids
+                .retain(|id| !winbosk_core::shell_items::is_virtual_id(id) || live.contains(id));
+            if f.icon_ids.len() != before {
+                changed = true;
+            }
+        }
+
+        changed
+    }
+}
+
+/// 虚拟壳项一次性同步（`Runtime` 入口）。**只在启动与控制中心「刷新」时调用。**
+///
+/// 注册口径见 [`VirtualPool::register`]（`sync` 内部走同一实现，注册 = 同步的第 2 步）。
+pub(crate) fn sync_virtual_items(rt: &mut Runtime, snap: &[VirtualItemSnapshot]) -> bool {
+    let mut pending = Vec::new();
+    let changed = {
+        let mut pool = VirtualPool {
+            desk: &mut rt.desk,
+            items: &mut rt.items,
+            item_index: &mut rt.item_index,
+            bitmap_ids: &mut rt.bitmap_ids,
+        };
+        pool.sync(snap, &mut pending)
+    };
+    rt.pending_uploads.extend(pending);
+    changed
+}
+
 /// 目标目录不可作为栅栏存储位置的原因（具名结果，不用歧义布尔值）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageReject {
@@ -1214,5 +1409,435 @@ mod tests {
         assert!(dir_eq(Path::new(r"C:/A/B"), Path::new(r"C:\A\B")));
         assert!(!dir_eq(Path::new(r"C:\A\B"), Path::new(r"C:\A\BC")));
         assert!(!dir_eq(Path::new(""), Path::new("")));
+    }
+
+    // ---- 虚拟壳项同步（plan 10.1 Step 3） ----
+
+    use winbosk_shell::virtual_items::VirtualItemSnapshot;
+
+    /// 本机回收站快照（CLSID 大写，与白名单同值）。
+    fn bin_snapshot() -> VirtualItemSnapshot {
+        VirtualItemSnapshot {
+            parsing_name: "::{645FF040-5081-101B-9F08-00AA002F954E}".into(),
+            clsid: "{645FF040-5081-101B-9F08-00AA002F954E}".into(),
+            display_name: "回收站".into(),
+        }
+    }
+
+    /// 桌面栅栏（title=「桌面」，无 storage_path）。
+    fn desktop_fence(id: u64) -> Fence {
+        let mut f = test_fence(id, &[]);
+        f.title = Some("桌面".into());
+        f
+    }
+
+    /// 池里登记一条虚拟项元数据（模拟上次启动落盘的 desk.json 条目）。
+    fn put_virtual_icon(desk: &mut Desk, id: &str, name: &str, path: Option<&str>) {
+        let mut ic = Icon::new(
+            id.to_string(),
+            name.to_string(),
+            winbosk_core::model::ItemKind::Unknown,
+        );
+        ic.path = path.map(|s| s.to_string());
+        ic.added = true;
+        desk.icons.insert(id.to_string(), ic);
+    }
+
+    /// 旧口径死元数据一次性清掉（中文名 / 英文 locale 名都不含 CLSID ⇒ 反查无效，
+    /// 只有快照差集能覆盖（H3））。
+    #[test]
+    fn sync_clears_stale_virtual_metadata_and_registers_new_id() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        put_virtual_icon(&mut desk, "shell:控制面板", "控制面板", None);
+        put_virtual_icon(&mut desk, "shell:This PC", "This PC", None);
+        put_virtual_icon(&mut desk, "shell:Recycle Bin", "Recycle Bin", None);
+        // 一个真实文件项：绝不能被虚拟同步碰
+        put_virtual_icon(
+            &mut desk,
+            r"c:\users\me\desktop\a.txt",
+            "a.txt",
+            Some(r"C:\Users\me\Desktop\a.txt"),
+        );
+
+        let mut items = Vec::new();
+        let mut item_index = HashMap::new();
+        let mut bitmap_ids = HashMap::new();
+        let mut pending = Vec::new();
+        {
+            let mut p = VirtualPool {
+                desk: &mut desk,
+                items: &mut items,
+                item_index: &mut item_index,
+                bitmap_ids: &mut bitmap_ids,
+            };
+            let changed = p.sync(&[bin_snapshot()], &mut pending);
+            assert!(changed, "清掉 3 条死元数据 + 注册 1 条新项");
+        }
+
+        for dead in ["shell:控制面板", "shell:This PC", "shell:Recycle Bin"] {
+            assert!(!desk.icons.contains_key(dead), "{dead} 应被清掉");
+        }
+        assert!(desk.icons.contains_key(r"c:\users\me\desktop\a.txt"));
+        assert!(desk.icons.contains_key("shell:回收站-645ff040"));
+        assert_eq!(
+            desk.fences[0].icon_ids,
+            vec!["shell:回收站-645ff040".to_string()]
+        );
+        assert!(items.is_empty() || items.iter().all(|it| it.path.is_none()));
+    }
+
+    /// 幂等：连续两次同步，第二次 0 变动。
+    #[test]
+    fn sync_virtual_items_is_idempotent() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        let mut items = Vec::new();
+        let mut item_index = HashMap::new();
+        let mut bitmap_ids = HashMap::new();
+        let mut pending = Vec::new();
+        let mut p = VirtualPool {
+            desk: &mut desk,
+            items: &mut items,
+            item_index: &mut item_index,
+            bitmap_ids: &mut bitmap_ids,
+        };
+        assert!(p.sync(&[bin_snapshot()], &mut pending));
+        assert!(!p.sync(&[bin_snapshot()], &mut pending), "第二次应 0 变动");
+    }
+
+    /// 桌面栅栏不存在：不 panic、不创建栅栏、返回 false。
+    #[test]
+    fn sync_without_desktop_fence_is_noop() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        let mut items = Vec::new();
+        let mut item_index = HashMap::new();
+        let mut bitmap_ids = HashMap::new();
+        let mut pending = Vec::new();
+        let mut p = VirtualPool {
+            desk: &mut desk,
+            items: &mut items,
+            item_index: &mut item_index,
+            bitmap_ids: &mut bitmap_ids,
+        };
+        assert!(!p.sync(&[bin_snapshot()], &mut pending));
+        assert!(desk.fences.is_empty(), "不得兜底创建栅栏");
+        assert!(desk.icons.is_empty());
+    }
+
+    /// H4 锁：虚拟项 `Icon.path` 恒 None、"假装"的解析名不得被当成管理区路径。
+    #[test]
+    fn virtual_item_path_is_none_and_never_managed() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        let mut items = Vec::new();
+        let mut item_index = HashMap::new();
+        let mut bitmap_ids = HashMap::new();
+        let mut pending = Vec::new();
+        {
+            let mut p = VirtualPool {
+                desk: &mut desk,
+                items: &mut items,
+                item_index: &mut item_index,
+                bitmap_ids: &mut bitmap_ids,
+            };
+            assert!(p.register(0, &bin_snapshot(), &mut pending));
+        }
+        let ic = &desk.icons["shell:回收站-645ff040"];
+        // H4 锁：path 必须显式 None。它同时锁死三件事——
+        // 1. `movable_items`（added && path.is_some()）不会把它当文件搬；
+        // 2. `file_extension("::{…}")` 无从切出假扩展名（根本进不了那个函数）；
+        // 3. `is_managed_path` 恒 false ⇒「删除」只走原生动词，WinBosk 绝不直删。
+        assert!(ic.path.is_none(), "H4：虚拟项 path 必须显式 None");
+        assert!(ic.added, "虚拟项非真实桌面文件");
+        assert_eq!(
+            desk.free_icons.len(),
+            0,
+            "虚拟项不得落在未分组区（无绘制入口）"
+        );
+    }
+
+    /// 回归：虚拟项 id **已被启动时的元数据补齐循环登记过**（`added = false`），
+    /// 此时 register 的 `already` 快路径不得保留那个错误值。
+    ///
+    /// 真机实测（第一轮走查）：回收站在 `enumerate_desktop_items()` 结果里，元数据
+    /// 补齐先把它写成 `added=false`；随后 `sync_virtual_items` 走 `already` 分支、
+    /// 不改 `added` ⇒ desk.json 落盘 `added=false` ⇒ 用户「删除」时走
+    /// `move_icon(id, None)` 把回收站丢进无绘制入口的未分组区，图标凭空消失；
+    /// Shell 菜单还会注入一个空转的「移出栅栏」。
+    #[test]
+    fn register_repairs_added_flag_of_preexisting_virtual_entry() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        // 模拟枚举元数据补齐后的状态：键已存在、added=false、无路径
+        let mut ic = Icon::new(
+            "shell:回收站-645ff040".into(),
+            "回收站".into(),
+            winbosk_core::model::ItemKind::Unknown,
+        );
+        ic.path = None;
+        ic.added = false;
+        desk.icons.insert(ic.id.clone(), ic);
+        // items 池也已有这一项（枚举产物）
+        let mut items: Vec<DesktopItem> =
+            vec![winbosk_shell::virtual_items::virtual_item(&bin_snapshot())];
+        let mut item_index: HashMap<String, usize> = HashMap::new();
+        item_index.insert("shell:回收站-645ff040".into(), 0);
+        let mut bitmap_ids: HashMap<String, u64> = HashMap::new();
+        bitmap_ids.insert("shell:回收站-645ff040".into(), 1);
+
+        let mut pending = Vec::new();
+        let mut p = VirtualPool {
+            desk: &mut desk,
+            items: &mut items,
+            item_index: &mut item_index,
+            bitmap_ids: &mut bitmap_ids,
+        };
+        assert!(p.register(0, &bin_snapshot(), &mut pending));
+        assert!(
+            p.desk.icons["shell:回收站-645ff040"].added,
+            "虚拟项必须被纠正为 added=true，否则删除时会被丢进未分组区"
+        );
+        assert!(p.desk.icons["shell:回收站-645ff040"].path.is_none());
+        // items 池不得膨胀
+        assert_eq!(p.items.len(), 1);
+        assert_eq!(p.bitmap_ids.len(), 1, "不得重复占位图槽");
+    }
+
+    /// 槽号不与既有槽号重合（即使 `items.len()` 更小）。真实危害：用
+    /// `rt.items.len()` 分配时，`remove_icon_entirely` 会把 items 池缩短，
+    /// 之后的新项拿到与旧项相同的槽号 → 覆盖旧项已上传的位图。
+    #[test]
+    fn bitmap_slot_never_collides_with_existing_slot() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        let mut items: Vec<DesktopItem> = Vec::new();
+        let mut item_index: HashMap<String, usize> = HashMap::new();
+        let mut bitmap_ids: HashMap<String, u64> = HashMap::new();
+        // 一个不产生位图的旧项：items.len()==1，但既有槽号是 5
+        let mut old = winbosk_shell::virtual_items::virtual_item(&bin_snapshot());
+        old.id = "shell:无位图".into();
+        item_index.insert(old.id.clone(), items.len());
+        items.push(old);
+        bitmap_ids.insert("shell:别的".into(), 5);
+
+        let mut pending = Vec::new();
+        let mut p = VirtualPool {
+            desk: &mut desk,
+            items: &mut items,
+            item_index: &mut item_index,
+            bitmap_ids: &mut bitmap_ids,
+        };
+        assert!(p.register(0, &bin_snapshot(), &mut pending));
+        assert_eq!(
+            p.bitmap_ids["shell:回收站-645ff040"], 6,
+            "槽号必须避开既有槽号（items.len()=1 会发出冲突的 1）"
+        );
+        // 重复注册幂等：不膨胀 items 池、不重复追加成员
+        assert!(
+            !p.register(0, &bin_snapshot(), &mut pending),
+            "已在栅栏内 → false"
+        );
+        assert_eq!(p.items.len(), 2);
+        assert_eq!(p.desk.fences[0].icon_ids.len(), 1);
+    }
+
+    /// 三块状态各自独立补齐：元数据在、DesktopItem 不在（`validate()` 剔过成员引用后
+    /// 又要求恢复）→ register 必须把 items 池补回来，否则右键/双击都摸不到 PIDL。
+    #[test]
+    fn register_repairs_missing_desktop_item() {
+        if winbosk_shell::com::init().is_err() {
+            eprintln!("COM init failed, skip");
+            return; // 本仓库是 Windows-only，正常不会走到这里
+        }
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        let mut ic = Icon::new(
+            "shell:回收站-645ff040".into(),
+            "回收站".into(),
+            winbosk_core::model::ItemKind::Unknown,
+        );
+        ic.path = None;
+        ic.added = true;
+        desk.icons.insert(ic.id.clone(), ic);
+        // items 池为空（DesktopItem 缺失）
+        let mut items: Vec<DesktopItem> = Vec::new();
+        let mut item_index: HashMap<String, usize> = HashMap::new();
+        let mut bitmap_ids: HashMap<String, u64> = HashMap::new();
+        let mut pending = Vec::new();
+        let mut p = VirtualPool {
+            desk: &mut desk,
+            items: &mut items,
+            item_index: &mut item_index,
+            bitmap_ids: &mut bitmap_ids,
+        };
+        assert!(p.register(0, &bin_snapshot(), &mut pending));
+        assert_eq!(p.items.len(), 1, "DesktopItem 必须被补回池");
+        assert_eq!(p.item_index["shell:回收站-645ff040"], 0);
+        assert_eq!(p.bitmap_ids["shell:回收站-645ff040"], 1, "位图槽应同步补");
+        assert_eq!(pending.len(), 1, "补池的同时必须安排一次位图上传");
+    }
+
+    /// 位图槽缺失但 DesktopItem 在（历史数据里没落 bitmap_ids）→ 也要补，
+    /// 否则渲染层查不到槽，图标位置空白。
+    #[test]
+    fn register_repairs_missing_bitmap_slot() {
+        if winbosk_shell::com::init().is_err() {
+            eprintln!("COM init failed, skip");
+            return; // 本仓库是 Windows-only，正常不会走到这里
+        }
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        let mut ic = Icon::new(
+            "shell:回收站-645ff040".into(),
+            "回收站".into(),
+            winbosk_core::model::ItemKind::Unknown,
+        );
+        ic.path = None;
+        ic.added = true;
+        desk.icons.insert(ic.id.clone(), ic);
+        let mut items: Vec<DesktopItem> =
+            vec![winbosk_shell::virtual_items::virtual_item(&bin_snapshot())];
+        let mut item_index: HashMap<String, usize> = HashMap::new();
+        item_index.insert("shell:回收站-645ff040".into(), 0);
+        let mut bitmap_ids: HashMap<String, u64> = HashMap::new(); // 缺槽
+        let mut pending = Vec::new();
+        let mut p = VirtualPool {
+            desk: &mut desk,
+            items: &mut items,
+            item_index: &mut item_index,
+            bitmap_ids: &mut bitmap_ids,
+        };
+        assert!(p.register(0, &bin_snapshot(), &mut pending));
+        assert_eq!(p.items.len(), 1, "不得重复 push items");
+        assert_eq!(p.bitmap_ids["shell:回收站-645ff040"], 1);
+        assert_eq!(pending.len(), 1, "补槽必须伴随一次位图上传");
+    }
+
+    /// 移除后重建下标：`item_index` 与 `items` 必须保持一致（否则双击打不开/错位）。
+    #[test]
+    fn remove_rebuilds_item_index_consistently() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        let mut items: Vec<DesktopItem> = Vec::new();
+        let mut item_index: HashMap<String, usize> = HashMap::new();
+        let mut bitmap_ids: HashMap<String, u64> = HashMap::new();
+        let mut pending = Vec::new();
+        let mut p = VirtualPool {
+            desk: &mut desk,
+            items: &mut items,
+            item_index: &mut item_index,
+            bitmap_ids: &mut bitmap_ids,
+        };
+        assert!(p.register(0, &bin_snapshot(), &mut pending));
+        p.remove("shell:回收站-645ff040");
+        assert!(p.items.is_empty());
+        assert!(p.item_index.is_empty());
+        assert!(p.bitmap_ids.is_empty());
+        assert!(p.desk.icons.is_empty());
+        assert!(p.desk.fences[0].icon_ids.is_empty());
+    }
+
+    /// 旧口径死元数据 + 新口径并存：同步后旧键从池/items/位图表全清。
+    #[test]
+    fn stale_entry_is_removed_from_all_three_tables() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        put_virtual_icon(&mut desk, "shell:回收站", "回收站", None);
+        desk.fences[0].icon_ids.push("shell:回收站".into());
+        // 先在建池之前把旧条目塞进 items / item_index / bitmap_ids（模拟上次运行的池状态）
+        let mut items: Vec<DesktopItem> = Vec::new();
+        let mut item_index: HashMap<String, usize> = HashMap::new();
+        let mut bitmap_ids: HashMap<String, u64> = HashMap::new();
+        {
+            let mut old = winbosk_shell::virtual_items::virtual_item(&bin_snapshot());
+            old.id = "shell:回收站".into();
+            let idx = items.len();
+            items.push(old);
+            item_index.insert("shell:回收站".into(), idx);
+            bitmap_ids.insert("shell:回收站".into(), 1);
+        }
+        let mut pending = Vec::new();
+        let mut p = VirtualPool {
+            desk: &mut desk,
+            items: &mut items,
+            item_index: &mut item_index,
+            bitmap_ids: &mut bitmap_ids,
+        };
+        assert!(p.sync(&[bin_snapshot()], &mut pending));
+        assert!(!p.desk.icons.contains_key("shell:回收站"));
+        assert!(!p.item_index.contains_key("shell:回收站"));
+        assert!(!p.bitmap_ids.contains_key("shell:回收站"));
+        assert!(!p.items.iter().any(|it| it.id == "shell:回收站"));
+        assert_eq!(
+            p.desk.fences[0].icon_ids,
+            vec!["shell:回收站-645ff040".to_string()]
+        );
+    }
+
+    /// H1 锁（心跳回归）：虚拟项在场不破坏 `mirror_converged` 的早退。
+    /// 虚拟项 `path == None` 被 `mirror_existing_paths` 首句丢弃 ⇒ 不进 `owned` ⇒
+    /// 但 `visible`/`all` 也派生自磁盘，两侧子集断言仍成立 ⇒ 仍收敛。
+    #[test]
+    fn virtual_items_do_not_break_mirror_fast_path() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        let a = r"C:\Users\me\Desktop\a.txt";
+        put_virtual_icon(&mut desk, r"c:\users\me\desktop\a.txt", "a.txt", Some(a));
+        put_virtual_icon(&mut desk, "shell:回收站-645ff040", "回收站", None);
+        desk.fences[0].icon_ids.extend([
+            r"c:\users\me\desktop\a.txt".to_string(),
+            "shell:回收站-645ff040".into(),
+        ]);
+
+        let roots = roots();
+        let owned = mirror_existing_paths(&desk, 0, &roots, true);
+        let visible = vec![PathBuf::from(a)];
+        let all: HashSet<String> = visible
+            .iter()
+            .map(|p| p.to_string_lossy().to_ascii_lowercase())
+            .collect();
+        assert!(
+            mirror_converged(&owned, &all, &visible),
+            "虚拟项在场仍必须收敛，否则 4s 心跳会白跑全量 exists()"
+        );
+    }
+
+    /// 虚拟项与文件项同池：文件被外部删掉 → 文件项被回收，虚拟项保留。
+    #[test]
+    fn file_removal_keeps_virtual_items() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences.push(desktop_fence(1));
+        put_virtual_icon(&mut desk, "shell:回收站-645ff040", "回收站", None);
+        put_virtual_icon(
+            &mut desk,
+            r"c:\users\me\desktop\gone.txt",
+            "gone.txt",
+            Some(r"C:\Users\me\Desktop\gone.txt"),
+        );
+        desk.fences[0].icon_ids.extend([
+            "shell:回收站-645ff040".into(),
+            r"c:\users\me\desktop\gone.txt".into(),
+        ]);
+
+        // 磁盘上 gone.txt 已不存在（不进 all_set）→ mirror_converged 不成立 → 走回收分支
+        let roots = roots();
+        let owned = mirror_existing_paths(&desk, 0, &roots, true);
+        let all: HashSet<String> = HashSet::new();
+        assert!(!mirror_converged(&owned, &all, &[]));
+
+        // 回收分支只按 path 反查并判 exists()：虚拟项 path==None 直接被跳过
+        let ids: Vec<String> = desk.icons.keys().cloned().collect();
+        let mut removed = Vec::new();
+        for id in ids {
+            let Some(p) = desk.icons.get(&id).and_then(|ic| ic.path.clone()) else {
+                continue;
+            };
+            if !Path::new(&p).exists() {
+                removed.push(id);
+            }
+        }
+        assert_eq!(removed, vec![r"c:\users\me\desktop\gone.txt".to_string()]);
+        assert!(desk.icons.contains_key("shell:回收站-645ff040"));
     }
 }

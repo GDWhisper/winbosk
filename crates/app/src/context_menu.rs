@@ -1,6 +1,7 @@
 //! 右键/托盘菜单：菜单构建、动作分发、剪贴板与文件选择。
 
 use crate::*;
+use windows::Win32::UI::Shell::SHCreateItemFromIDList;
 pub(crate) const MENU_ICON_OPEN: usize = 1;
 pub(crate) const MENU_ICON_REMOVE: usize = 2;
 pub(crate) const MENU_PASTE: usize = 2500;
@@ -77,6 +78,15 @@ pub(crate) fn handle_context_menu(
             .and_then(|f| f.icon_ids.get(ii))
             .and_then(|id| rt.desk.icons.get(id))
             .and_then(|ic| ic.path.clone());
+        // 虚拟壳项（回收站等无路径项）：真实 Shell 菜单走 PIDL 构造的 IShellItem，
+        // 不走 `SHCreateItemFromParsingName`——它没有文件系统路径。
+        let virtual_id = rt
+            .desk
+            .fences
+            .get(fence)
+            .and_then(|f| f.icon_ids.get(ii))
+            .cloned()
+            .filter(|id| winbosk_core::shell_items::is_virtual_id(id));
         // 该项是否由 WinBosk 管理（库内项 / 链接镜像项 / 虚拟项，added=true）：
         // 栅栏内容与文件夹同步，「移出栅栏」与「删除」等价（镜像项移出即删文件、
         // 库内项移出即删引用），菜单不再重复提供「移出栅栏」，只留「删除」。
@@ -108,6 +118,47 @@ pub(crate) fn handle_context_menu(
         }
         if !rt.selected.contains(&key) {
             rt.selected = vec![key];
+        }
+        // 虚拟壳项：用 PIDL 构造 IShellItem 弹真实 Shell 菜单（等同桌面右键回收站）。
+        // 菜单注入侧同样标记 `managed`（虚拟项 added=true），不提供「移出栅栏」。
+        if let (Some(vid), Some(&item_idx)) = (
+            virtual_id.as_deref(),
+            rt.desk
+                .fences
+                .get(fence)
+                .and_then(|f| f.icon_ids.get(ii))
+                .and_then(|id| rt.item_index.get(id)),
+        ) {
+            let (pidl, name, parsing) = rt
+                .items
+                .get(item_idx)
+                .map(|it| (it.pidl, it.display_name.clone(), it.parsing_name()))
+                .unwrap_or((std::ptr::null_mut(), vid.to_string(), String::new()));
+            if pidl.is_null() {
+                tracing::warn!(id = %vid, "虚拟壳项 PIDL 缺失，退回简版菜单");
+                if let Some(IconMenuAction::Open) = icon_context_menu(rt, sx, sy, managed) {
+                    launch_fence_icon(rt, fence, ii);
+                }
+                return;
+            }
+            let item: windows::Win32::UI::Shell::IShellItem = match unsafe {
+                SHCreateItemFromIDList::<windows::Win32::UI::Shell::IShellItem>(pidl)
+            } {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::warn!(id = %vid, "虚拟壳项 IShellItem 构造失败: {e}");
+                    if let Some(IconMenuAction::Open) = icon_context_menu(rt, sx, sy, managed) {
+                        launch_fence_icon(rt, fence, ii);
+                    }
+                    return;
+                }
+            };
+            let result = shell_menu::show_item(rt, &item, &parsing, &name, sx, sy, managed);
+            // 虚拟壳项的原生动词（清空回收站 / 属性 / 固定到快速访问…）都在 Shell 内
+            // 完成，本进程没有任何状态要跟：栅栏成员不变、没有死图标要回收、
+            // 「移出栅栏」与「重命名」本就不注入（managed=true）。故只留一行日志。
+            tracing::debug!(id = %vid, ?result, "虚拟壳项 Shell 菜单结束");
+            return;
         }
         // 有文件路径的项走真实 Shell 右键菜单（等同桌面右键）；虚拟项（无路径）
         // 退回简版「打开」菜单。Shell 菜单在主线程模态弹出，与 Windows 右键
