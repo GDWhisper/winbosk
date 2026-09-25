@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>03 · 命令面板 · WinBosk</title>
+<style>
+  :root {
+    --bg: #0a0a0c;
+    --glass: rgba(22,22,26,.88);
+    --line: rgba(255,255,255,.08);
+    --ink: #f5f5f7;
+    --muted: #9a9aa8;
+    --accent: #7c9cff;
+    --desktop-a: #1b2438;
+    --desktop-b: #0f1420;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    min-height: 100vh;
+    color: var(--ink);
+    background:
+      radial-gradient(900px 500px at 70% 20%, rgba(124,156,255,.15), transparent 55%),
+      radial-gradient(700px 400px at 20% 80%, rgba(255,140,120,.08), transparent 50%),
+      linear-gradient(160deg, var(--desktop-a), var(--desktop-b));
+    display: grid;
+    place-items: center;
+    padding: 48px 16px;
+  }
+  .stage {
+    width: min(980px, 100%);
+    position: relative;
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    box-shadow: 0 40px 100px rgba(0,0,0,.55);
+    min-height: 620px;
+    background:
+      radial-gradient(600px 300px at 80% 10%, rgba(90,120,200,.25), transparent 60%),
+      linear-gradient(165deg, #243049 0%, #12182a 50%, #0c1018 100%);
+  }
+  /* faux desktop icons behind */
+  .desk-icons {
+    position: absolute; inset: 0;
+    padding: 28px;
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 20px 12px;
+    align-content: start;
+    opacity: .35;
+    filter: blur(1px);
+    pointer-events: none;
+  }
+  .dicon { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .dicon .sq {
+    width: 48px; height: 48px;
+    border-radius: 12px;
+    background: linear-gradient(145deg, #5b6b8c, #3a4660);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.15);
+  }
+  .dicon span { font-size: 11px; color: #c8d0e0; text-align: center; width: 72px; }
+  .scrim {
+    position: absolute; inset: 0;
+    background: rgba(6,8,14,.55);
+    backdrop-filter: blur(6px);
+  }
+  .palette {
+    position: relative;
+    z-index: 2;
+    width: min(640px, calc(100% - 48px));
+    margin: 72px auto 0;
+    background: var(--glass);
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 14px;
+    backdrop-filter: blur(24px) saturate(1.2);
+    box-shadow:
+      0 0 0 1px rgba(0,0,0,.4),
+      0 24px 80px rgba(0,0,0,.55),
+      inset 0 1px 0 rgba(255,255,255,.08);
+    overflow: hidden;
+  }
+  .input-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 16px 18px;
+    border-bottom: 1px solid var(--line);
+  }
+  .input-row .icon { color: var(--accent); font-size: 18px; }
+  .input-row input {
+    flex: 1;
+    background: transparent;
+    border: 0;
+    outline: 0;
+    color: var(--ink);
+    font: inherit;
+    font-size: 16px;
+    caret-color: var(--accent);
+  }
+  .input-row input::placeholder { color: #6e6e80; }
+  .input-row .esc {
+    font-size: 11px;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 2px 6px;
+    background: rgba(255,255,255,.04);
+  }
+  .results { padding: 8px; max-height: 380px; overflow: auto; }
+  .cat {
+    font-size: 10px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: #6a6a7c;
+    padding: 10px 12px 6px;
+  }
+  .item {
+    display: grid;
+    grid-template-columns: 32px 1fr auto;
+    gap: 12px;
+    align-items: center;
+    padding: 10px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .item .ic {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    background: rgba(255,255,255,.06);
+    border: 1px solid var(--line);
+    display: grid; place-items: center;
+    font-size: 14px;
+    color: var(--accent);
+  }
+  .item .tx strong { display: block; font-size: 14px; font-weight: 550; }
+  .item .tx span { font-size: 12px; color: var(--muted); }
+  .item .hk { font-size: 11px; color: var(--muted); }
+  .item.on, .item:hover {
+    background: rgba(124,156,255,.14);
+    border-color: rgba(124,156,255,.35);
+  }
+  .item.on .ic { background: rgba(124,156,255,.2); }
+  .foot {
+    display: flex; gap: 16px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--line);
+    font-size: 11px;
+    color: var(--muted);
+    background: rgba(0,0,0,.25);
+  }
+  .foot b { color: var(--ink); font-weight: 550; }
+  .hint {
+    position: absolute;
+    bottom: 24px; left: 0; right: 0;
+    text-align: center;
+    font-size: 13px;
+    color: rgba(255,255,255,.45);
+    z-index: 2;
+  }
+  .hint kbd {
+    font-size: 11px;
+    background: rgba(255,255,255,.08);
+    border: 1px solid rgba(255,255,255,.15);
+    border-radius: 4px;
+    padding: 2px 6px;
+    margin: 0 2px;
+  }
+</style>
+</head>
+<body>
+<div class="stage" role="application" aria-label="桌面命令面板 mockup">
+  <div class="desk-icons" aria-hidden="true">
+    <div class="dicon"><div class="sq"></div><span>此电脑</span></div>
+    <div class="dicon"><div class="sq"></div><span>回收站</span></div>
+    <div class="dicon"><div class="sq"></div><span>浏览器</span></div>
+    <div class="dicon"><div class="sq"></div><span>编辑器</span></div>
+    <div class="dicon"><div class="sq"></div><span>终端</span></div>
+    <div class="dicon"><div class="sq"></div><span>笔记</span></div>
+    <div class="dicon"><div class="sq"></div><span>设计稿</span></div>
+    <div class="dicon"><div class="sq"></div><span>截图</span></div>
+    <div class="dicon"><div class="sq"></div><span>VPN</span></div>
+    <div class="dicon"><div class="sq"></div><span>音乐</span></div>
+    <div class="dicon"><div class="sq"></div><span>Steam</span></div>
+    <div class="dicon"><div class="sq"></div><span>文档</span></div>
+  </div>
+  <div class="scrim"></div>
+
+  <div class="palette" role="dialog" aria-label="命令面板">
+    <div class="input-row">
+      <span class="icon" aria-hidden="true">⌕</span>
+      <input type="text" placeholder="输入命令，或搜索栅栏…" value="" aria-label="命令输入" />
+      <span class="esc">Esc</span>
+    </div>
+    <div class="results">
+      <div class="cat">快速动作</div>
+      <div class="item on">
+        <div class="ic">＋</div>
+        <div class="tx"><strong>新建栅栏</strong><span>在光标位置创建空白分组</span></div>
+        <div class="hk">Ctrl N</div>
+      </div>
+      <div class="item">
+        <div class="ic">⇄</div>
+        <div class="tx"><strong>切换桌面</strong><span>栅栏接管 ⇄ 原始桌面</span></div>
+        <div class="hk">Ctrl D</div>
+      </div>
+      <div class="item">
+        <div class="ic">✦</div>
+        <div class="tx"><strong>一键整理</strong><span>把未分组项按现有栅栏归类</span></div>
+        <div class="hk">Ctrl O</div>
+      </div>
+      <div class="cat">栅栏</div>
+      <div class="item">
+        <div class="ic">工</div>
+        <div class="tx"><strong>工具</strong><span>外部文件夹 · D:\Tools · 9 项</span></div>
+        <div class="hk">↵</div>
+      </div>
+      <div class="item">
+        <div class="ic">项</div>
+        <div class="tx"><strong>项目</strong><span>应用内部 · 14 项 · 网格</span></div>
+        <div class="hk">↵</div>
+      </div>
+      <div class="cat">系统</div>
+      <div class="item">
+        <div class="ic">⌘</div>
+        <div class="tx"><strong>打开控制中心</strong><span>Ctrl + Alt + T</span></div>
+        <div class="hk">↵</div>
+      </div>
+      <div class="item">
+        <div class="ic">⏻</div>
+        <div class="tx"><strong>退出并恢复桌面</strong><span>IconGuard 将还原全部原生图标</span></div>
+        <div class="hk">Ctrl ⇧ F10</div>
+      </div>
+    </div>
+    <div class="foot">
+      <span><b>↑↓</b> 导航</span>
+      <span><b>↵</b> 执行</span>
+      <span><b>Tab</b> 循环分区</span>
+      <span style="margin-left:auto">WinBosk Command</span>
+    </div>
+  </div>
+
+  <p class="hint">按 <kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>P</kbd> 在桌面上唤起（概念）</p>
+</div>
+<script>
+  const input = document.querySelector('.input-row input');
+  const items = () => [...document.querySelectorAll('.item')];
+  let idx = 0;
+  function setActive(n) {
+    const list = items();
+    list.forEach(x => x.classList.remove('on'));
+    idx = (n + list.length) % list.length;
+    list[idx].classList.add('on');
+    list[idx].scrollIntoView({ block: 'nearest' });
+  }
+  document.querySelector('.results').addEventListener('click', e => {
+    const it = e.target.closest('.item');
+    if (!it) return;
+    setActive(items().indexOf(it));
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); setActive(idx + 1); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); setActive(idx - 1); }
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') return;
+  });
+  // filter demo on type
+  input.addEventListener('input', () => {
+    const q = input.value.trim().toLowerCase();
+    items().forEach(it => {
+      const t = it.textContent.toLowerCase();
+      it.style.display = !q || t.includes(q) ? '' : 'none';
+    });
+    const vis = items().filter(x => x.style.display !== 'none');
+    items().forEach(x => x.classList.remove('on'));
+    if (vis[0]) { vis[0].classList.add('on'); idx = items().indexOf(vis[0]); }
+  });
+</script>
+</body>
+</html>

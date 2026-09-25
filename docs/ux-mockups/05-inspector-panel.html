@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>05 · 侧栏检查器 · WinBosk</title>
+<style>
+  :root {
+    --bg: #1e1e1e;
+    --chrome: #252526;
+    --panel: #2d2d30;
+    --line: #3e3e42;
+    --ink: #e8e8ea;
+    --muted: #9d9da8;
+    --accent: #3b9eff;
+    --ok: #3fb950;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    background: #121212;
+    color: var(--ink);
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 32px 16px;
+  }
+  .app {
+    width: min(1120px, 100%);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 30px 80px rgba(0,0,0,.5);
+    background: var(--bg);
+  }
+  .titlebar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 14px;
+    background: var(--chrome);
+    border-bottom: 1px solid var(--line);
+    font-size: 13px;
+  }
+  .titlebar .brand { font-weight: 600; }
+  .titlebar .sep { color: var(--muted); }
+  .titlebar .sel-name { color: var(--accent); }
+  .toolbar {
+    display: flex; gap: 6px;
+    padding: 8px 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .tool {
+    font: inherit; font-size: 12px;
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--muted);
+    border-radius: 4px;
+    padding: 5px 10px;
+    cursor: pointer;
+  }
+  .tool:hover { background: #3e3e42; color: var(--ink); }
+  .tool.on {
+    background: rgba(59,158,255,.15);
+    border-color: rgba(59,158,255,.4);
+    color: var(--accent);
+  }
+  .work {
+    display: grid;
+    grid-template-columns: 200px 1fr 280px;
+    min-height: 520px;
+  }
+  .tree {
+    background: var(--chrome);
+    border-right: 1px solid var(--line);
+    padding: 12px 8px;
+    font-size: 13px;
+  }
+  .tree .lbl {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .07em;
+    color: #6e6e78; padding: 8px 8px 6px;
+  }
+  .tree a {
+    display: flex; align-items: center; gap: 8px;
+    color: var(--ink);
+    text-decoration: none;
+    padding: 7px 8px;
+    border-radius: 4px;
+    border-left: 2px solid transparent;
+  }
+  .tree a .sw {
+    width: 10px; height: 10px; border-radius: 3px;
+    background: #555;
+  }
+  .tree a.on {
+    background: rgba(59,158,255,.12);
+    border-left-color: var(--accent);
+  }
+  .tree a:hover:not(.on) { background: #333; }
+  .tree a .cnt { margin-left: auto; font-size: 11px; color: #6e6e78; }
+  .canvas {
+    position: relative;
+    background:
+      linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px) 0 0 / 24px 24px,
+      linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px) 0 0 / 24px 24px,
+      #1a1a1c;
+    padding: 28px;
+    overflow: hidden;
+  }
+  .desk-fake {
+    position: relative;
+    height: 100%;
+    min-height: 420px;
+    border-radius: 8px;
+    background: linear-gradient(150deg, #1c2438, #12161f);
+    border: 1px dashed #3a3a40;
+    overflow: hidden;
+  }
+  .fake-fence {
+    position: absolute;
+    background: rgba(255,255,255,.06);
+    border: 1px solid rgba(255,255,255,.14);
+    border-radius: 12px;
+    padding: 10px;
+  }
+  .fake-fence.sel {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    box-shadow: 0 0 0 4px rgba(59,158,255,.2);
+  }
+  .fake-fence h4 {
+    font-size: 11px;
+    color: rgba(255,255,255,.75);
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+  .icons-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .icons-row i {
+    width: 36px; height: 36px; border-radius: 8px;
+    background: linear-gradient(145deg, #6a7a9a, #3e4a66);
+    display: block;
+  }
+  .ff1 { left: 6%; top: 8%; width: 48%; }
+  .ff2 { right: 6%; top: 14%; width: 36%; }
+  .ff3 { left: 12%; bottom: 12%; width: 55%; }
+  .handle {
+    position: absolute;
+    width: 8px; height: 8px;
+    background: #fff;
+    border: 1.5px solid var(--accent);
+    border-radius: 1px;
+  }
+  .h-tl { left: -4px; top: -4px; }
+  .h-tr { right: -4px; top: -4px; }
+  .h-bl { left: -4px; bottom: -4px; }
+  .h-br { right: -4px; bottom: -4px; }
+  .inspector {
+    background: var(--chrome);
+    border-left: 1px solid var(--line);
+    padding: 14px;
+    font-size: 13px;
+    overflow: auto;
+  }
+  .inspector h3 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--muted);
+    margin: 4px 0 12px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .inspector h3 .badge {
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 10px;
+    color: var(--accent);
+    background: rgba(59,158,255,.12);
+    border: 1px solid rgba(59,158,255,.3);
+    border-radius: 999px;
+    padding: 2px 7px;
+  }
+  .field { margin-bottom: 12px; }
+  .field label {
+    display: block;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 5px;
+  }
+  .field input, .field select {
+    width: 100%;
+    font: inherit;
+    font-size: 13px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 4px;
+    padding: 7px 9px;
+    outline: none;
+  }
+  .field input:focus, .field select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(59,158,255,.25);
+  }
+  .field.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .seg {
+    display: flex;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 2px;
+    gap: 2px;
+  }
+  .seg button {
+    flex: 1;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12px;
+    padding: 6px;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .seg button.on {
+    background: #3e3e42;
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .divider {
+    height: 1px;
+    background: var(--line);
+    margin: 16px 0;
+  }
+  .kv {
+    display: flex; justify-content: space-between;
+    font-size: 12px;
+    padding: 6px 0;
+    color: var(--muted);
+    border-bottom: 1px dashed #333;
+  }
+  .kv b { color: var(--ink); font-weight: 500; font-family: Consolas, monospace; font-size: 12px; }
+  .swatches { display: flex; gap: 6px; }
+  .sw {
+    width: 24px; height: 24px;
+    border-radius: 4px;
+    border: 2px solid transparent;
+    cursor: pointer;
+  }
+  .sw.on { border-color: #fff; }
+  .danger {
+    width: 100%;
+    margin-top: 8px;
+    font: inherit; font-size: 12px;
+    background: transparent;
+    border: 1px solid #a33;
+    color: #f88;
+    border-radius: 4px;
+    padding: 8px;
+    cursor: pointer;
+  }
+  .danger:hover { background: rgba(255,60,60,.1); }
+  .status {
+    display: flex; gap: 16px;
+    padding: 8px 14px;
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .status .ok { color: var(--ok); }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="titlebar">
+    <span class="brand">WinBosk</span>
+    <span class="sep">/</span>
+    <span>控制中心</span>
+    <span class="sep">/</span>
+    <span class="sel-name">工具</span>
+    <span style="margin-left:auto;color:var(--muted)">选中 1 个栅栏 · 编辑模式</span>
+  </div>
+
+  <div class="toolbar">
+    <button class="tool on">选择</button>
+    <button class="tool">新建栅栏</button>
+    <button class="tool">框选图标</button>
+    <button class="tool">对齐</button>
+    <button class="tool">分布</button>
+    <button class="tool" style="margin-left:auto">切换桌面</button>
+    <button class="tool" style="background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600">应用</button>
+  </div>
+
+  <div class="work">
+    <aside class="tree">
+      <div class="lbl">栅栏</div>
+      <a href="#"><span class="sw" style="background:#5b8def"></span>项目<span class="cnt">14</span></a>
+      <a href="#" class="on"><span class="sw" style="background:#3ddc97"></span>工具<span class="cnt">9</span></a>
+      <a href="#"><span class="sw" style="background:#ffb454"></span>文档<span class="cnt">22</span></a>
+      <a href="#"><span class="sw" style="background:#c792ea"></span>游戏<span class="cnt">6</span></a>
+      <div class="lbl">未分组</div>
+      <a href="#"><span class="sw" style="background:#666"></span>自由区<span class="cnt">4</span></a>
+    </aside>
+
+    <div class="canvas">
+      <div class="desk-fake">
+        <div class="fake-fence ff1">
+          <h4>项目</h4>
+          <div class="icons-row"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        </div>
+        <div class="fake-fence ff2 sel">
+          <span class="handle h-tl"></span>
+          <span class="handle h-tr"></span>
+          <span class="handle h-bl"></span>
+          <span class="handle h-br"></span>
+          <h4>工具 · 外部文件夹</h4>
+          <div class="icons-row"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        </div>
+        <div class="fake-fence ff3">
+          <h4>文档</h4>
+          <div class="icons-row"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        </div>
+      </div>
+    </div>
+
+    <aside class="inspector" aria-label="属性检查器">
+      <h3>属性 <span class="badge">实时预览</span></h3>
+
+      <div class="field">
+        <label for="title">标题</label>
+        <input id="title" value="工具" />
+      </div>
+
+      <div class="field">
+        <label>布局</label>
+        <div class="seg">
+          <button class="on">网格</button>
+          <button>列表</button>
+          <button>侧栏</button>
+        </div>
+      </div>
+
+      <div class="field row2">
+        <div>
+          <label for="cols">列数</label>
+          <input id="cols" value="3" />
+        </div>
+        <div>
+          <label for="gap">间距</label>
+          <input id="gap" value="8" />
+        </div>
+      </div>
+
+      <div class="field row2">
+        <div>
+          <label for="x">X</label>
+          <input id="x" value="1042" />
+        </div>
+        <div>
+          <label for="y">Y</label>
+          <input id="y" value="86" />
+        </div>
+      </div>
+
+      <div class="field row2">
+        <div>
+          <label for="w">宽</label>
+          <input id="w" value="320" />
+        </div>
+        <div>
+          <label for="h">高 <span style="opacity:.6">0=自动</span></label>
+          <input id="h" value="0" />
+        </div>
+      </div>
+
+      <div class="field">
+        <label>背景</label>
+        <div class="seg">
+          <button class="on">玻璃</button>
+          <button>描边</button>
+          <button>纯色</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>色调</label>
+        <div class="swatches">
+          <button class="sw" style="background:#5b8def"></button>
+          <button class="sw on" style="background:#3ddc97"></button>
+          <button class="sw" style="background:#ffb454"></button>
+          <button class="sw" style="background:#c792ea"></button>
+          <button class="sw" style="background:#ff7a90"></button>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <h3>文件位置</h3>
+      <div class="field">
+        <label>存储模式</label>
+        <div class="seg">
+          <button>应用内部</button>
+          <button class="on">外部文件夹</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="path">路径（点击可在资源管理器打开）</label>
+        <input id="path" value="D:\Tools" style="color:var(--accent);text-decoration:underline;" />
+      </div>
+      <div class="kv"><span>成员</span><b>9</b></div>
+      <div class="kv"><span>同步</span><b>4s 心跳 · 子集校验</b></div>
+      <div class="kv"><span>删除语义</span><b>真删磁盘文件</b></div>
+
+      <button class="danger">删除栅栏…（可撤销）</button>
+    </aside>
+  </div>
+
+  <div class="status">
+    <span class="ok">● 已持久化 desk.json</span>
+    <span>磁吸 开</span>
+    <span>DPI 150%</span>
+    <span>物理像素坐标</span>
+    <span style="margin-left:auto">1920×1080 · 显示器 1</span>
+  </div>
+</div>
+<script>
+  document.querySelectorAll('.seg').forEach(seg => {
+    seg.addEventListener('click', e => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      seg.querySelectorAll('button').forEach(x => x.classList.remove('on'));
+      b.classList.add('on');
+    });
+  });
+  document.querySelectorAll('.swatches').forEach(box => {
+    box.addEventListener('click', e => {
+      const s = e.target.closest('.sw');
+      if (!s) return;
+      box.querySelectorAll('.sw').forEach(x => x.classList.remove('on'));
+      s.classList.add('on');
+    });
+  });
+  document.querySelectorAll('.tree a').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      document.querySelectorAll('.tree a').forEach(x => x.classList.remove('on'));
+      a.classList.add('on');
+      const name = a.textContent.replace(/\d+$/, '').trim();
+      document.querySelector('.sel-name').textContent = name;
+      const t = document.getElementById('title');
+      if (t) t.value = name;
+    });
+  });
+  document.querySelectorAll('.toolbar .tool').forEach(t => {
+    if (t.textContent === '应用') return;
+    t.addEventListener('click', () => {
+      document.querySelectorAll('.toolbar .tool').forEach(x => {
+        if (x.textContent !== '应用' && x.textContent !== '切换桌面') x.classList.remove('on');
+      });
+      if (!['应用','切换桌面'].includes(t.textContent)) t.classList.add('on');
+    });
+  });
+</script>
+</body>
+</html>

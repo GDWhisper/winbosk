@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>08 · 整理仪表盘 · WinBosk</title>
+<style>
+  :root {
+    --bg: #f7f6f3;
+    --card: #ffffff;
+    --ink: #1c1917;
+    --muted: #78716c;
+    --line: #e7e5e4;
+    --accent: #0f766e;
+    --accent-soft: #ccfbf1;
+    --warn: #b45309;
+    --warn-soft: #fef3c7;
+    --danger: #be123c;
+    --radius: 12px;
+    --shadow: 0 1px 2px rgba(28,25,23,.05), 0 8px 24px rgba(28,25,23,.04);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 32px 16px;
+  }
+  .app {
+    width: min(1100px, 100%);
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    box-shadow: var(--shadow), 0 24px 60px rgba(28,25,23,.06);
+    overflow: hidden;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 22px 28px;
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #fafaf9, #fff);
+  }
+  .logo {
+    width: 40px; height: 40px;
+    border-radius: 10px;
+    background: linear-gradient(145deg, #0f766e, #14b8a6);
+    color: #fff;
+    display: grid; place-items: center;
+    font-weight: 750;
+    font-size: 18px;
+    letter-spacing: -.04em;
+  }
+  header h1 { font-size: 20px; font-weight: 700; letter-spacing: -.02em; }
+  header p { font-size: 13px; color: var(--muted); margin-top: 2px; }
+  .head-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .search {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 9px 12px;
+    min-width: 200px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .search input {
+    border: 0; background: transparent; outline: 0;
+    font: inherit; font-size: 13px; color: var(--ink);
+    width: 100%;
+  }
+  .btn {
+    font: inherit; font-size: 13px; font-weight: 600;
+    border-radius: 8px;
+    padding: 10px 16px;
+    cursor: pointer;
+    border: 1px solid var(--line);
+    background: #fff;
+    color: var(--ink);
+  }
+  .btn.pri {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .btn:hover { filter: brightness(.97); }
+
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+  .metric {
+    background: var(--card);
+    padding: 18px 22px;
+  }
+  .metric .k { font-size: 12px; color: var(--muted); font-weight: 500; }
+  .metric .v {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -.03em;
+    margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .metric .n { font-size: 12px; color: var(--accent); margin-top: 4px; }
+  .metric .n.warn { color: var(--warn); }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 28px;
+    border-bottom: 1px solid var(--line);
+    background: #fafaf9;
+  }
+  .tabs { display: flex; gap: 4px; }
+  .tab {
+    font: inherit; font-size: 13px;
+    border: 0; background: transparent;
+    color: var(--muted);
+    padding: 8px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 500;
+  }
+  .tab.on {
+    background: var(--ink);
+    color: #fff;
+    font-weight: 600;
+  }
+  .tab:hover:not(.on) { background: var(--line); color: var(--ink); }
+  .toolbar .right { margin-left: auto; font-size: 12px; color: var(--muted); }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 1.2fr .8fr;
+    min-height: 380px;
+  }
+  .board {
+    padding: 24px;
+    border-right: 1px solid var(--line);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    align-content: start;
+    background:
+      radial-gradient(circle, #e7e5e4 1px, transparent 1px) 0 0 / 16px 16px;
+  }
+  .tile {
+    background: rgba(255,255,255,.92);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 14px;
+    box-shadow: var(--shadow);
+    cursor: grab;
+    transition: transform .12s, border-color .12s;
+  }
+  .tile:hover { transform: translateY(-2px); border-color: #d6d3d1; }
+  .tile.drag { opacity: .5; border-style: dashed; }
+  .tile .th {
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 10px;
+  }
+  .tile .sw {
+    width: 12px; height: 12px;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+  .tile strong { font-size: 14px; font-weight: 650; }
+  .tile .cnt {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--bg);
+    border-radius: 999px;
+    padding: 2px 8px;
+  }
+  .icons { display: flex; gap: 6px; flex-wrap: wrap; }
+  .icons i {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    background: linear-gradient(145deg, #d6d3d1, #a8a29e);
+    display: block;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.5);
+  }
+  .tile .more {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 8px;
+    display: inline-block;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+    background: none; border: 0; font-family: inherit;
+    padding: 0;
+  }
+  .side {
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    background: #fafaf9;
+  }
+  .side h3 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .sug {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px;
+  }
+  .sug .row {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+  .sug strong { font-size: 14px; font-weight: 650; }
+  .sug p { font-size: 13px; color: var(--muted); line-height: 1.5; margin-bottom: 12px; }
+  .sug .actions { display: flex; gap: 6px; }
+  .sug .actions .btn { padding: 7px 12px; font-size: 12px; font-weight: 600; }
+  .tag {
+    font-size: 11px;
+    font-weight: 650;
+    border-radius: 999px;
+    padding: 3px 8px;
+    white-space: nowrap;
+  }
+  .tag.warn { background: var(--warn-soft); color: var(--warn); }
+  .tag.ok { background: var(--accent-soft); color: var(--accent); }
+  .tag.mut { background: var(--line); color: var(--muted); }
+
+  .inbox {
+    background: #fff;
+    border: 1px dashed #d6d3d1;
+    border-radius: 10px;
+    padding: 14px;
+    flex: 1;
+    min-height: 120px;
+  }
+  .inbox .drop {
+    border: 1.5px dashed transparent;
+    border-radius: 8px;
+    min-height: 72px;
+    display: grid;
+    place-items: center;
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 10px;
+    transition: border-color .12s, background .12s;
+  }
+  .inbox .drop.over {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .freepool { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .chip {
+    display: flex; align-items: center; gap: 6px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 12px;
+    cursor: grab;
+    user-select: none;
+  }
+  .chip:active { cursor: grabbing; }
+  .chip .sw { width: 10px; height: 10px; border-radius: 3px; background: #a8a29e; }
+  .chip.ghost { opacity: .35; }
+
+  footer {
+    display: flex;
+    gap: 16px;
+    padding: 14px 28px;
+    border-top: 1px solid var(--line);
+    font-size: 12px;
+    color: var(--muted);
+    background: #fafaf9;
+  }
+  footer b { color: var(--ink); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="logo">W</div>
+    <div>
+      <h1>整理仪表盘</h1>
+      <p>看全局分组 · 处理未分组项 · 批量调整布局</p>
+    </div>
+    <div class="head-actions">
+      <div class="search">
+        <span>⌕</span>
+        <input type="search" placeholder="搜索栅栏 / 图标…" aria-label="搜索" />
+      </div>
+      <button class="btn">切换桌面</button>
+      <button class="btn pri">新建栅栏</button>
+    </div>
+  </header>
+
+  <div class="metrics">
+    <div class="metric">
+      <div class="k">栅栏</div>
+      <div class="v">12</div>
+      <div class="n">+2 本周</div>
+    </div>
+    <div class="metric">
+      <div class="k">已收纳</div>
+      <div class="v">86%</div>
+      <div class="n">104 / 121 项</div>
+    </div>
+    <div class="metric">
+      <div class="k">未分组</div>
+      <div class="v">17</div>
+      <div class="n warn">建议整理</div>
+    </div>
+    <div class="metric">
+      <div class="k">外部链接</div>
+      <div class="v">4</div>
+      <div class="n">双向镜像中</div>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab">画板</button>
+      <button class="tab" role="tab">列表</button>
+      <button class="tab" role="tab">存储</button>
+    </div>
+    <span class="right">拖动色块可尝试投递到右侧收件区（演示）</span>
+  </div>
+
+  <div class="layout">
+    <div class="board" id="board">
+      <article class="tile" draggable="true" data-name="项目">
+        <div class="th"><span class="sw" style="background:#0f766e"></span><strong>项目</strong><span class="cnt">14</span></div>
+        <div class="icons"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <button class="more">查看全部</button>
+      </article>
+      <article class="tile" draggable="true" data-name="工具">
+        <div class="th"><span class="sw" style="background:#2563eb"></span><strong>工具</strong><span class="cnt">外部 9</span></div>
+        <div class="icons"><i></i><i></i><i></i><i></i><i></i></div>
+        <button class="more">D:\Tools</button>
+      </article>
+      <article class="tile" draggable="true" data-name="文档">
+        <div class="th"><span class="sw" style="background:#b45309"></span><strong>文档</strong><span class="cnt">22</span></div>
+        <div class="icons"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <button class="more">查看全部</button>
+      </article>
+      <article class="tile" draggable="true" data-name="游戏">
+        <div class="th"><span class="sw" style="background:#7c3aed"></span><strong>游戏</strong><span class="cnt">6</span></div>
+        <div class="icons"><i></i><i></i><i></i><i></i></div>
+        <button class="more">侧边栏</button>
+      </article>
+      <article class="tile" draggable="true" data-name="桌面镜像">
+        <div class="th"><span class="sw" style="background:#be185d"></span><strong>桌面镜像</strong><span class="cnt">公共 3</span></div>
+        <div class="icons"><i></i><i></i><i></i></div>
+        <button class="more">Public Desktop</button>
+      </article>
+      <article class="tile" draggable="true" data-name="截图">
+        <div class="th"><span class="sw" style="background:#0891b2"></span><strong>截图</strong><span class="cnt">5</span></div>
+        <div class="icons"><i></i><i></i><i></i><i></i></div>
+        <button class="more">查看全部</button>
+      </article>
+    </div>
+
+    <aside class="side">
+      <h3>智能建议</h3>
+      <div class="sug">
+        <div class="row">
+          <strong>17 个未分组项</strong>
+          <span class="tag warn">待处理</span>
+        </div>
+        <p>其中 9 个可按类型归入现有栅栏；其余建议新建「下载 / 临时」组。</p>
+        <div class="actions">
+          <button class="btn pri" id="autoBtn">一键整理</button>
+          <button class="btn">逐个查看</button>
+        </div>
+      </div>
+      <div class="sug">
+        <div class="row">
+          <strong>外部文件夹心跳正常</strong>
+          <span class="tag ok">4s</span>
+        </div>
+        <p>工具 / 文档 / 归档 / 设计 四个链接栅栏双向同步，子集校验通过。</p>
+        <div class="actions">
+          <button class="btn">打开路径</button>
+        </div>
+      </div>
+
+      <h3 style="margin-top:4px">未分组收件区</h3>
+      <div class="inbox" id="inbox">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-size:13px;font-weight:600">自由区 · 17</span>
+          <span class="tag mut">可拖入栅栏</span>
+        </div>
+        <div class="freepool" id="pool">
+          <div class="chip" draggable="true"><span class="sw"></span>便签</div>
+          <div class="chip" draggable="true"><span class="sw"></span>截图.png</div>
+          <div class="chip" draggable="true"><span class="sw"></span>VPN</div>
+          <div class="chip" draggable="true"><span class="sw"></span>音乐</div>
+          <div class="chip" draggable="true"><span class="sw"></span>新快捷方式</div>
+          <div class="chip" draggable="true"><span class="sw"></span>temp.zip</div>
+        </div>
+        <div class="drop" id="drop">将色块拖到某个栅栏卡片上（或松手到此处取消）</div>
+      </div>
+    </aside>
+  </div>
+
+  <footer>
+    <span>布局 <b>网格优先</b></span>
+    <span>磁吸 <b>开</b></span>
+    <span>接管 <b>IconGuard 守卫中</b></span>
+    <span style="margin-left:auto">数据目录 <b>&lt;exe_parent&gt;/data</b></span>
+  </footer>
+</div>
+<script>
+  // tabs
+  document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(x => x.classList.remove('on'));
+      t.classList.add('on');
+    });
+  });
+
+  // drag chips → tiles
+  let dragged = null;
+  document.querySelectorAll('.chip').forEach(chip => {
+    chip.addEventListener('dragstart', e => {
+      dragged = chip;
+      chip.classList.add('ghost');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', chip.textContent);
+    });
+    chip.addEventListener('dragend', () => {
+      chip.classList.remove('ghost');
+      dragged = null;
+    });
+  });
+
+  document.querySelectorAll('.tile').forEach(tile => {
+    tile.addEventListener('dragover', e => {
+      e.preventDefault();
+      tile.style.borderColor = '#0f766e';
+      tile.style.background = '#f0fdfa';
+    });
+    tile.addEventListener('dragleave', () => {
+      tile.style.borderColor = '';
+      tile.style.background = '';
+    });
+    tile.addEventListener('drop', e => {
+      e.preventDefault();
+      tile.style.borderColor = '';
+      tile.style.background = '';
+      if (!dragged) return;
+      const name = tile.dataset.name;
+      const icons = tile.querySelector('.icons');
+      const i = document.createElement('i');
+      icons.appendChild(i);
+      const cnt = tile.querySelector('.cnt');
+      const n = parseInt(cnt.textContent, 10);
+      if (!isNaN(n)) cnt.textContent = String(n + 1);
+      dragged.remove();
+      const free = document.querySelector('.inbox .tag.mut');
+      // update free count roughly
+      const poolCount = document.querySelectorAll('#pool .chip').length;
+      document.querySelector('.inbox span').textContent = `自由区 · ${poolCount + 11}`;
+    });
+  });
+
+  const drop = document.getElementById('drop');
+  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault();
+    drop.classList.remove('over');
+  });
+
+  document.getElementById('autoBtn').addEventListener('click', function() {
+    this.textContent = '整理中…';
+    this.disabled = true;
+    setTimeout(() => {
+      document.querySelectorAll('.tile .icons').forEach(icons => {
+        const i = document.createElement('i');
+        icons.appendChild(i);
+      });
+      document.querySelectorAll('#pool .chip').forEach(c => c.remove());
+      document.querySelector('.inbox span').textContent = '自由区 · 0';
+      document.querySelectorAll('.metric .v')[2].textContent = '0';
+      this.textContent = '已整理 ✓';
+      const sug = this.closest('.sug');
+      sug.querySelector('strong').textContent = '桌面已整洁';
+      sug.querySelector('p').textContent = '全部项已归组。可继续拖拽微调，或打开控制中心改外观。';
+      sug.querySelector('.tag').textContent = '完成';
+      sug.querySelector('.tag').className = 'tag ok';
+    }, 600);
+  });
+</script>
+</body>
+</html>

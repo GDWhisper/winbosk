@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>06 · 首次运行引导 · WinBosk</title>
+<style>
+  :root {
+    --bg: #0c1220;
+    --card: #121a2c;
+    --line: rgba(255,255,255,.08);
+    --ink: #eef2ff;
+    --muted: #8b95b0;
+    --accent: #6ea8fe;
+    --accent-2: #8b7cf6;
+    --ok: #3ddc97;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    background:
+      radial-gradient(1000px 600px at 50% -20%, rgba(110,168,254,.2), transparent 55%),
+      radial-gradient(700px 400px at 90% 100%, rgba(139,124,246,.12), transparent 50%),
+      var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 40px 16px;
+  }
+  .wizard {
+    width: min(720px, 100%);
+    background: rgba(18,26,44,.92);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    backdrop-filter: blur(20px);
+    box-shadow: 0 30px 80px rgba(0,0,0,.5);
+    overflow: hidden;
+  }
+  .steps {
+    display: flex;
+    gap: 0;
+    padding: 20px 28px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .step {
+    flex: 1;
+    text-align: center;
+    padding-bottom: 14px;
+    position: relative;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .step::after {
+    content: "";
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 2px;
+    background: transparent;
+  }
+  .step.done { color: var(--ink); }
+  .step.done::after { background: rgba(110,168,254,.35); }
+  .step.on {
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .step.on::after { background: var(--accent); }
+  .step .n {
+    display: inline-grid;
+    place-items: center;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    border: 1.5px solid var(--line);
+    font-size: 11px;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .step.on .n {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #0c1220;
+    font-weight: 700;
+  }
+  .step.done .n {
+    background: rgba(61,220,151,.15);
+    border-color: var(--ok);
+    color: var(--ok);
+  }
+  .panel { padding: 36px 36px 28px; min-height: 360px; display: none; }
+  .panel.on { display: block; animation: fade .25s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .eyebrow {
+    font-size: 12px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 10px;
+    font-weight: 600;
+  }
+  h1 {
+    font-size: 32px;
+    font-weight: 700;
+    letter-spacing: -.03em;
+    line-height: 1.15;
+    margin-bottom: 12px;
+  }
+  .lead {
+    color: var(--muted);
+    font-size: 15px;
+    line-height: 1.6;
+    max-width: 48ch;
+    margin-bottom: 28px;
+  }
+  .choices { display: grid; gap: 10px; }
+  .choice {
+    display: grid;
+    grid-template-columns: 44px 1fr auto;
+    gap: 14px;
+    align-items: center;
+    padding: 16px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: rgba(255,255,255,.03);
+    cursor: pointer;
+    text-align: left;
+    color: inherit;
+    font: inherit;
+    transition: border-color .12s, background .12s, transform .12s;
+  }
+  .choice:hover { border-color: rgba(110,168,254,.4); transform: translateY(-1px); }
+  .choice.on {
+    border-color: var(--accent);
+    background: rgba(110,168,254,.1);
+    box-shadow: 0 0 0 3px rgba(110,168,254,.15);
+  }
+  .choice .ic {
+    width: 44px; height: 44px;
+    border-radius: 10px;
+    background: rgba(255,255,255,.06);
+    border: 1px solid var(--line);
+    display: grid; place-items: center;
+    font-size: 18px;
+    color: var(--accent);
+  }
+  .choice strong { display: block; font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .choice span { font-size: 13px; color: var(--muted); line-height: 1.45; }
+  .choice .tag {
+    font-size: 11px;
+    color: var(--ok);
+    background: rgba(61,220,151,.1);
+    border: 1px solid rgba(61,220,151,.3);
+    border-radius: 999px;
+    padding: 4px 8px;
+  }
+  .perm {
+    display: flex; gap: 12px;
+    padding: 16px;
+    border-radius: 12px;
+    background: rgba(255,180,84,.08);
+    border: 1px solid rgba(255,180,84,.25);
+    margin-bottom: 12px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #f0d9a8;
+  }
+  .perm .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #ffb454;
+    margin-top: 6px;
+    flex-shrink: 0;
+  }
+  .okbox {
+    display: flex; gap: 12px;
+    padding: 16px;
+    border-radius: 12px;
+    background: rgba(61,220,151,.08);
+    border: 1px solid rgba(61,220,151,.25);
+    font-size: 13px;
+    line-height: 1.55;
+    color: #b8f0d4;
+    margin-bottom: 16px;
+  }
+  .hotkeys {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .hk {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 14px;
+    background: rgba(255,255,255,.04);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .hk kbd {
+    font-size: 12px;
+    background: #1a2238;
+    border: 1px solid #2a3550;
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    padding: 3px 8px;
+    color: var(--ink);
+    font-family: inherit;
+  }
+  .footer {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 18px 36px 28px;
+    border-top: 1px solid var(--line);
+    margin-top: 8px;
+  }
+  .footer .skip {
+    font-size: 13px;
+    color: var(--muted);
+    background: none;
+    border: 0;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .footer .skip:hover { color: var(--ink); }
+  .footer .spacer { flex: 1; }
+  .btn {
+    font: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    border-radius: 9px;
+    padding: 11px 22px;
+    cursor: pointer;
+    border: 1px solid var(--line);
+    background: rgba(255,255,255,.05);
+    color: var(--ink);
+  }
+  .btn:hover { background: rgba(255,255,255,.09); }
+  .btn.pri {
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    border: 0;
+    color: #0c1220;
+    box-shadow: 0 8px 24px rgba(110,168,254,.3);
+  }
+  .btn.pri:hover { filter: brightness(1.06); }
+  .progress-txt { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wizard" role="dialog" aria-label="首次运行引导">
+  <div class="steps" aria-hidden="true">
+    <div class="step on" data-step="0"><span class="n">1</span>接管方式</div>
+    <div class="step" data-step="1"><span class="n">2</span>安全说明</div>
+    <div class="step" data-step="2"><span class="n">3</span>快捷键</div>
+    <div class="step" data-step="3"><span class="n">4</span>完成</div>
+  </div>
+
+  <!-- Step 1 -->
+  <div class="panel on" data-panel="0">
+    <div class="eyebrow">欢迎使用 WinBosk</div>
+    <h1>你的桌面，<br />按你的习惯分组。</h1>
+    <p class="lead">选择如何整理现有图标。随时可在控制中心调整——所有操作可逆，退出即还原。</p>
+    <div class="choices" role="radiogroup">
+      <button class="choice on" role="radio" aria-checked="true">
+        <div class="ic">✦</div>
+        <div>
+          <strong>一键智能归组（推荐）</strong>
+          <span>按扩展名与 Shell 类型把现有桌面项放入「应用 / 文档 / 文件夹」等栅栏，你可再拖拽微调。</span>
+        </div>
+        <span class="tag">约 1 秒</span>
+      </button>
+      <button class="choice" role="radio" aria-checked="false">
+        <div class="ic">□</div>
+        <div>
+          <strong>保持原样，手动建栅栏</strong>
+          <span>图标仍留在自由区，你自己画框、拖入。最大自由度。</span>
+        </div>
+        <span class="tag" style="color:var(--muted);border-color:var(--line);background:rgba(255,255,255,.04)">可稍后</span>
+      </button>
+      <button class="choice" role="radio" aria-checked="false">
+        <div class="ic">⧉</div>
+        <div>
+          <strong>从桌面镜像开始</strong>
+          <span>创建一个与真实桌面目录双向同步的栅栏，适合已有文件夹结构的用户。</span>
+        </div>
+        <span class="tag" style="color:var(--accent);border-color:rgba(110,168,254,.35);background:rgba(110,168,254,.1)">Folder Portal</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- Step 2 -->
+  <div class="panel" data-panel="1">
+    <div class="eyebrow">安全与共存</div>
+    <h1>只隐藏，不销毁。</h1>
+    <p class="lead">接管的边界写死在架构里——理解这三点，就可以放心用。</p>
+    <div class="perm"><span class="dot"></span><div><b>仅隐藏 SysListView32</b><br />不销毁、不重挂 WorkerW / Progman，Wallpaper Engine 等动态壁纸正常工作。</div></div>
+    <div class="perm"><span class="dot"></span><div><b>IconGuard RAII 守卫</b><br />任何退出路径（含崩溃）都会恢复原生图标；重启程序可自愈上次异常退出。</div></div>
+    <div class="perm"><span class="dot"></span><div><b>空闲几乎不占 CPU</b><br />背景模糊走 DWM GPU；动画结束立即停钟；主线程唯一周期唤醒是 4 秒库同步心跳。</div></div>
+    <div class="okbox">
+      <div>✓</div>
+      <div>请使用 <b>Ctrl + Shift + F10</b> 或托盘退出，不要用任务管理器强杀——正常退出才能当次还原图标。</div>
+    </div>
+  </div>
+
+  <!-- Step 3 -->
+  <div class="panel" data-panel="2">
+    <div class="eyebrow">肌肉记忆</div>
+    <h1>三个键，覆盖日常。</h1>
+    <p class="lead">其余快捷键可随时在控制中心「快捷键」页查看与自定义（概念）。</p>
+    <div class="hotkeys">
+      <div class="hk"><span>开关控制中心</span><kbd>Ctrl Alt T</kbd></div>
+      <div class="hk"><span>退出并恢复桌面</span><kbd>Ctrl Shift F10</kbd></div>
+      <div class="hk"><span>命令面板（概念）</span><kbd>Ctrl Alt P</kbd></div>
+      <div class="hk"><span>多选图标</span><kbd>Ctrl + 点击</kbd></div>
+      <div class="hk"><span>框选</span><kbd>空白拖拽</kbd></div>
+      <div class="hk"><span>就地重命名</span><kbd>F2</kbd></div>
+    </div>
+  </div>
+
+  <!-- Step 4 -->
+  <div class="panel" data-panel="3">
+    <div class="eyebrow">就绪</div>
+    <h1>开始整理。</h1>
+    <p class="lead">完成后你会看到：桌面图标已收纳，托盘出现 WinBosk，控制中心随时用 Ctrl + Alt + T 呼出。</p>
+    <div class="okbox">
+      <div>✓</div>
+      <div>
+        <b>将执行</b><br />
+        · 接管桌面（隐藏原生图标视图）<br />
+        · 按所选策略创建初始栅栏<br />
+        · 注册托盘与全局热键<br />
+        · 写入 <code>&lt;exe_parent&gt;/data</code>（非 %APPDATA%）
+      </div>
+    </div>
+    <div class="perm" style="background:rgba(110,168,254,.08);border-color:rgba(110,168,254,.25);color:#c5dbff">
+      <span class="dot" style="background:var(--accent)"></span>
+      <div>随时可「切换桌面」对比整理前后，或一键还原为原始桌面。</div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <span class="progress-txt" id="ptxt">步骤 1 / 4</span>
+    <button class="skip" id="skipBtn">跳过引导</button>
+    <div class="spacer"></div>
+    <button class="btn" id="prevBtn" disabled style="opacity:.4">上一步</button>
+    <button class="btn pri" id="nextBtn">下一步</button>
+  </div>
+</div>
+<script>
+  let cur = 0;
+  const total = 4;
+  const panels = document.querySelectorAll('.panel');
+  const steps = document.querySelectorAll('.step');
+  const nextBtn = document.getElementById('nextBtn');
+  const prevBtn = document.getElementById('prevBtn');
+  const ptxt = document.getElementById('ptxt');
+
+  function render() {
+    panels.forEach((p, i) => p.classList.toggle('on', i === cur));
+    steps.forEach((s, i) => {
+      s.classList.toggle('on', i === cur);
+      s.classList.toggle('done', i < cur);
+    });
+    ptxt.textContent = `步骤 ${cur + 1} / ${total}`;
+    prevBtn.disabled = cur === 0;
+    prevBtn.style.opacity = cur === 0 ? '.4' : '1';
+    nextBtn.textContent = cur === total - 1 ? '开始使用 WinBosk' : '下一步';
+  }
+
+  nextBtn.addEventListener('click', () => {
+    if (cur < total - 1) { cur++; render(); }
+    else { nextBtn.textContent = '已启动 ✓'; nextBtn.disabled = true; }
+  });
+  prevBtn.addEventListener('click', () => { if (cur > 0) { cur--; render(); } });
+  document.getElementById('skipBtn').addEventListener('click', () => {
+    cur = total - 1; render();
+  });
+
+  document.querySelectorAll('.choice').forEach(c => {
+    c.addEventListener('click', () => {
+      document.querySelectorAll('.choice').forEach(x => {
+        x.classList.remove('on');
+        x.setAttribute('aria-checked', 'false');
+      });
+      c.classList.add('on');
+      c.setAttribute('aria-checked', 'true');
+    });
+  });
+
+  render();
+</script>
+</body>
+</html>

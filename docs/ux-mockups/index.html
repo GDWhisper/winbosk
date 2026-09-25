@@ -1,0 +1,175 @@
+<!-- AI生成 -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WinBosk UX Mockups · 索引</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #171a21;
+    --line: rgba(255,255,255,.08);
+    --ink: #eef0f4;
+    --muted: #8b93a7;
+    --accent: #6ea8fe;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    background:
+      radial-gradient(900px 500px at 20% -10%, rgba(110,168,254,.12), transparent 55%),
+      var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+    padding: 48px 20px 64px;
+  }
+  .wrap { width: min(960px, 100%); margin: 0 auto; }
+  .eyebrow {
+    font-size: 12px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 650;
+    margin-bottom: 10px;
+  }
+  h1 {
+    font-size: clamp(28px, 4vw, 40px);
+    font-weight: 750;
+    letter-spacing: -.03em;
+    line-height: 1.15;
+    margin-bottom: 12px;
+  }
+  .lead {
+    color: var(--muted);
+    font-size: 15px;
+    line-height: 1.65;
+    max-width: 60ch;
+    margin-bottom: 36px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  a.card {
+    display: block;
+    text-decoration: none;
+    color: inherit;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 20px;
+    transition: border-color .15s, transform .15s, box-shadow .15s;
+  }
+  a.card:hover {
+    border-color: rgba(110,168,254,.45);
+    transform: translateY(-3px);
+    box-shadow: 0 16px 40px rgba(0,0,0,.35);
+  }
+  .num {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: .06em;
+    margin-bottom: 8px;
+  }
+  h2 { font-size: 17px; font-weight: 650; letter-spacing: -.02em; margin-bottom: 8px; }
+  p { font-size: 13px; color: var(--muted); line-height: 1.55; margin-bottom: 14px; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag {
+    font-size: 11px;
+    color: var(--muted);
+    background: rgba(255,255,255,.04);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 3px 9px;
+  }
+  .note {
+    margin-top: 36px;
+    padding: 18px 20px;
+    border: 1px dashed var(--line);
+    border-radius: 12px;
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+  .note b { color: var(--ink); font-weight: 600; }
+</style>
+</head>
+<body>
+<p data-aigc-mark="1" style="margin:0 0 8px;font-size:10px;line-height:1.3;color:#6b6560;font-weight:400;">AI生成</p>
+
+<div class="wrap">
+  <div class="eyebrow">docs / ux-mockups</div>
+  <h1>WinBosk UX Mockups</h1>
+  <p class="lead">
+    按行业常见范式产出的 8 个独立 mockup，覆盖控制中心、桌面 overlay、命令面板、引导、HUD 与整理仪表盘。
+    每个文件自包含（单 HTML，无外部依赖），可直接在浏览器打开对比结构与视觉方向。
+  </p>
+
+  <div class="grid">
+    <a class="card" href="./01-fluent-settings.html">
+      <div class="num">01</div>
+      <h2>Fluent 设置风格</h2>
+      <p>Windows 11 原生设置范式：左侧分区 + 卡片行 + 开关/分段控件。最「系统原生」、最低学习成本。</p>
+      <div class="tags"><span class="tag">控制中心</span><span class="tag">Light</span><span class="tag">Settings</span></div>
+    </a>
+
+    <a class="card" href="./02-linear-dark.html">
+      <div class="num">02</div>
+      <h2>Linear 深色极简</h2>
+      <p>键盘优先的工单式列表：面包屑、计数徽标、属性行。强调密度与快捷操作，适合高频用户。</p>
+      <div class="tags"><span class="tag">控制中心</span><span class="tag">Dark</span><span class="tag">Keyboard-first</span></div>
+    </a>
+
+    <a class="card" href="./03-command-palette.html">
+      <div class="num">03</div>
+      <h2>命令面板 / Palette</h2>
+      <p>Raycast / Spotlight 式全局动作入口，浮在桌面之上。把「新建、整理、退出」收敛为一次键入。</p>
+      <div class="tags"><span class="tag">桌面唤起</span><span class="tag">Overlay</span><span class="tag">Power user</span></div>
+    </a>
+
+    <a class="card" href="./04-desktop-overlay.html">
+      <div class="num">04</div>
+      <h2>桌面栅栏 Overlay</h2>
+      <p>产品主场景：多栅栏玻璃卡片 + 折叠侧栏 + 自由区，展示磁吸、悬停与穿透的视觉目标。</p>
+      <div class="tags"><span class="tag">主界面</span><span class="tag">Glass</span><span class="tag">场景图</span></div>
+    </a>
+
+    <a class="card" href="./05-inspector-panel.html">
+      <div class="num">05</div>
+      <h2>侧栏检查器</h2>
+      <p>Figma / IDE 式三栏：图层树 + 画布选中 + 属性检查器。把布局、存储模式、路径做成可编辑表单。</p>
+      <div class="tags"><span class="tag">编辑模式</span><span class="tag">Inspector</span><span class="tag">Pro</span></div>
+    </a>
+
+    <a class="card" href="./06-onboarding.html">
+      <div class="num">06</div>
+      <h2>首次运行引导</h2>
+      <p>四步向导：接管策略 → 安全边界 → 快捷键 → 就绪。把 IconGuard / 单实例等硬约束翻译成用户语言。</p>
+      <div class="tags"><span class="tag">Onboarding</span><span class="tag">Wizard</span><span class="tag">Trust</span></div>
+    </a>
+
+    <a class="card" href="./07-compact-hud.html">
+      <div class="num">07</div>
+      <h2>紧凑浮动 HUD</h2>
+      <p>底部胶囊工具条：面板 / 整理 / 折叠 / 桌面一排触达，展开二级菜单。始终可见但不占版面。</p>
+      <div class="tags"><span class="tag">HUD</span><span class="tag">浮层</span><span class="tag">Minimal</span></div>
+    </a>
+
+    <a class="card" href="./08-organize-dashboard.html">
+      <div class="num">08</div>
+      <h2>整理仪表盘</h2>
+      <p>指标 + 看板 + 未分组收件区：处理「17 个自由项」的专项工作流，支持拖放归组与一键整理。</p>
+      <div class="tags"><span class="tag">Dashboard</span><span class="tag">Workflow</span><span class="tag">Drag & drop</span></div>
+    </a>
+  </div>
+
+  <div class="note">
+    <b>说明</b>：mockup 为 UX 方向探索，不直接对应当前 D2D 实现细节；交互演示（分段控件、向导步进、拖放等）仅用于表达信息架构与状态变化。
+    若选定方向，再按 <code>docs/engineering-plan-guidelines.md</code> 拆到 core / render / app 各层落地。
+  </div>
+</div>
+</body>
+</html>
