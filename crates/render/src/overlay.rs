@@ -59,14 +59,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWLP_USERDATA, GW_HWNDPREV, HCURSOR, HICON, HTCLIENT, HTTRANSPARENT, HWND_TOP, ICON_BIG,
     ICON_SMALL, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG,
     MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, PM_REMOVE, QS_ALLINPUT, SET_WINDOW_POS_FLAGS,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNA,
-    SW_SHOWNOACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_CTLCOLOREDIT, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
-    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_SYSKEYDOWN, WM_TIMER,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
+    SM_CXDOUBLECLK, SM_CXVIRTUALSCREEN, SM_CYDOUBLECLK, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOSIZE,
+    SWP_NOZORDER, SW_SHOWNA, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
+    WM_CTLCOLOREDIT, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCHITTEST, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON,
+    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use winbosk_core::hotkey::HotkeyAction;
@@ -145,6 +146,56 @@ pub const CORNER_RESIZE: f32 = 12.0;
 pub const CLICK_DRAG_THRESHOLD: f32 = 5.0;
 /// 侧边栏图标拖动排序的启动阈值（像素）：按下后移动超过此距离才进入 reorder 模式。
 const REORDER_THRESHOLD: f32 = 8.0;
+
+/// 图标/标题按下的「单击 vs 拖动」判定阈值（物理 px）。
+///
+/// 取 `max(CLICK_DRAG_THRESHOLD, 系统双击判定矩形)`：Windows 把「两次按下相距
+/// `SM_CXDOUBLECLK/SM_CYDOUBLECLK` 以内」的连击派发成 `WM_LBUTTONDBLCLK`，该容差
+/// 可在辅助功能里调大（默认 4px）。**阈值必须 ≥ 系统容差**，否则「系统认定的
+/// 双击」会先被当成拖动把栅栏移走——第二次按下的图标命中测试必然落空，双击
+/// 永远打不开文件；同时每次这类点击的位移都会永久累积（间隙推离朝远离邻居的
+/// 方向推 + 夹屏停在屏幕边缘），栅栏会被反复测试的点击一步步「走」到角落。
+/// 三处判定（抖动抑制、reorder 启动、松开分类）必须共用本函数，口径一致。
+fn drag_threshold_px() -> f32 {
+    let sys = unsafe {
+        let cx = GetSystemMetrics(SM_CXDOUBLECLK);
+        let cy = GetSystemMetrics(SM_CYDOUBLECLK);
+        cx.max(cy).max(1)
+    } as f32;
+    CLICK_DRAG_THRESHOLD.max(sys)
+}
+
+/// 系统双击时限（毫秒）与双击判定矩形（物理 px）。
+///
+/// 判定矩形取 `max(1)`：辅助功能/注册表可把它调成 0，此时系统把任何两次按下都当
+/// 连击；退避到 1px 与 [`drag_threshold_px`] 的 `max(1)` 口径一致，避免零容差把
+/// 正常单击也算成双击。
+fn system_double_click() -> (u64, f32, f32) {
+    let limit = unsafe { GetDoubleClickTime() } as u64;
+    let (cx, cy) = unsafe {
+        (
+            GetSystemMetrics(SM_CXDOUBLECLK).max(1) as f32,
+            GetSystemMetrics(SM_CYDOUBLECLK).max(1) as f32,
+        )
+    };
+    (limit, cx, cy)
+}
+
+/// 第二次按下是否构成双击（纯函数，便于单测）。
+///
+/// 口径与系统一致：间隔严格小于系统双击时限，且横/纵位移都不超过双击判定矩形。
+fn within_double_click(
+    prev_ms: u64,
+    now_ms: u64,
+    prev: (f32, f32),
+    now: (f32, f32),
+    limit_ms: u64,
+    clk: (f32, f32),
+) -> bool {
+    now_ms.saturating_sub(prev_ms) < limit_ms
+        && (now.0 - prev.0).abs() <= clk.0
+        && (now.1 - prev.1).abs() <= clk.1
+}
 
 /// 类只注册一次（同一 HINSTANCE）。
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -448,6 +499,30 @@ pub enum OverlayEvent {
     },
 }
 
+/// 上一次「按下图标」的记录：系统 `WM_LBUTTONDBLCLK` 缺席时用来自行判定双击。
+///
+/// **为什么必须自兜底**：Windows 只在「按下 → 松开 → 再按下」整段都落在系统双击
+/// 时限内、且两次按下都落在双击判定矩形内时，才把第二次按下换成 `WM_LBUTTONDBLCLK`
+/// （见 `WM_LBUTTONDBLCLK` 文档）。图标按下这条路比栅栏收展按钮长得多：
+/// 按下即 `SetCapture`，松开还要发 `IconClicked`（App 层改选中集 → 整帧重绘 + present）
+/// 与 `FenceDragEnd`（同步写 `desk.json`）。这条处理链一旦吃掉时限，系统就不再派发
+/// DBLCLK——第二次按下以普通 `WM_LBUTTONDOWN` 到达，`on_double_click` 永远不被调用，
+/// 图标永远打不开；而每次按下都走「图标拖动」分支，用户看到的就是「点一下就出拖动
+/// 指针」。收展按钮之所以没这个毛病，正是因为它在 `on_button_down` 里按下即 toggle、
+/// 不捕获鼠标。
+///
+/// 因此把双击判据从「系统是否派发 DBLCLK」改成渲染层自己记账：记录每次图标按下
+/// （时刻 + 坐标 + 目标），下一次按下命中同一图标的时限/位移窗即视为双击。系统照常
+/// 派发 DBLCLK 的路径不受影响——那种情况下压根没有第二次 `WM_LBUTTONDOWN`。
+#[derive(Debug, Clone, Copy)]
+struct IconClick {
+    fence: usize,
+    icon: usize,
+    x: f32,
+    y: f32,
+    at_ms: u64,
+}
+
 /// 拖拽会话（按下到松开之间持续有效）。
 #[derive(Debug, Clone, Copy)]
 struct DragState {
@@ -461,6 +536,10 @@ struct DragState {
     pressed_icon: Option<usize>,
     /// 按下时是否按住 Ctrl（单击时决定「切换选择」还是「单选」）。
     ctrl: bool,
+    /// 是否已实际移动过栅栏（发出过 `FenceMove`）。「拖动已成立」的锁存位：
+    /// 一旦成立，后续位移再小也继续跟随（否则光标拖出 6px 又拖回 3px 时栅栏
+    /// 会停在 6px 处不动，松开还被算成单击——点击把栅栏永久挪位）。
+    moved: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -498,6 +577,9 @@ struct WindowState {
     /// 回流，同一坐标可能已经换成别的控件（例如点「列表」后下方整排上移），此时必须拒绝，
     /// 否则会误触到相邻控件。
     last_console_zone: Option<ConsoleZone>,
+    /// 上一次「按下图标」的记录；系统 `WM_LBUTTONDBLCLK` 缺席时用它自行判定双击。
+    /// 判据与生命周期见 [`IconClick`]（为什么必须自兜底）。
+    last_icon_click: Option<IconClick>,
     /// 上次上报的光标位置（仅位置变化才发 CursorMove，避免无谓重绘）。
     last_cursor: Option<(f32, f32)>,
     /// 上次 SetWindowRgn 的区域句柄：区域几何未变时跳过 SetWindowRgn。
@@ -728,6 +810,7 @@ impl OverlayWindow {
             console_hovered: None,
             last_press_in_console: false,
             last_console_zone: None,
+            last_icon_click: None,
             last_cursor: None,
             last_region: None,
             handler: None,
@@ -1727,6 +1810,10 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
     // 中间只要按过别处（或压根没命中面板），记忆立即失效。
     state.last_press_in_console = false;
     state.last_console_zone = None;
+    // 取出上一次图标按下记录：本函数任何分支都会替它做决定——命中同一图标则升级为
+    // 双击并消费；在图标上按下则重新记账；按到别处则丢弃（不清会让「点图标 → 点其它
+    // → 再点图标」被误判成一次双击）。见 [`IconClick`]。
+    let prev_icon_click = state.last_icon_click.take();
     // 内联编辑框优先：点编辑框内部 = 把光标定位到点击处，不落到下面的栅栏/图标
     // （否则会触发「点击别处提交编辑」，用户根本无法点击文本）。
     if let Some(er) = state.model.edit_rect {
@@ -1757,6 +1844,7 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                     orig: c.rect,
                     pressed_icon: None,
                     ctrl: false,
+                    moved: false,
                 });
                 unsafe {
                     let _ = SetCursor(Some(zone_cursor(zone)));
@@ -1772,6 +1860,7 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                     orig: c.rect,
                     pressed_icon: None,
                     ctrl: false,
+                    moved: false,
                 });
                 unsafe {
                     let cur = LoadCursorW(None, IDC_SIZEALL).unwrap_or_default();
@@ -1807,6 +1896,7 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                     orig: f.body,
                     pressed_icon: None,
                     ctrl: false,
+                    moved: false,
                 });
                 // 拖拽期间 SetCapture 不再发 WM_SETCURSOR，这里锁定一次缩放光标
                 unsafe {
@@ -1836,6 +1926,7 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                 orig: f.body,
                 pressed_icon: None,
                 ctrl: false,
+                moved: false,
             });
             unsafe {
                 let cur = LoadCursorW(None, IDC_SIZEALL).unwrap_or_default();
@@ -1865,6 +1956,7 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                     orig: f.body,
                     pressed_icon: None,
                     ctrl,
+                    moved: false,
                 });
                 // 空白按下即清空选择（Explorer 行为）；拖拽中再逐帧上报框选结果
                 emit_event(
@@ -1879,6 +1971,42 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                 unsafe { SetCapture(hwnd) };
                 return;
             }
+            let icon_idx = pressed_icon.expect("上面已排除未命中图标");
+            // 自兜底双击：系统 DBLCLK 缺席时第二次按下以普通 DOWN 到达，这里补上
+            // （判据与由来见 [`IconClick`]）。命中即消费记录并直接打开，不建立拖拽会话
+            // ——随后的 `WM_LBUTTONUP` 无会话即空操作。
+            if let Some(prev) = prev_icon_click {
+                let (limit, cx, cy) = system_double_click();
+                if prev.fence == f.id
+                    && prev.icon == icon_idx
+                    && within_double_click(
+                        prev.at_ms,
+                        now_ms(),
+                        (prev.x, prev.y),
+                        (mx, my),
+                        limit,
+                        (cx, cy),
+                    )
+                {
+                    emit_event(
+                        hwnd,
+                        state,
+                        OverlayEvent::IconDoubleClicked {
+                            fence: f.id,
+                            icon: icon_idx,
+                        },
+                    );
+                    return;
+                }
+            }
+            // 记账本次「图标按下」，供下一次按下做双击判定。
+            state.last_icon_click = Some(IconClick {
+                fence: f.id,
+                icon: icon_idx,
+                x: mx,
+                y: my,
+                at_ms: now_ms(),
+            });
             state.drag = Some(DragState {
                 kind: DragKind::Move,
                 fence: f.id,
@@ -1886,11 +2014,11 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                 orig: f.body,
                 pressed_icon,
                 ctrl: is_ctrl_down(),
+                moved: false,
             });
-            unsafe {
-                let cur = LoadCursorW(None, IDC_SIZEALL).unwrap_or_default();
-                let _ = SetCursor(Some(cur));
-            }
+            // 光标**不**在按下瞬间就变成移动指针：单击图标是「选中」，一按下就露出
+            // 拖动指针会让用户以为已经拖起来了（这也正是「双击打不开」的观感证据）。
+            // 真正越过拖动阈值时由 `on_mouse_move` 切换为 `IDC_SIZEALL`。
             unsafe { SetCapture(hwnd) };
             return;
         }
@@ -2037,6 +2165,20 @@ fn hover_key(model: &HitModel, mx: f32, my: f32) -> Option<(usize, Option<usize>
     None
 }
 
+/// 图标上按下的 Move 拖拽，本次移动是否尚未构成拖动（应抑制 `FenceMove`）。
+///
+/// 双击的两次按下之间必然存在几像素的自然抖动：若抖动立即发 `FenceMove`，
+/// App 侧 `settle_move` 的间距推离会把栅栏推得比抖动更远（对垂直堆叠、水平
+/// 方向重叠的相邻栅栏，1px 抖动可被沿另一轴推开至多 `FENCE_GAP`），图标矩形
+/// 随之大幅偏离光标，第二次按下（`WM_LBUTTONDBLCLK`）的图标命中测试落空，
+/// 双击永远打不开文件。阈值 `t` 必须与 `on_button_up` 判定「单击 vs 拖动」
+/// 同源（[`drag_threshold_px`]，≥ 系统双击判定矩形）且同为严格小于：位移小于
+/// 阈值 → 栅栏纹丝不动 + 松开按单击处理，两处口径一致。越过阈值后的
+/// `FenceMove` 仍按「原始矩形 + 全量位移」出发，不产生跳变。
+fn press_move_suppressed(dist2: f32, t: f32) -> bool {
+    dist2 < t * t
+}
+
 /// 移动：拖动中连续上报新位置/新尺寸。目标一律用**原始矩形 + 鼠标总位移**
 /// （`drag.orig + (鼠标 - 按下点)`），即「原始目标」——App 层对每个原始目标
 /// 独立做碰撞/吸附。若用上一帧已生效矩形做增量，吸附是粘性的：被吸住后
@@ -2049,7 +2191,14 @@ fn on_mouse_move(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
     let orig = drag.orig;
     match drag.kind {
         DragKind::Move => {
-            // 侧边栏图标上按下 + 移动超阈值 → 切换为拖动排序模式
+            let dx = mx - drag.start.0;
+            let dy = my - drag.start.1;
+            let dist2 = dx * dx + dy * dy;
+            let t = drag_threshold_px();
+            // 侧边栏图标上按下 + 移动超阈值 → 切换为拖动排序模式。
+            // reorder 启动阈值取 max(REORDER_THRESHOLD, 单击/拖动阈值)：阈值以内属于
+            // 「点击容忍带」，不能被 reorder 抢走（容差调大的机器上侧边栏双击会先
+            // 触发重排，图标顺序被一次双击打乱）。
             if let Some(icon_idx) = drag.pressed_icon {
                 let is_sidebar = state
                     .model
@@ -2058,9 +2207,8 @@ fn on_mouse_move(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                     .find(|f| f.id == drag.fence)
                     .map(|f| f.is_sidebar)
                     .unwrap_or(false);
-                let dx = mx - drag.start.0;
-                let dy = my - drag.start.1;
-                if is_sidebar && (dx * dx + dy * dy) > REORDER_THRESHOLD * REORDER_THRESHOLD {
+                let reorder_t = t.max(REORDER_THRESHOLD);
+                if is_sidebar && dist2 > reorder_t * reorder_t {
                     state.drag = Some(DragState {
                         kind: DragKind::SidebarReorder,
                         fence: drag.fence,
@@ -2068,6 +2216,7 @@ fn on_mouse_move(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                         orig: drag.orig,
                         pressed_icon: Some(icon_idx),
                         ctrl: false,
+                        moved: drag.moved,
                     });
                     emit_event(
                         hwnd,
@@ -2080,6 +2229,27 @@ fn on_mouse_move(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                         },
                     );
                     return;
+                }
+                // 图标上按下：未越过阈值前栅栏不得跟随——「系统认定的双击绝不能先
+                // 移动栅栏」（见 `drag_threshold_px` 文档）。拖动一旦成立（越过阈值）
+                // 即锁存：此后位移再小也继续跟随，避免「拖出 6px 又拖回 3px」时
+                // 栅栏停在 6px 处、松开还被算成单击。
+                if !drag.moved && press_move_suppressed(dist2, t) {
+                    return;
+                }
+            }
+            if !drag.moved {
+                if let Some(d) = state.drag.as_mut() {
+                    d.moved = true;
+                }
+                // 拖动已成立：本次按下退出双击判定（否则「拖一下再快速点同一图标」会被
+                // 误判成双击），并且现在才把光标切成移动指针——见 `on_button_down` 处注释。
+                state.last_icon_click = None;
+                if drag.pressed_icon.is_some() {
+                    unsafe {
+                        let cur = LoadCursorW(None, IDC_SIZEALL).unwrap_or_default();
+                        let _ = SetCursor(Some(cur));
+                    }
                 }
             }
             // 原始目标左上角 = 按下时矩形左上角 + 鼠标相对按下点的位移
@@ -2209,14 +2379,29 @@ fn drop_paths(hdrop: HDROP) -> Vec<String> {
 
 /// 松开：结束拖拽会话。位移小于阈值且按在图标上 → 视为「单击选中」；
 /// 否则是拖动（无论是否移动，都通知 App 持久化布局）。
+///
+/// 单击（含「拖动已成立后又拖回阈值内」）必须把栅栏还原到按下时的位置：
+/// 点击绝不挪位栅栏。否则反复点击的自然漂移会永久累积——间隙推离朝远离邻居
+/// 的方向推、夹屏把栅栏停在屏幕边缘，栅栏会被一步步「走」到屏幕角落。
 fn on_button_up(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
     if let Some(drag) = state.drag.take() {
         if drag.kind == DragKind::Move {
             let dx = mx - drag.start.0;
             let dy = my - drag.start.1;
-            let moved = dx * dx + dy * dy;
-            let t = CLICK_DRAG_THRESHOLD;
-            if moved < t * t {
+            let dist2 = dx * dx + dy * dy;
+            let t = drag_threshold_px();
+            if dist2 < t * t {
+                // 判定为单击。拖动已成立过（越过阈值又拖回）→ 先还原栅栏位置。
+                if drag.moved {
+                    emit_event(
+                        hwnd,
+                        state,
+                        OverlayEvent::FenceMove {
+                            fence: drag.fence,
+                            pos: (drag.orig.x, drag.orig.y),
+                        },
+                    );
+                }
                 if let Some(icon) = drag.pressed_icon {
                     emit_event(
                         hwnd,
@@ -2228,6 +2413,9 @@ fn on_button_up(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
                         },
                     );
                 }
+            } else {
+                // 真实拖动：本次按下不参与双击判定（见 [`IconClick`]）。
+                state.last_icon_click = None;
             }
         } else if drag.kind == DragKind::Select {
             // 框选结束：清除橡皮筋显示（选择结果已在最后一次 SelectDrag 中生效）
@@ -2318,6 +2506,9 @@ fn compute_reorder_target(
 
 /// 双击图标：把下标交给 App 打开对应项。
 fn on_double_click(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
+    // 系统已经派发了 DBLCLK ⇒ 本次连击由系统记账完毕，清掉自兜底记录，免得它被
+    // 之后一次无关的按下误判成双击（见 [`IconClick`]）。
+    state.last_icon_click = None;
     // 控制台面板：既阻断双击穿透到底层桌面，也让幂等控件「跟手」。
     //
     // 判据是「上一次**按下**是否被控制台面板消费」，而不是「当前坐标是否还在面板矩形内」：
@@ -2608,6 +2799,329 @@ mod tests {
 
         let size = (orig.w + (now.0 - start.0), orig.h + (now.1 - start.1));
         assert_eq!(size, (460.0, 310.0));
+    }
+
+    #[test]
+    fn icon_press_jiggle_below_click_threshold_is_suppressed() {
+        // 双击两次按下之间的自然抖动（< 系统双击容差）必须被抑制：抑制 FenceMove
+        // 图标矩形才不会被间隙推离挪走，DBLCLK 命中才成立。阈值 = 单击/拖动判定。
+        let t = CLICK_DRAG_THRESHOLD;
+        assert!(press_move_suppressed(0.0, t));
+        assert!(press_move_suppressed(3.0_f32.hypot(2.0).powi(2), t));
+        // 恰好到达阈值按「拖动」处理：与 on_button_up 的严格小于判定同口径
+        assert!(!press_move_suppressed(t * t, t));
+        assert!(!press_move_suppressed(6.0_f32.hypot(8.0).powi(2), t));
+    }
+
+    /// 构造一个「单栅栏 + 单图标」的最小命中模型，并把事件收进 `events`。
+    fn gesture_state(events: &std::rc::Rc<std::cell::RefCell<Vec<OverlayEvent>>>) -> WindowState {
+        let model = HitModel {
+            fences: vec![FenceHit {
+                body: RectF {
+                    x: 500.0,
+                    y: 300.0,
+                    w: 400.0,
+                    h: 300.0,
+                },
+                title: RectF {
+                    x: 500.0,
+                    y: 300.0,
+                    w: 400.0,
+                    h: 40.0,
+                },
+                grip: RectF {
+                    x: 874.0,
+                    y: 574.0,
+                    w: 26.0,
+                    h: 26.0,
+                },
+                id: 0,
+                tooltip: None,
+                is_sidebar: false,
+                collapse_btn: None,
+                collapsed: false,
+            }],
+            icons: vec![IconHit {
+                rect: RectF {
+                    x: 600.0,
+                    y: 350.0,
+                    w: 72.0,
+                    h: 72.0,
+                },
+                fence: 0,
+                icon: 0,
+            }],
+            console: None,
+            edit_rect: None,
+            reserved: vec![],
+        };
+        let sink = events.clone();
+        let mut state = WindowState {
+            model,
+            drag: None,
+            hovered: None,
+            console_hovered: None,
+            last_press_in_console: false,
+            last_console_zone: None,
+            last_icon_click: None,
+            last_cursor: None,
+            last_region: None,
+            handler: Some(Box::new(move |ev| {
+                sink.borrow_mut().push(ev);
+                None // 保持命中模型不变（图标矩形不动，双击命中可复现）
+            })),
+            edit_brush: HBRUSH(std::ptr::null_mut()),
+            owner: HWND(std::ptr::null_mut()),
+            console_session: false,
+        };
+        state
+    }
+
+    #[test]
+    fn double_click_on_icon_never_emits_fence_move() {
+        // 完整双击手势回放：按下 → 抖动（< 阈值）→ 松开 → DBLCLK → 松开。
+        // 栅栏绝不能被抖动移动；单击选中与双击打开都必须触发。
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut state = gesture_state(&events);
+        let hwnd = HWND(std::ptr::null_mut());
+        on_button_down(hwnd, &mut state, 630.0, 380.0);
+        on_mouse_move(hwnd, &mut state, 632.0, 381.0);
+        on_mouse_move(hwnd, &mut state, 629.0, 379.0);
+        on_button_up(hwnd, &mut state, 630.0, 380.0);
+        on_double_click(hwnd, &mut state, 631.0, 380.0);
+        on_button_up(hwnd, &mut state, 631.0, 380.0);
+
+        let evs = events.borrow();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, OverlayEvent::FenceMove { .. })),
+            "双击的抖动不得移动栅栏: {evs:?}"
+        );
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, OverlayEvent::IconClicked { .. })),
+            "第一次松开应选中图标: {evs:?}"
+        );
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, OverlayEvent::IconDoubleClicked { .. })),
+            "DBLCLK 应命中图标并打开: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn out_and_back_drag_restores_fence_on_click() {
+        // 拖出阈值又拖回阈值内 → 期间栅栏跟随，但松开判定为单击：
+        // 必须先发还原 FenceMove（回到按下时位置）再发 IconClicked。
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut state = gesture_state(&events);
+        let hwnd = HWND(std::ptr::null_mut());
+        on_button_down(hwnd, &mut state, 630.0, 380.0);
+        on_mouse_move(hwnd, &mut state, 640.0, 380.0); // 越过阈值：拖动成立
+        on_mouse_move(hwnd, &mut state, 632.0, 380.0); // 拖回阈值内
+        on_button_up(hwnd, &mut state, 632.0, 380.0);
+
+        let evs = events.borrow();
+        let moves: Vec<(f32, f32)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                OverlayEvent::FenceMove { pos, .. } => Some(*pos),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            moves.last(),
+            Some(&(500.0, 300.0)),
+            "单击松开时栅栏必须还原到按下时位置: {moves:?}"
+        );
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, OverlayEvent::IconClicked { .. })),
+            "拖回阈值内的松开仍是单击: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn real_drag_beyond_threshold_moves_and_does_not_click() {
+        // 真实拖动（越过阈值且不再回到阈值内）：栅栏跟随到全量位移处，
+        // 不发 IconClicked、不还原。
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut state = gesture_state(&events);
+        let hwnd = HWND(std::ptr::null_mut());
+        on_button_down(hwnd, &mut state, 630.0, 380.0);
+        on_mouse_move(hwnd, &mut state, 660.0, 400.0);
+        on_button_up(hwnd, &mut state, 660.0, 400.0);
+
+        let evs = events.borrow();
+        let moves: Vec<(f32, f32)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                OverlayEvent::FenceMove { pos, .. } => Some(*pos),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            moves.last(),
+            Some(&(530.0, 320.0)),
+            "拖动目标 = 原始矩形 + 全量位移: {moves:?}"
+        );
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, OverlayEvent::IconClicked { .. })),
+            "拖动松开不是单击: {evs:?}"
+        );
+        assert!(
+            !moves.contains(&(500.0, 300.0)),
+            "真实拖动不得还原: {moves:?}"
+        );
+    }
+
+    #[test]
+    fn within_double_click_matches_system_window() {
+        // 双击 = 时限内 + 双击判定矩形内；超时或位移越界都不算。
+        let clk = (4.0, 4.0);
+        assert!(within_double_click(
+            1_000,
+            1_200,
+            (10.0, 10.0),
+            (13.0, 8.0),
+            500,
+            clk
+        ));
+        // 恰好到达时限按「不是双击」（与 LastTrayClick 的 `>= limit` 口径一致）
+        assert!(!within_double_click(
+            1_000,
+            1_500,
+            (10.0, 10.0),
+            (10.0, 10.0),
+            500,
+            clk
+        ));
+        // 横/纵位移任一越界即不是双击（系统容差默认 4px）
+        assert!(!within_double_click(
+            1_000,
+            1_200,
+            (10.0, 10.0),
+            (14.5, 10.0),
+            500,
+            clk
+        ));
+        assert!(!within_double_click(
+            1_000,
+            1_200,
+            (10.0, 10.0),
+            (10.0, 20.0),
+            500,
+            clk
+        ));
+    }
+
+    #[test]
+    fn icon_press_twice_without_system_dblclk_opens() {
+        // 系统 DBLCLK 缺席（第二次按下仍以 `WM_LBUTTONDOWN` 到达）时，自兜底必须把
+        // 同一图标上的快速二次按下升级为双击：打开图标，且不得建立拖拽会话 / 不得发
+        // `FenceMove`（这正是「点一下就出拖动指针、双击永远打不开」的回归断言）。
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut state = gesture_state(&events);
+        let hwnd = HWND(std::ptr::null_mut());
+        on_button_down(hwnd, &mut state, 630.0, 380.0);
+        on_button_up(hwnd, &mut state, 630.0, 380.0);
+        // 第二次按下：系统没派发 DBLCLK，走普通 DOWN
+        on_button_down(hwnd, &mut state, 631.0, 380.0);
+        on_button_up(hwnd, &mut state, 631.0, 380.0);
+
+        let evs = events.borrow();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, OverlayEvent::IconDoubleClicked { .. })),
+            "自兜底双击应打开图标: {evs:?}"
+        );
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, OverlayEvent::FenceMove { .. })),
+            "双击全程不得移动栅栏: {evs:?}"
+        );
+        assert_eq!(
+            evs.iter()
+                .filter(|e| matches!(e, OverlayEvent::IconClicked { .. }))
+                .count(),
+            1,
+            "只应有第一次单击的选中: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn slow_second_click_on_icon_is_not_a_double_click() {
+        // 两次单击间隔超过系统双击时限 → 只是两次单击，不得打开。
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut state = gesture_state(&events);
+        let hwnd = HWND(std::ptr::null_mut());
+        on_button_down(hwnd, &mut state, 630.0, 380.0);
+        on_button_up(hwnd, &mut state, 630.0, 380.0);
+        // 手工把记录时刻推到时限之外（避免测试真的等待）
+        if let Some(c) = state.last_icon_click.as_mut() {
+            c.at_ms = c.at_ms.saturating_sub(10_000);
+        }
+        on_button_down(hwnd, &mut state, 630.0, 380.0);
+        on_button_up(hwnd, &mut state, 630.0, 380.0);
+
+        let evs = events.borrow();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, OverlayEvent::IconDoubleClicked { .. })),
+            "超时的两次单击不得打开: {evs:?}"
+        );
+        assert_eq!(
+            evs.iter()
+                .filter(|e| matches!(e, OverlayEvent::IconClicked { .. }))
+                .count(),
+            2,
+            "两次单击各自选中: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn far_second_click_on_icon_is_not_a_double_click() {
+        // 时限内但位移超出系统双击判定矩形（光标已经滑到别处）→ 不得算双击。
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut state = gesture_state(&events);
+        let hwnd = HWND(std::ptr::null_mut());
+        on_button_down(hwnd, &mut state, 610.0, 355.0);
+        on_button_up(hwnd, &mut state, 610.0, 355.0);
+        // 仍在同一图标矩形内（600..672），但离第一次按下 > 双击判定矩形
+        on_button_down(hwnd, &mut state, 665.0, 355.0);
+        on_button_up(hwnd, &mut state, 665.0, 355.0);
+
+        let evs = events.borrow();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, OverlayEvent::IconDoubleClicked { .. })),
+            "位移越界不得判双击: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn real_drag_invalidates_pending_double_click() {
+        // 拖动一次（越过阈值）后，紧接着在同一图标上快速按下不得被误判成双击。
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut state = gesture_state(&events);
+        let hwnd = HWND(std::ptr::null_mut());
+        on_button_down(hwnd, &mut state, 630.0, 380.0);
+        on_mouse_move(hwnd, &mut state, 700.0, 420.0);
+        on_button_up(hwnd, &mut state, 700.0, 420.0);
+        assert!(
+            state.last_icon_click.is_none(),
+            "拖动必须作废待判定的双击记录"
+        );
+        on_button_down(hwnd, &mut state, 630.0, 380.0);
+        on_button_up(hwnd, &mut state, 630.0, 380.0);
+
+        let evs = events.borrow();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, OverlayEvent::IconDoubleClicked { .. })),
+            "拖动后的单击不得升级为双击: {evs:?}"
+        );
     }
 
     #[test]
