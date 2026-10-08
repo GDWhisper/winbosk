@@ -1,0 +1,743 @@
+//! 真实 Shell 上下文菜单（IContextMenu2/3）：右键栅栏内对象 = 桌面右键菜单。
+//!
+//! 通过 `SHCreateItemFromParsingName` + `IShellItem::BindToHandler(BHID_SFUIObject)`
+//! 拿到文件/文件夹/快捷方式的**标准 Shell 右键菜单**（打开/编辑/打印/剪切/复制/
+//! 删除/重命名/属性/发送到…），并在菜单顶部注入 WinBosk 自己的「移出栅栏」「重命名」。
+//!
+//! ## 为什么必须用 IContextMenu2/3
+//!
+//! Windows 10/11 的 Shell 右键菜单大量使用**所有者绘制**（owner-draw）菜单项
+//! （图标、渐变、现代样式的子菜单等）。这些项由 Shell 扩展通过
+//! `WM_MEASUREITEM`/`WM_DRAWITEM`/`WM_INITMENUPOPUP`/`WM_MENUCHAR` 绘制。
+//! 只用 `IContextMenu`(v1) + 裸 `TrackPopupMenu` 时，这些消息落到 owner 窗口的
+//! `DefWindowProcW` 上被丢弃，所有者绘制项渲染成空白——看起来就是
+//! 「没有 Windows 右键列表」。修复：把菜单 owner 设为一个**专用宿主窗口**，
+//! 其窗口过程把上述消息转发给 `IContextMenu2::HandleMenuMsg` /
+//! `IContextMenu3::HandleMenuMsg2`，Shell 扩展据此绘制完整菜单。
+//!
+//! 宿主窗口必须是**真实（可激活）的顶层窗口**，不能用 `HWND_MESSAGE` 消息窗口：
+//! `TrackPopupMenu` 要求 owner 在弹出前已是前台窗口，否则点击菜单外区域菜单不会
+//! 消失；而消息窗口永远无法被激活（见 `run_menu` 里的前台前置）。因此宿主建在
+//! 离屏 1×1、`WS_EX_TOOLWINDOW`（不进任务栏/Alt+Tab），弹出前用
+//! `OverlayWindow::with_foreground_lock` 提到前台，菜单收起后还原原前台窗口。
+//!
+//! 前提：调用方已完成 COM 初始化（`CoInitializeEx`，App 启动早期完成）。
+//! `InvokeCommand` 必须在其 COM 对象存活期间调用（本函数内保持引用即可）。
+
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
+use std::sync::{Mutex, OnceLock};
+
+use windows::core::{Interface, PCSTR, PCWSTR};
+use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Com::IBindCtx;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::{
+    BHID_SFUIObject, IContextMenu, IContextMenu2, IContextMenu3, IShellItem,
+    SHCreateItemFromParsingName, CMF_NORMAL, CMINVOKECOMMANDINFO,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
+    GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowThreadProcessId, InsertMenuW,
+    IsWindow, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, ShowWindow,
+    TrackPopupMenu, TranslateMessage, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG,
+    SW_SHOWNOACTIVATE, SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DRAWITEM,
+    WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_MENUCOMMAND, WM_MENUDRAG, WM_MENURBUTTONUP,
+    WM_NULL, WNDCLASSW, WNDCLASS_STYLES, WS_EX_TOOLWINDOW, WS_POPUP,
+};
+
+use crate::Runtime;
+
+/// Shell 项命令 ID 区间（`QueryContextMenu` 的 idCmdFirst..=idCmdLast）。
+const SHELL_CMD_FIRST: u32 = 0x7000;
+const SHELL_CMD_LAST: u32 = 0x7FFF;
+
+/// 注入的 WinBosk 命令 ID（在 Shell 区间之外，避免冲突）。
+/// 「移出栅栏」= 0x8000，「重命名」= 0x8001。
+pub const CMD_REMOVE: usize = 0x8000;
+const CMD_RENAME: usize = 0x8001;
+
+/// 菜单动作结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellMenuResult {
+    /// 点击了 WinBosk 注入的「移出栅栏」。
+    Remove,
+    /// 点击了 WinBosk 注入的「重命名」。
+    Rename,
+    /// 点击了 Shell 真实命令（已通过 `InvokeCommand` 执行）。
+    Invoked,
+    /// 用户取消菜单（Esc / 点击别处关闭）。
+    Canceled,
+    /// 菜单无法创建（路径无效 / COM 失败 / 资源不足等）。
+    Failed,
+}
+
+/// 菜单宿主窗口类名（真实可激活的离屏顶层窗口，用于接收菜单 owner-draw 消息并作为
+/// `TrackPopupMenu` 的 owner；常驻复用，见 `MENU_HOST` / `acquire_menu_host`）。
+const MENU_HOST_CLASS: &str = "WinBoskMenuHost";
+
+// 菜单期间持有 Shell 菜单接口，供宿主窗口过程转发 owner-draw 消息。
+// 菜单全程在主线程模态运行（TrackPopupMenu 阻塞），无跨线程访问。
+thread_local! {
+    static MENU_CTX2: RefCell<Option<IContextMenu2>> = const { RefCell::new(None) };
+    static MENU_CTX3: RefCell<Option<IContextMenu3>> = const { RefCell::new(None) };
+}
+
+/// 菜单宿主窗口类只注册一次。
+static MENU_CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
+
+// 菜单宿主窗口（常驻）：第一次需要时在**主线程**创建，之后复用，不再每次右键
+// 建/销窗口。窗口过程 `menu_host_proc` 只转发 IContextMenu 消息、自身不持有状态，
+// 多轮菜单复用安全。`run_menu` 始终在主线程串行（TrackPopupMenu 模态阻塞），且
+// 宿主窗口只在该线程创建/使用，故用 thread_local 存储（HWND 非 Sync，不能进 static）。
+thread_local! {
+    static MENU_HOST: Cell<Option<HWND>> = const { Cell::new(None) };
+}
+
+/// 已预热（加载并初始化过 Shell 扩展）的文件类型键集合。
+static PRIMED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn primed_set() -> std::sync::MutexGuard<'static, HashSet<String>> {
+    PRIMED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+}
+
+/// 弹出 `path` 对应的真实 Shell 右键菜单并执行选中命令。
+///
+/// `managed`：该项为 WinBosk 管理项（库内项/链接镜像项，见 context_menu::handle_context_menu）。
+/// 链接栅栏即文件夹镜像，「移出栅栏」与 Shell「删除」等价（移出不删文件，镜像 ≤4s 就把
+/// 图标加回来），库内项移出同样只此一个意义，故不再注入「移出栅栏」，避免菜单重复。
+///
+/// 菜单全程在**主线程**上弹出（模态）——与 Windows 桌面右键行为完全一致：
+/// 点击菜单外区域自动收起、Shell 动词（属性/删除/重命名…）能正常激活前台窗口。
+///
+/// 慢 Shell 扩展（如百度网盘 YunShellExt）首次加载会卡线程数秒，若首次右键时
+/// 扩展尚未加载，Windows 会判 UI 线程无响应（AppHangB1）并结束进程——表现即
+/// 「首次右键软件崩溃」。解决：右键前先在**后台线程**把该文件类型的 Shell 扩展
+/// 加载并初始化好（`prime_*`），再走主线程菜单。扩展慢初始化只发生一次（这就
+/// 是「重开软件就正常」的原因），预热后右键即为「第二次」速度。
+pub fn show(rt: &Runtime, path: &str, sx: i32, sy: i32, managed: bool) -> ShellMenuResult {
+    // 类型未预热则后台预热；等待期间泵送消息，窗口保持可响应（不触发 AppHang）
+    ensure_primed(path, rt.hwnd);
+    // 路径 → IShellItem（真实 Shell 菜单的入口）
+    let item: IShellItem = match unsafe {
+        SHCreateItemFromParsingName::<PCWSTR, Option<&IBindCtx>, IShellItem>(
+            PCWSTR(wide(path).as_ptr()),
+            None,
+        )
+    } {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(path, "SHCreateItemFromParsingName 失败: {e}");
+            return ShellMenuResult::Failed;
+        }
+    };
+    run_menu(rt, &item, path, sx, sy, managed)
+}
+
+/// 从已构造的 `IShellItem` 弹真实 Shell 右键菜单并执行选中命令。
+///
+/// 给**虚拟壳项**（回收站等无路径项）用：它没有文件系统路径，`SHCreateItemFromParsingName`
+/// 吃不下，只能由调用方用 `SHCreateItemFromIDList` 从 `DesktopItem.pidl` 构造。
+///
+/// `parsing_name`（`::{645FF040-…}`）是预热口径的键源：类型键走 `virtual:<clsid 小写>`，
+/// 与 `prime_startup` / `ensure_primed` 完全同源 —— 少这一环，`prime_startup` 插进
+/// `primed_set()` 的 `virtual:` 键没人查，回收站冷启那 191 ms 一次都没省下。
+/// `label` 仅用于日志。
+pub fn show_item(
+    rt: &Runtime,
+    item: &IShellItem,
+    parsing_name: &str,
+    label: &str,
+    sx: i32,
+    sy: i32,
+    managed: bool,
+) -> ShellMenuResult {
+    // 虚拟壳项尚未预热则后台预热（等待期间泵消息，不触发 AppHang）
+    ensure_primed_virtual(parsing_name, rt.hwnd);
+    run_menu(rt, item, label, sx, sy, managed)
+}
+
+/// 启动时预热：把栅栏里已有文件类型的 Shell 扩展在后台加载并初始化。
+/// 每个类型挑一个真实路径做一次 `QueryContextMenu`（就是这一步加载扩展、
+/// 触发慢首次初始化），把成本移到用户交互之前。
+///
+/// `parsing_names`：**虚拟壳项的解析名**（`::{645FF040-…}`），单独收、单独打类型键。
+/// 不能混进 `paths`：`unique_type_keys` 按 `std::path` 口径推键，而解析名尾部是 `}`，
+/// `Path::extension()` 取不到任何东西 ⇒ 落到 `"\0file"` 键（和真实文件相撞）。
+/// 键不同口径 ⇒ 预热静默失效（它正是为修回收站冷启 191 ms 而加的）。
+pub fn prime_startup(paths: &[String], parsing_names: &[String]) {
+    let mut keys = unique_type_keys(paths);
+    // 虚拟项：键 = `virtual:<clsid 小写>`，值 = 解析名（`prime_one` 直接吃解析名）
+    let mut by_key: HashMap<String, String> =
+        paths.iter().map(|p| (type_key(p), p.clone())).collect();
+    for name in parsing_names {
+        let key = virtual_type_key(name);
+        if !by_key.contains_key(&key) {
+            by_key.insert(key.clone(), name.clone());
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("winbosk-menu-prime".into())
+        .spawn(move || {
+            let _ = winbosk_shell::com::init();
+            for key in &keys {
+                if let Some(path) = by_key.get(key) {
+                    let _ = std::panic::catch_unwind(|| prime_one(path));
+                }
+                primed_set().insert(key.clone());
+            }
+        });
+}
+
+/// 虚拟壳项的类型键：`virtual:<clsid 小写>`。
+///
+/// 与 `unique_type_keys` 的按路径推键完全隔离——解析名尾部是 `}`，`Path::extension()`
+/// 取不到任何东西，会退化成「无扩展名文件」键。
+fn virtual_type_key(parsing_name: &str) -> String {
+    format!("virtual:{}", parsing_name.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 键口径必须与「按路径推键」隔离。
+    ///
+    /// 回归锁：解析名 `::{645FF040-…}` 的尾部 `}` 让 `std::path::Path::extension()`
+    /// 取不到任何东西（本机实测），`type_key` 于是回落到 `"\0file"`——**和真实文件撞同一个
+    /// 键**。两个不同的虚拟壳项也互相撞。若 `prime_startup` 用这个口径，
+    /// `primed_set()` 里的键没人查得到，回收站冷启那 191 ms 一次都省不下。
+    #[test]
+    fn virtual_type_key_is_isolated_from_path_extension_keys() {
+        let parsing = "::{645FF040-5081-101B-9F08-00AA002F954E}";
+        let vk = virtual_type_key(parsing);
+        assert_eq!(vk, "virtual:::{645ff040-5081-101b-9f08-00aa002f954e}");
+        // 按路径推键：解析名退化成「无扩展名文件」键 —— 与真实文件相撞
+        assert_eq!(type_key(parsing), "\u{0}file");
+        assert_ne!(vk, type_key(parsing));
+    }
+
+    /// 大小写 / 同名虚拟项：解析名唯一 ⇒ 键唯一，不会互相顶掉预热。
+    #[test]
+    fn virtual_type_key_distinguishes_same_display_name() {
+        assert_ne!(
+            virtual_type_key("::{26EE0668-A00A-44D7-9371-BEB064C98683}"),
+            virtual_type_key("::{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}")
+        );
+    }
+}
+
+/// 该类型的 Shell 菜单尚未预热：后台预热，并在等待期间泵送消息。
+/// 预热完成（或线程创建失败）后返回；调用方随后直接走主线程菜单。
+fn ensure_primed(path: &str, hwnd: HWND) {
+    let key = type_key(path);
+    if primed_set().contains(&key) {
+        return;
+    }
+    let Some(rx) = prime_path_async(key, path, hwnd) else {
+        return; // 线程创建失败：照常弹菜单（罕见，退化为旧行为）
+    };
+    let _ = pump_until(rx);
+}
+
+/// 虚拟壳项的 `ensure_primed` 版本：键走 `virtual:<解析名小写>` 口径。
+///
+/// 与 `ensure_primed` **不是**同一个键空间——按解析名推扩展名会切出
+/// `00aa002f954e}` 这类假扩展名，两边键不同 ⇒ 预热静默失效。
+/// `prime_one` 直接吃解析名（`SHCreateItemFromParsingName` 认 `::{…}`），故预热本身
+/// 无需改动，只有键的口径要分开。
+fn ensure_primed_virtual(parsing_name: &str, hwnd: HWND) {
+    let key = virtual_type_key(parsing_name);
+    if primed_set().contains(&key) {
+        return;
+    }
+    let Some(rx) = prime_path_async(key, parsing_name, hwnd) else {
+        return; // 线程创建失败：照常弹菜单（罕见，退化为旧行为）
+    };
+    let _ = pump_until(rx);
+}
+
+/// 后台预热单个文件类型，完成时发一个空消息唤醒等待方的消息泵。
+///
+/// `key` 由调用方给定（路径项 = `type_key`，虚拟项 = `virtual_type_key`）：
+/// 这里不能再自己推——按解析名推扩展名会切出假扩展名，与查询侧键不同口径。
+fn prime_path_async(
+    key: String,
+    parsing: &str,
+    hwnd: HWND,
+) -> Option<std::sync::mpsc::Receiver<()>> {
+    let parsing = parsing.to_string();
+    let hwnd_usize = hwnd.0 as usize;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ok = std::thread::Builder::new()
+        .name("winbosk-menu-prime".into())
+        .spawn(move || {
+            let _ = winbosk_shell::com::init();
+            let _ = std::panic::catch_unwind(|| prime_one(&parsing));
+            primed_set().insert(key);
+            let _ = tx.send(());
+            // 唤醒等待方的消息泵（等待方阻塞在 GetMessage 上时）
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd_usize as *mut core::ffi::c_void)),
+                    WM_NULL,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        })
+        .is_ok();
+    if ok {
+        Some(rx)
+    } else {
+        None
+    }
+}
+
+/// 加载并初始化 `path` 文件类型的 Shell 扩展（创建 IContextMenu + QueryContextMenu，
+/// 随后释放）。慢首次初始化（扩展连主进程/建缓存等）就发生在这里。
+fn prime_one(path: &str) -> bool {
+    let wide_path = wide(path);
+    let item: IShellItem = match unsafe {
+        SHCreateItemFromParsingName::<PCWSTR, Option<&IBindCtx>, IShellItem>(
+            PCWSTR(wide_path.as_ptr()),
+            None,
+        )
+    } {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(path, "预热: SHCreateItemFromParsingName 失败: {e}");
+            return false;
+        }
+    };
+    let ctx: IContextMenu = match unsafe {
+        item.BindToHandler::<Option<&IBindCtx>, IContextMenu>(None, &BHID_SFUIObject)
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(path, "预热: BindToHandler(IContextMenu) 失败: {e}");
+            return false;
+        }
+    };
+    let ctx2: IContextMenu2 = match ctx.cast::<IContextMenu2>() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(path, "预热: 获取 IContextMenu2 失败: {e}");
+            return false;
+        }
+    };
+    let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
+    if menu.is_invalid() {
+        return false;
+    }
+    // QueryContextMenu 触发扩展加载与初始化（慢首次加载就在这一步）
+    let _ = unsafe { ctx2.QueryContextMenu(menu, 0, SHELL_CMD_FIRST, SHELL_CMD_LAST, CMF_NORMAL) };
+    unsafe {
+        let _ = DestroyMenu(menu);
+    }
+    true
+}
+
+/// 文件类型的分类键：有扩展名的按扩展名（小写，含点）区分；无扩展名的文件夹/文件分开。
+fn type_key(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if let Some(ext) = p.extension() {
+        let ext = ext.to_string_lossy().to_lowercase();
+        if !ext.is_empty() {
+            return format!(".{ext}");
+        }
+    }
+    if p.is_dir() {
+        "\u{0}folder".to_string()
+    } else {
+        "\u{0}file".to_string()
+    }
+}
+
+/// 去重后的类型键列表（保持输入顺序）。
+fn unique_type_keys(paths: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for p in paths {
+        let k = type_key(p);
+        if seen.insert(k.clone()) {
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// 主线程泵送消息直到 `rx` 收到值（调用方阻塞）。返回 `None` 表示收到 `WM_QUIT`
+/// （用户退出，已把退出信号转发给外层消息循环）。
+///
+/// 不能空等——窗口必须持续处理消息，否则 Windows 判无响应（AppHangB1）。
+/// 泵送期间到达的 overlay 事件由 App 的 `ReentryGuard` 丢弃（模态期间行为一致）。
+fn pump_until<T>(rx: std::sync::mpsc::Receiver<T>) -> Option<T> {
+    loop {
+        if let Ok(v) = rx.try_recv() {
+            return Some(v);
+        }
+        let mut msg = MSG::default();
+        if unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 == 0 {
+            // WM_QUIT：转发退出信号，放弃等待
+            unsafe {
+                PostQuitMessage(msg.wParam.0 as i32);
+            }
+            return None;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            let _ = DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// 在**主线程**上弹出 Shell 右键菜单并执行选中命令（模态，阻塞到菜单关闭）。
+/// 由 `show` 调用（见 `show`）；COM 必须在调用线程上已初始化。
+///
+/// 菜单宿主窗口的前置/还原需要 overlay 的焦点代理（`with_foreground_lock`），
+/// 因此这里收的是整个 `Runtime`：overlay 句柄用于 Shell 动词的父窗口，overlay
+/// 指针用于绕过前台锁。
+///
+/// `item` 已由调用方构造（路径项走 `SHCreateItemFromParsingName`，虚拟壳项走
+/// `SHCreateItemFromIDList`——两者都要真实 Shell 菜单，只是入口不同）；`label`
+/// 仅用于日志。
+fn run_menu(
+    rt: &Runtime,
+    item: &IShellItem,
+    label: &str,
+    sx: i32,
+    sy: i32,
+    managed: bool,
+) -> ShellMenuResult {
+    let hwnd = rt.hwnd;
+    let overlay = rt.overlay_ptr;
+    let ctx: IContextMenu = match unsafe {
+        item.BindToHandler::<Option<&IBindCtx>, IContextMenu>(None, &BHID_SFUIObject)
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(label, "BindToHandler(IContextMenu) 失败: {e}");
+            return ShellMenuResult::Failed;
+        }
+    };
+
+    // 取 IContextMenu3（优先）/ IContextMenu2：转发 owner-draw 菜单消息必需。
+    // IContextMenu3 : IContextMenu2 : IContextMenu，cast 失败说明该扩展只实现了 v1，
+    // 此时 owner-draw 项无法绘制（极少数旧扩展），其余项仍可正常显示。
+    let ctx3: Option<IContextMenu3> = ctx.cast::<IContextMenu3>().ok();
+    let ctx2: IContextMenu2 = match ctx.cast::<IContextMenu2>() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(label, "获取 IContextMenu2 失败: {e}");
+            return ShellMenuResult::Failed;
+        }
+    };
+    tracing::debug!(label, ctx3 = ctx3.is_some(), "Shell 菜单接口就绪");
+
+    let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
+    if menu.is_invalid() {
+        tracing::warn!(label, "创建 Shell 菜单句柄失败");
+        return ShellMenuResult::Failed;
+    }
+
+    // 顶部注入 WinBosk 命令 + 分隔线；Shell 真实项从其后位置开始追加。
+    // WinBosk 管理项跳过「移出栅栏」（与「删除」等价，见 `show` 文档）。
+    unsafe {
+        let mut pos = 0u32;
+        if !managed {
+            let _ = InsertMenuW(
+                menu,
+                pos,
+                MF_BYPOSITION | MF_STRING,
+                CMD_REMOVE,
+                PCWSTR(wide("移出栅栏").as_ptr()),
+            );
+            pos += 1;
+        }
+        let _ = InsertMenuW(
+            menu,
+            pos,
+            MF_BYPOSITION | MF_STRING,
+            CMD_RENAME,
+            PCWSTR(wide("重命名").as_ptr()),
+        );
+        let _ = InsertMenuW(
+            menu,
+            pos + 1,
+            MF_BYPOSITION | MF_SEPARATOR,
+            0,
+            PCWSTR::null(),
+        );
+        // 追加 Shell 项；HRESULT 低 16 位为新增项数（忽略）
+        let _ = ctx2.QueryContextMenu(menu, pos + 2, SHELL_CMD_FIRST, SHELL_CMD_LAST, CMF_NORMAL);
+    }
+
+    // 菜单 owner 用专用宿主窗口：它负责把 owner-draw 消息转发给 IContextMenu2/3，
+    // 使 Shell 扩展能绘制出完整的「桌面右键菜单」。
+    //
+    // 必须是可激活的真实顶层窗口（不是 HWND_MESSAGE）：`TrackPopupMenu` 要求 owner
+    // 在弹出前已是前台窗口，否则点击菜单外区域菜单不会消失。这里建在离屏 1×1 并以
+    // `SW_SHOWNOACTIVATE` 显示——不可见的窗口无法被激活，显示是前置的前提。
+    let hinst = match unsafe { GetModuleHandleW(None) } {
+        Ok(m) => HINSTANCE(m.0),
+        Err(e) => {
+            tracing::warn!(label, "获取模块句柄失败: {e}");
+            unsafe {
+                let _ = DestroyMenu(menu);
+            }
+            return ShellMenuResult::Failed;
+        }
+    };
+    // 宿主窗口常驻：第一次创建，之后复用（见 `acquire_menu_host`）。
+    let host = match acquire_menu_host(hinst) {
+        Some(h) => h,
+        None => {
+            unsafe {
+                let _ = DestroyMenu(menu);
+            }
+            return ShellMenuResult::Failed;
+        }
+    };
+
+    // 模态期间保持接口存活：存进 thread_local，宿主窗口过程从中读取转发
+    // （clone 维持引用计数，原句柄继续用于 InvokeCommand）
+    MENU_CTX2.with(|c| *c.borrow_mut() = Some(ctx2.clone()));
+    MENU_CTX3.with(|c| *c.borrow_mut() = ctx3);
+
+    // 前置：菜单要求 owner 在弹出前已是前台窗口（否则点击菜单外区域不关闭）。
+    // 记下「应收回的前台窗口」，菜单收起后还回去，避免用户当前窗口一直失焦。
+    let prev_fg = foreground_to_restore();
+    unsafe {
+        (*overlay).with_foreground_lock(|| {
+            let _ = SetForegroundWindow(host);
+        });
+    }
+    let cmd = unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+            sx,
+            sy,
+            Some(0),
+            host,
+            None,
+        )
+        .0 as usize
+    };
+    unsafe {
+        // 收尾空消息：确保菜单的模态状态彻底退出（宿主对 WM_NULL 走默认处理）。
+        let _ = PostMessageW(Some(host), WM_NULL, WPARAM(0), LPARAM(0));
+    }
+
+    MENU_CTX2.with(|c| *c.borrow_mut() = None);
+    MENU_CTX3.with(|c| *c.borrow_mut() = None);
+    unsafe {
+        let _ = DestroyMenu(menu);
+    }
+
+    // 命令（含 Shell 动词）必须在本进程**仍是前台进程**时执行：属性 / 删除确认 /
+    // 重命名这类对话框由 Shell 扩展在进程内创建，非前台进程弹窗会被前台锁挡住，
+    // 只在任务栏闪烁。所以宿主窗口的存活与前台状态都保持到命令跑完再收尾。
+    let result = match cmd {
+        CMD_REMOVE => ShellMenuResult::Remove,
+        CMD_RENAME => ShellMenuResult::Rename,
+        c if (SHELL_CMD_FIRST as usize..=SHELL_CMD_LAST as usize).contains(&c) => {
+            // 命令偏移量（低字），cast 成 LPSTR 即 MAKEINTRESOURCE 语义
+            let offset = (c - SHELL_CMD_FIRST as usize) as isize;
+            let info = CMINVOKECOMMANDINFO {
+                cbSize: size_of::<CMINVOKECOMMANDINFO>() as u32,
+                fMask: 0,
+                hwnd,
+                // MAKEINTRESOURCEA(offset)：按命令索引执行 Shell 动词
+                lpVerb: PCSTR::from_raw(offset as *const u8),
+                lpParameters: PCSTR::null(),
+                lpDirectory: PCSTR::null(),
+                nShow: SW_SHOWNORMAL.0,
+                dwHotKey: 0,
+                hIcon: HANDLE::default(),
+            };
+            unsafe {
+                let _ = ctx2.InvokeCommand(&info);
+            }
+            ShellMenuResult::Invoked
+        }
+        _ => ShellMenuResult::Canceled,
+    };
+
+    unsafe {
+        // 只有前台仍停在宿主（用户选了某项或按 Esc）才还原；用户点到别的窗口
+        // （例如 Shell 动词打开的新窗口已经抢到前台）时不要抢焦点回来。
+        // 宿主窗口常驻（见 `MENU_HOST`），这里不再销毁。
+        if !prev_fg.is_invalid() && GetForegroundWindow() == host {
+            let _ = SetForegroundWindow(prev_fg);
+        }
+    }
+    result
+}
+
+/// 注册菜单宿主窗口类（幂等）。
+fn ensure_menu_host_class(hinst: HINSTANCE) -> bool {
+    if MENU_CLASS_REGISTERED.get().is_some() {
+        return true;
+    }
+    let class_name = wide(MENU_HOST_CLASS);
+    let wc = WNDCLASSW {
+        style: WNDCLASS_STYLES(0),
+        lpfnWndProc: Some(menu_host_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinst,
+        hIcon: Default::default(),
+        hCursor: Default::default(),
+        hbrBackground: Default::default(),
+        lpszMenuName: PCWSTR::null(),
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+    };
+    let atom = unsafe { RegisterClassW(&wc) };
+    if atom == 0 {
+        tracing::warn!("注册菜单宿主窗口类失败");
+        return false;
+    }
+    let _ = MENU_CLASS_REGISTERED.set(());
+    true
+}
+
+/// 取得（首次则创建）菜单宿主窗口。窗口离屏 1×1、`WS_EX_TOOLWINDOW`（不进任务栏 /
+/// Alt+Tab），以 `SW_SHOWNOACTIVATE` 显示——可见是 `SetForegroundWindow` 的前提，但
+/// 不抢用户当前窗口焦点（真正的激活在 `run_menu` 的前景锁里做）。创建后即常驻，
+/// 后续右键直接复用同一窗口（线程局部，仅主线程访问）。
+fn acquire_menu_host(hinst: HINSTANCE) -> Option<HWND> {
+    if let Some(h) = MENU_HOST.with(|c| c.get()) {
+        return Some(h);
+    }
+    if !ensure_menu_host_class(hinst) {
+        return None;
+    }
+    let host = match unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            PCWSTR(wide(MENU_HOST_CLASS).as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP,
+            -32000,
+            -32000,
+            1,
+            1,
+            None,
+            None,
+            Some(hinst),
+            None,
+        )
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("创建菜单宿主窗口失败: {e}");
+            return None;
+        }
+    };
+    // 只显示一次：常驻窗口保持可见即可被后续菜单反复激活（不再销毁）。
+    unsafe {
+        let _ = ShowWindow(host, SW_SHOWNOACTIVATE);
+    }
+    MENU_HOST.with(|c| c.set(Some(host)));
+    Some(host)
+}
+
+/// 选出「菜单收起后应当还原回去」的前台窗口：
+/// - 跳过无效窗口（`IsWindow` 失败，可能已被销毁）；
+/// - 跳过本进程自己的隐藏窗口（如离屏焦点代理 / overlay），否则焦点会困在不可见窗口上；
+/// - 若原前台本就是本进程窗口，回退到 Shell 桌面窗口（`GetShellWindow`，属 explorer、
+///   安全可激活），避免焦点困死也算有合理落点。
+fn foreground_to_restore() -> HWND {
+    let cur_pid = std::process::id();
+    let pick = |w: HWND| -> Option<HWND> {
+        if w.is_invalid() || !unsafe { IsWindow(Some(w)) }.as_bool() {
+            return None;
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(w, Some(&mut pid)) };
+        if pid == cur_pid {
+            return None;
+        }
+        Some(w)
+    };
+    match pick(unsafe { GetForegroundWindow() }) {
+        Some(w) => w,
+        None => pick(unsafe { GetShellWindow() }).unwrap_or_default(),
+    }
+}
+
+/// 菜单宿主窗口过程：把菜单 owner-draw 消息转发给 IContextMenu2/3。
+///
+/// - `WM_INITMENUPOPUP` / `WM_DRAWITEM` / `WM_MEASUREITEM` → `HandleMenuMsg`；
+/// - `WM_MENUCHAR`（键盘助记符）→ 优先 `HandleMenuMsg2` 并把 lResult 返回，
+///   否则退回 v1 的 `HandleMenuMsg`；
+/// - `WM_MENUDRAG` / `WM_MENUCOMMAND` / `WM_MENURBUTTONUP` → `HandleMenuMsg2`。
+unsafe extern "system" fn menu_host_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM => {
+            let handled = MENU_CTX2.with(|c| {
+                if let Some(ctx) = c.borrow().as_ref() {
+                    ctx.HandleMenuMsg(msg, wparam, lparam).is_ok()
+                } else {
+                    false
+                }
+            });
+            if handled {
+                return LRESULT(0);
+            }
+        }
+        WM_MENUCHAR | WM_MENUDRAG | WM_MENUCOMMAND | WM_MENURBUTTONUP => {
+            // IContextMenu3 能返回 lResult（WM_MENUCHAR 需要）
+            let r = MENU_CTX3.with(|c| {
+                if let Some(ctx) = c.borrow().as_ref() {
+                    let mut lr = LRESULT(0);
+                    if ctx
+                        .HandleMenuMsg2(msg, wparam, lparam, Some(&mut lr))
+                        .is_ok()
+                    {
+                        return Some(lr);
+                    }
+                }
+                None
+            });
+            if let Some(lr) = r {
+                return lr;
+            }
+            // 只有 v2 时，WM_MENUCHAR 交给 HandleMenuMsg（返回值不可达，仅尽力）
+            if msg == WM_MENUCHAR {
+                let handled = MENU_CTX2.with(|c| {
+                    if let Some(ctx) = c.borrow().as_ref() {
+                        ctx.HandleMenuMsg(msg, wparam, lparam).is_ok()
+                    } else {
+                        false
+                    }
+                });
+                if handled {
+                    return LRESULT(0);
+                }
+            }
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 把字符串转成 UTF-16（含结尾 NUL），供宽字符 API 使用。
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}

@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>01 · Fluent 设置风格 · WinBosk 控制中心</title>
+<style>
+  :root {
+    --bg: #f3f3f3;
+    --card: #ffffff;
+    --ink: #1a1a1a;
+    --muted: #5c5c5c;
+    --line: #e5e5e5;
+    --accent: #0067c0;
+    --accent-soft: #e8f1fb;
+    --success: #0f7b0f;
+    --radius: 8px;
+    --shadow: 0 2px 8px rgba(0,0,0,.06);
+    font-size: 15px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    background: linear-gradient(180deg, #e8eef5 0%, #f3f3f3 40%);
+    color: var(--ink);
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 32px 16px;
+  }
+  .window {
+    width: min(1040px, 100%);
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.12), var(--shadow);
+    overflow: hidden;
+  }
+  .titlebar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    background: #fafafa;
+  }
+  .app-icon {
+    width: 28px; height: 28px;
+    border-radius: 6px;
+    background: linear-gradient(135deg, #0067c0, #4cc2ff);
+    display: grid; place-items: center;
+    color: #fff; font-size: 13px; font-weight: 700;
+  }
+  .titlebar strong { font-weight: 600; font-size: 14px; }
+  .titlebar .kbd {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 4px 8px;
+  }
+  .shell { display: grid; grid-template-columns: 220px 1fr; min-height: 560px; }
+  nav {
+    background: #f9f9f9;
+    border-right: 1px solid var(--line);
+    padding: 16px 10px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  nav .section-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: #888;
+    padding: 8px 12px 6px;
+  }
+  nav a {
+    display: flex; align-items: center; gap: 10px;
+    text-decoration: none; color: var(--ink);
+    padding: 10px 12px;
+    border-radius: 6px;
+    font-size: 14px;
+    border: 1px solid transparent;
+  }
+  nav a .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #c8c8c8;
+  }
+  nav a.active {
+    background: var(--accent-soft);
+    border-color: #cfe3f7;
+    font-weight: 600;
+  }
+  nav a.active .dot { background: var(--accent); }
+  nav a:hover:not(.active) { background: #efefef; }
+  main { padding: 28px 32px 36px; overflow: auto; }
+  h1 { font-size: 28px; font-weight: 650; letter-spacing: -.02em; margin-bottom: 6px; }
+  .lead { color: var(--muted); font-size: 14px; margin-bottom: 24px; max-width: 52ch; }
+  .group {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 16px;
+    align-items: center;
+    padding: 16px 18px;
+    border-bottom: 1px solid var(--line);
+  }
+  .row:last-child { border-bottom: 0; }
+  .row h3 { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  .row p { font-size: 13px; color: var(--muted); line-height: 1.45; max-width: 48ch; }
+  .value { font-size: 13px; color: var(--muted); margin-top: 6px; font-family: "Cascadia Code", Consolas, monospace; }
+  .switch {
+    width: 44px; height: 24px;
+    border-radius: 999px;
+    background: #8a8a8a;
+    position: relative;
+    cursor: pointer;
+    border: none;
+    flex-shrink: 0;
+  }
+  .switch::after {
+    content: "";
+    position: absolute; top: 3px; left: 3px;
+    width: 18px; height: 18px;
+    background: #fff; border-radius: 50%;
+    transition: transform .15s ease;
+    box-shadow: 0 1px 3px rgba(0,0,0,.2);
+  }
+  .switch.on { background: var(--accent); }
+  .switch.on::after { transform: translateX(20px); }
+  .seg {
+    display: inline-flex;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 3px;
+    gap: 2px;
+  }
+  .seg button {
+    border: 0; background: transparent;
+    font: inherit; font-size: 13px;
+    padding: 6px 14px;
+    border-radius: 4px;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .seg button.on {
+    background: #fff;
+    color: var(--ink);
+    font-weight: 600;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08);
+  }
+  .btn {
+    font: inherit; font-size: 13px;
+    border: 1px solid var(--line);
+    background: #fff;
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+  }
+  .btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    font-weight: 600;
+  }
+  .btn:hover { filter: brightness(.98); }
+  .swatches { display: flex; gap: 8px; }
+  .swatch {
+    width: 28px; height: 28px;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    cursor: pointer;
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.08);
+  }
+  .swatch.sel { border-color: var(--ink); outline: 2px solid #fff; outline-offset: -4px; }
+  .footer-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #888;
+    display: flex; gap: 16px;
+  }
+  .footer-hint span { display: inline-flex; align-items: center; gap: 6px; }
+  kbd {
+    font-family: inherit;
+    font-size: 11px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 1px 6px;
+  }
+  .badge {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--success);
+    background: #eaf6ea;
+    border: 1px solid #c8e6c8;
+    border-radius: 999px;
+    padding: 3px 8px;
+  }
+</style>
+</head>
+<body>
+<div class="window" role="application" aria-label="WinBosk 控制中心 Fluent 风格 mockup">
+  <header class="titlebar">
+    <div class="app-icon">W</div>
+    <strong>WinBosk 控制中心</strong>
+    <span class="kbd">Ctrl + Alt + T</span>
+  </header>
+  <div class="shell">
+    <nav aria-label="设置分区">
+      <div class="section-label">管理</div>
+      <a href="#" class="active"><span class="dot"></span>栅栏总览</a>
+      <a href="#"><span class="dot"></span>布局与外观</a>
+      <a href="#"><span class="dot"></span>文件位置</a>
+      <div class="section-label">系统</div>
+      <a href="#"><span class="dot"></span>快捷键</a>
+      <a href="#"><span class="dot"></span>接管与恢复</a>
+      <a href="#"><span class="dot"></span>性能</a>
+      <a href="#"><span class="dot"></span>关于</a>
+    </nav>
+    <main>
+      <h1>栅栏总览</h1>
+      <p class="lead">统一管理桌面上的分组容器。所有更改实时预览并持久化；关闭本面板后完全隐藏，不占桌面空间。</p>
+
+      <div class="group">
+        <div class="row">
+          <div>
+            <h3>工作区 <span class="badge">已接管</span></h3>
+            <p>当前桌面由 WinBosk 托管，原生图标已隐藏。退出时将 100% 还原。</p>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <button class="btn">切换桌面</button>
+            <button class="btn primary">新建栅栏</button>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <h3>默认布局</h3>
+            <p>新建栅栏时使用的排列方式。既有栅栏可在「布局与外观」中单独覆盖。</p>
+          </div>
+          <div class="seg" role="tablist" aria-label="默认布局">
+            <button class="on" role="tab" aria-selected="true">网格</button>
+            <button role="tab">列表</button>
+            <button role="tab">侧边栏</button>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <h3>背景风格</h3>
+            <p>影响所有栅栏卡片的默认材质。玻璃风格使用 GPU 实时模糊，空闲时不占 CPU。</p>
+          </div>
+          <div class="seg">
+            <button class="on">玻璃</button>
+            <button>描边</button>
+            <button>纯色</button>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <h3>主题色调</h3>
+            <p>一键为全部栅栏上色，也可在单栅栏属性中微调。</p>
+          </div>
+          <div class="swatches" aria-label="色调">
+            <button class="swatch" style="background:#6ea8fe" aria-label="蓝"></button>
+            <button class="swatch sel" style="background:#8b7cf6" aria-label="紫"></button>
+            <button class="swatch" style="background:#3ddc97" aria-label="绿"></button>
+            <button class="swatch" style="background:#ffb454" aria-label="琥珀"></button>
+            <button class="swatch" style="background:#ff7a90" aria-label="珊瑚"></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="row">
+          <div>
+            <h3>磁吸对齐</h3>
+            <p>拖动栅栏时吸附到屏幕边缘与相邻栅栏，过冲回弹。</p>
+          </div>
+          <button class="switch on" role="switch" aria-checked="true" aria-label="磁吸对齐"></button>
+        </div>
+        <div class="row">
+          <div>
+            <h3>动效</h3>
+            <p>悬停放大、开合淡入、折叠占位框提示。动画结束后立即停止渲染。</p>
+          </div>
+          <button class="switch on" role="switch" aria-checked="true" aria-label="动效"></button>
+        </div>
+        <div class="row">
+          <div>
+            <h3>库同步心跳</h3>
+            <p>外部文件夹栅栏每 4 秒做一次子集校验。这是主线程唯一的周期性唤醒。</p>
+            <div class="value">interval = 4000ms · idle CPU ≈ 0</div>
+          </div>
+          <button class="switch on" role="switch" aria-checked="true" aria-label="库同步"></button>
+        </div>
+      </div>
+
+      <div class="footer-hint">
+        <span><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>T</kbd> 开关面板</span>
+        <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F10</kbd> 退出并恢复桌面</span>
+      </div>
+    </main>
+  </div>
+</div>
+<script>
+  document.querySelectorAll('.seg').forEach(seg => {
+    seg.addEventListener('click', e => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      seg.querySelectorAll('button').forEach(x => x.classList.remove('on'));
+      b.classList.add('on');
+    });
+  });
+  document.querySelectorAll('.switch').forEach(sw => {
+    sw.addEventListener('click', () => {
+      const on = sw.classList.toggle('on');
+      sw.setAttribute('aria-checked', String(on));
+    });
+  });
+  document.querySelectorAll('.swatches').forEach(box => {
+    box.addEventListener('click', e => {
+      const s = e.target.closest('.swatch');
+      if (!s) return;
+      box.querySelectorAll('.swatch').forEach(x => x.classList.remove('sel'));
+      s.classList.add('sel');
+    });
+  });
+  document.querySelectorAll('nav a').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      document.querySelectorAll('nav a').forEach(x => x.classList.remove('active'));
+      a.classList.add('active');
+    });
+  });
+</script>
+</body>
+</html>

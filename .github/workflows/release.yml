@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布版本标签 (例如 v0.1.0)'
+        required: false
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            scripts/installer/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Resolve release tag
+        id: vars
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') {
+              $env:GITHUB_REF_NAME
+          } elseif ($env:INPUT_TAG) {
+              $env:INPUT_TAG
+          } else {
+              'v0.1.0'
+          }
+          Write-Host "Release tag: $tag"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+
+      - name: Build main executable
+        run: cargo build --release
+
+      - name: Build installer
+        run: cargo build --release --manifest-path scripts/installer/Cargo.toml
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          pwsh -ExecutionPolicy Bypass -File scripts\package-release.ps1 -Tag "${{ steps.vars.outputs.tag }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ steps.vars.outputs.tag }}
+          path: dist/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: Release ${{ steps.vars.outputs.tag }}
+          files: |
+            dist/*
+          body: |
+            ### 📦 下载说明
+            - **`WinBosk-Setup-${{ steps.vars.outputs.tag }}.exe`**：推荐日常使用。图形化安装向导，支持自定义路径、快捷方式与干净卸载。
+            - **`WinBosk-${{ steps.vars.outputs.tag }}-win64.zip`**：绿色便携版。解压即用，配置保存在本地 `data` 目录，兼容 winget。
+            - **`winbosk-${{ steps.vars.outputs.tag }}-x64.exe`**：单文件版。无需解压，双击直接运行。
+
+            ---
+          generate_release_notes: true

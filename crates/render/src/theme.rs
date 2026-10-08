@@ -1,0 +1,294 @@
+//! 主题：配色与尺寸（全部物理像素）。
+//!
+//! 与应用无关：App 层负责把逻辑尺寸 × DPI 换算后填入。
+//! 颜色为直通 alpha（straight alpha），绘制时由 D2D 内部转换为预乘。
+
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
+
+/// 直通 alpha 的 RGBA 颜色（浮点，0..1）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Color {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl Color {
+    pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self { r, g, b, a }
+    }
+
+    /// 转成 D2D 颜色。
+    pub fn to_d2d(&self) -> D2D1_COLOR_F {
+        D2D1_COLOR_F {
+            r: self.r,
+            g: self.g,
+            b: self.b,
+            a: self.a,
+        }
+    }
+}
+
+/// 文本样式。
+#[derive(Debug, Clone, Copy)]
+pub struct TextStyle {
+    pub font_family: &'static str,
+    pub size: f32,
+    pub color: Color,
+}
+
+/// detail 级小字（副行/详情标签/路径）字号 = 基准字号 × 此比例。
+///
+/// 唯一真源：render 层 `TextFormats` 的 `detail` / `console_detail` 与 app 层
+/// `storage_row_geometry` 的宽度预算都从这里取值——改比例必须全链路同源，
+/// 禁止在调用点手写字面量。
+pub const DETAIL_SIZE_RATIO: f32 = 0.72;
+
+/// 从基准样式派生 detail 级小字样式（同族字体与颜色、字号按 [`DETAIL_SIZE_RATIO`] 缩小）。
+pub fn detail_style(base: &TextStyle) -> TextStyle {
+    TextStyle {
+        font_family: base.font_family,
+        size: base.size * DETAIL_SIZE_RATIO,
+        color: base.color,
+    }
+}
+
+/// 语义化控件几何度量（物理像素，基准为 96 DPI / scale = 1.0）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ControlMetrics {
+    pub btn_large_h: f32,
+    pub btn_large_radius: f32,
+    pub btn_large_pad_x: f32,
+    pub btn_medium_h: f32,
+    pub btn_medium_radius: f32,
+    pub btn_medium_pad_x: f32,
+    pub chip_h: f32,
+    pub chip_radius: f32,
+    pub chip_pad_x: f32,
+    pub icon_btn_size: f32,
+    pub icon_btn_radius: f32,
+    pub input_h: f32,
+    pub input_radius: f32,
+    pub input_pad_x: f32,
+    pub input_pad_y: f32,
+    pub stroke_focus: f32,
+    pub stroke_normal: f32,
+}
+
+impl Default for ControlMetrics {
+    fn default() -> Self {
+        Self {
+            btn_large_h: 34.0,
+            btn_large_radius: 8.0,
+            btn_large_pad_x: 12.0,
+            btn_medium_h: 26.0,
+            btn_medium_radius: 6.0,
+            btn_medium_pad_x: 8.0,
+            chip_h: 22.0,
+            chip_radius: 4.0,
+            chip_pad_x: 6.0,
+            icon_btn_size: 28.0,
+            icon_btn_radius: 6.0,
+            input_h: 26.0,
+            input_radius: 4.0,
+            input_pad_x: 8.0,
+            input_pad_y: 4.0,
+            stroke_focus: 1.2,
+            stroke_normal: 1.0,
+        }
+    }
+}
+
+impl ControlMetrics {
+    /// 按 DPI 缩放系数等比缩放全部控件度量。
+    pub fn scale(&self, s: f32) -> Self {
+        Self {
+            btn_large_h: self.btn_large_h * s,
+            btn_large_radius: self.btn_large_radius * s,
+            btn_large_pad_x: self.btn_large_pad_x * s,
+            btn_medium_h: self.btn_medium_h * s,
+            btn_medium_radius: self.btn_medium_radius * s,
+            btn_medium_pad_x: self.btn_medium_pad_x * s,
+            chip_h: self.chip_h * s,
+            chip_radius: self.chip_radius * s,
+            chip_pad_x: self.chip_pad_x * s,
+            icon_btn_size: self.icon_btn_size * s,
+            icon_btn_radius: self.icon_btn_radius * s,
+            input_h: self.input_h * s,
+            input_radius: self.input_radius * s,
+            input_pad_x: self.input_pad_x * s,
+            input_pad_y: self.input_pad_y * s,
+            stroke_focus: self.stroke_focus * s,
+            stroke_normal: self.stroke_normal * s,
+        }
+    }
+}
+
+/// 主题：栅栏外观、标题、图标网格与文字。
+///
+/// 渲染目标固定为 96 DPI（1 DIP = 1 物理像素），因此**全部尺寸都是物理像素**。
+/// App 层在 `Theme::default()` 后按 `scale = 系统DPI / 96` 把每个 DIP 度量放大；
+/// `scale` 同时供绘制层的固定偏移（按钮留白、控制台边距等）按同一比例缩放，
+/// 保证高 DPI 下布局比例一致、文字行列不重叠。
+#[derive(Debug, Clone)]
+pub struct Theme {
+    /// DPI 缩放系数（系统 DPI / 96）；默认 1.0 = 100% 缩放。
+    pub scale: f32,
+    /// 语义化控件几何度量（按 DPI 等比缩放）。
+    pub controls: ControlMetrics,
+    // 栅栏外观
+    pub fence_bg: Color,
+    pub fence_border: Color,
+    pub fence_corner_radius: f32,
+    pub fence_padding: f32,
+    /// 栅栏顶部高光描边（玻璃质感）：紧贴顶边内侧的一条亮线，让卡片从桌面浮起。
+    /// 厚度（物理像素）`<= 0` 时禁用，绘制层整段跳过。
+    pub fence_highlight: Color,
+    pub fence_highlight_h: f32,
+    /// 栅栏底部内阴影（海拔感）：卡片内侧靠底边的一条渐暗暗带，与 `fence_highlight`
+    /// 一明一暗配合出浮雕效果。厚度（物理像素）`<= 0` 时禁用。
+    ///
+    /// **不能改成外扩投影**：窗口区域被 `SetWindowRgn` 裁成栅栏矩形的并集
+    /// （见 `overlay::build_region`），画到栅栏边界之外会被直接裁掉；而把区域外扩
+    /// 会让投影带变成可点击区，吞掉栅栏四周的桌面图标点击（违反穿透前提）。
+    pub fence_shadow: Color,
+    pub fence_shadow_h: f32,
+    /// 模糊背景高斯标准偏差（物理像素，`GaussianBlurEffect::SetStandardDeviation`）。
+    /// GPU 效果按 sigma 直接设；初值 20 对旧观感微调。
+    pub blur_stddev: f32,
+    // 标题
+    pub title: TextStyle,
+    pub title_padding_bottom: f32,
+    // 控制中心文字。**与桌面栅栏文字解耦**：面板是管理界面，整体比栅栏同款大
+    // 两号（DIP +4）：`console_title` 20 / `console_label` 16；detail 级小字按
+    // `DETAIL_SIZE_RATIO` × `console_label.size` 派生（经 [`detail_style`]，
+    // 与 `TextFormats` 的 console_detail 同源）。
+    // 几何常量（行高 36 / 按钮高 24 / 行距 30 等）不随字号放大——16px 的实际字形
+    // 高（约 1.32 em ≈ 21px）仍装得进 24px 按钮带。
+    pub console_title: TextStyle,
+    pub console_label: TextStyle,
+    // 图标
+    pub icon_size: f32,
+    pub icon_gap: f32,
+    pub icon_caption_gap: f32,
+    pub label: TextStyle,
+    pub caption_max_width: f32,
+    // 网格
+    pub icon_cols: u32,
+    // 列表布局
+    pub list_row_gap: f32,
+    pub list_label_gap: f32,
+}
+
+/// 网格图标下方文件名标签：两行总高 = `label.size` 的倍数（DWrite 每行实际行高约
+/// 1.1 倍字号 + 余量）。App 布局（行高/编辑框）与 Render 绘制（标签框）共用同一
+/// 常量，保证二者一致不重叠。
+pub const GRID_CAPTION_H_MULT: f32 = 2.6;
+
+impl Default for Theme {
+    fn default() -> Self {
+        // 现代深色半透明栅栏；具体数值在 M4 视觉打磨阶段调整。
+        Self {
+            scale: 1.0,
+            controls: ControlMetrics::default(),
+            fence_bg: Color::rgba(0.13, 0.15, 0.19, 0.60),
+            fence_border: Color::rgba(1.0, 1.0, 1.0, 0.42),
+            fence_corner_radius: 12.0,
+            fence_padding: 14.0,
+            fence_highlight: Color::rgba(1.0, 1.0, 1.0, 0.22),
+            fence_highlight_h: 1.0,
+            fence_shadow: Color::rgba(0.0, 0.0, 0.0, 0.30),
+            fence_shadow_h: 6.0,
+            blur_stddev: 20.0,
+            title: TextStyle {
+                font_family: "Microsoft YaHei UI",
+                size: 16.0,
+                color: Color::rgba(1.0, 1.0, 1.0, 0.90),
+            },
+            title_padding_bottom: 10.0,
+            console_title: TextStyle {
+                font_family: "Microsoft YaHei UI",
+                size: 20.0,
+                color: Color::rgba(1.0, 1.0, 1.0, 0.90),
+            },
+            console_label: TextStyle {
+                font_family: "Microsoft YaHei UI",
+                size: 16.0,
+                color: Color::rgba(1.0, 1.0, 1.0, 0.85),
+            },
+            icon_size: 48.0,
+            // 网格格宽保底 = 1.5×图标宽（见 app 层 grid_cell_w），种子栅栏宽度估算对齐
+            icon_gap: 24.0,
+            icon_caption_gap: 6.0,
+            label: TextStyle {
+                font_family: "Microsoft YaHei UI",
+                size: 12.0,
+                color: Color::rgba(1.0, 1.0, 1.0, 0.85),
+            },
+            caption_max_width: 80.0,
+            icon_cols: 5,
+            list_row_gap: 8.0,
+            list_label_gap: 10.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_theme_metrics_are_sane() {
+        let t = Theme::default();
+        assert!(t.icon_size > 0.0);
+        assert!(t.icon_cols > 0);
+        assert!(t.fence_corner_radius >= 0.0);
+        assert!(t.title.size > 0.0 && t.label.size > 0.0);
+        assert!(t.console_title.size > t.title.size);
+        assert!(t.console_label.size > t.label.size);
+        assert!(t.fence_padding >= 0.0);
+        assert!(t.fence_highlight_h > 0.0);
+        assert!(t.fence_shadow_h > 0.0);
+        assert_eq!(t.controls, ControlMetrics::default());
+        assert!(t.controls.btn_large_h > 0.0);
+        assert!(t.controls.btn_medium_h > 0.0);
+        assert!(t.controls.chip_h > 0.0);
+        assert!(t.controls.icon_btn_size > 0.0);
+        assert!(t.controls.input_h > 0.0);
+        assert!(t.controls.input_pad_y > 0.0);
+        assert!(t.controls.stroke_focus > t.controls.stroke_normal);
+    }
+
+    #[test]
+    fn control_metrics_scale_proportional() {
+        let base = ControlMetrics::default();
+        let s = 1.5;
+        let scaled = base.scale(s);
+        assert!((scaled.btn_large_h - base.btn_large_h * s).abs() < 1e-5);
+        assert!((scaled.btn_large_radius - base.btn_large_radius * s).abs() < 1e-5);
+        assert!((scaled.btn_large_pad_x - base.btn_large_pad_x * s).abs() < 1e-5);
+        assert!((scaled.btn_medium_h - base.btn_medium_h * s).abs() < 1e-5);
+        assert!((scaled.btn_medium_radius - base.btn_medium_radius * s).abs() < 1e-5);
+        assert!((scaled.btn_medium_pad_x - base.btn_medium_pad_x * s).abs() < 1e-5);
+        assert!((scaled.chip_h - base.chip_h * s).abs() < 1e-5);
+        assert!((scaled.chip_radius - base.chip_radius * s).abs() < 1e-5);
+        assert!((scaled.chip_pad_x - base.chip_pad_x * s).abs() < 1e-5);
+        assert!((scaled.icon_btn_size - base.icon_btn_size * s).abs() < 1e-5);
+        assert!((scaled.icon_btn_radius - base.icon_btn_radius * s).abs() < 1e-5);
+        assert!((scaled.input_h - base.input_h * s).abs() < 1e-5);
+        assert!((scaled.input_radius - base.input_radius * s).abs() < 1e-5);
+        assert!((scaled.input_pad_x - base.input_pad_x * s).abs() < 1e-5);
+        assert!((scaled.input_pad_y - base.input_pad_y * s).abs() < 1e-5);
+        assert!((scaled.stroke_focus - base.stroke_focus * s).abs() < 1e-5);
+        assert!((scaled.stroke_normal - base.stroke_normal * s).abs() < 1e-5);
+    }
+
+    #[test]
+    fn color_converts_to_d2d_matching_input() {
+        let c = Color::rgba(0.2, 0.4, 0.6, 0.8);
+        let d = c.to_d2d();
+        assert!((d.r - 0.2).abs() < 1e-6);
+        assert!((d.a - 0.8).abs() < 1e-6);
+    }
+}

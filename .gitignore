@@ -1,0 +1,14 @@
+/target
+/dist
+/packaging/msix/build
+/docs/store/screenshots
+**/*.rs.bk
+*.log
+*.exe
+*.pdb
+scripts/installer/target
+/.claude
+/.workbuddy
+/.workbuddy-ai
+/.codegraph
+/.freebuff

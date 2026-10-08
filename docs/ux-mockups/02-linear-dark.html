@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>02 · Linear 深色极简 · WinBosk 控制中心</title>
+<style>
+  :root {
+    --bg: #0d0d0f;
+    --panel: #141416;
+    --panel-2: #1a1a1e;
+    --line: rgba(255,255,255,.07);
+    --ink: #f2f2f4;
+    --muted: #8b8b96;
+    --accent: #5e6ad2;
+    --accent-2: #7b83eb;
+    --ok: #4cb782;
+    --warn: #e2b93d;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(94,106,210,.18), transparent 60%),
+      radial-gradient(800px 400px at 100% 0%, rgba(76,183,130,.08), transparent 50%),
+      var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 40px 16px;
+  }
+  .app {
+    width: min(920px, 100%);
+    background: rgba(20,20,22,.92);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    backdrop-filter: blur(20px);
+    box-shadow: 0 30px 80px rgba(0,0,0,.55);
+    overflow: hidden;
+  }
+  .top {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .traffic { display: flex; gap: 6px; }
+  .traffic i {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #3a3a42; display: block;
+  }
+  .traffic i:nth-child(1) { background: #ff5f57; }
+  .traffic i:nth-child(2) { background: #febc2e; }
+  .traffic i:nth-child(3) { background: #28c840; }
+  .crumb { color: var(--muted); font-size: 13px; margin-left: 8px; }
+  .crumb b { color: var(--ink); font-weight: 550; }
+  .top .search {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 8px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 7px 12px;
+    min-width: 220px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .top .search kbd {
+    margin-left: auto;
+    font-size: 11px;
+    background: rgba(255,255,255,.06);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 5px;
+    color: var(--muted);
+  }
+  .body { display: grid; grid-template-columns: 200px 1fr; min-height: 540px; }
+  .side {
+    border-right: 1px solid var(--line);
+    padding: 16px 10px;
+    display: flex; flex-direction: column; gap: 2px;
+    background: rgba(0,0,0,.2);
+  }
+  .side .lbl {
+    font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+    color: #5c5c68; padding: 10px 10px 6px;
+  }
+  .side a {
+    text-decoration: none;
+    color: var(--muted);
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .side a.on {
+    background: rgba(94,106,210,.18);
+    color: var(--ink);
+    box-shadow: inset 0 0 0 1px rgba(94,106,210,.35);
+  }
+  .side a:hover:not(.on) { background: rgba(255,255,255,.04); color: var(--ink); }
+  .side .count {
+    font-size: 11px; color: #6e6e7a;
+    background: rgba(255,255,255,.05);
+    border-radius: 999px;
+    padding: 1px 7px;
+  }
+  .main { padding: 28px 28px 32px; }
+  .head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 16px; margin-bottom: 22px;
+  }
+  h1 { font-size: 20px; font-weight: 600; letter-spacing: -.02em; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 6px; max-width: 48ch; line-height: 1.5; }
+  .actions { display: flex; gap: 8px; }
+  .btn {
+    font: inherit; font-size: 13px;
+    border-radius: 7px;
+    padding: 8px 14px;
+    cursor: pointer;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--ink);
+  }
+  .btn.pri {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    font-weight: 550;
+  }
+  .btn:hover { filter: brightness(1.08); }
+  .list { display: flex; flex-direction: column; gap: 8px; }
+  .card {
+    display: grid;
+    grid-template-columns: 36px 1fr auto auto;
+    gap: 14px;
+    align-items: center;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    transition: border-color .12s, transform .12s;
+    cursor: default;
+  }
+  .card:hover {
+    border-color: rgba(94,106,210,.45);
+    transform: translateY(-1px);
+  }
+  .thumb {
+    width: 36px; height: 36px;
+    border-radius: 8px;
+    display: grid; place-items: center;
+    font-size: 14px; font-weight: 650;
+    color: #0d0d0f;
+  }
+  .t1 { background: linear-gradient(135deg,#8b95f5,#5e6ad2); color:#fff; }
+  .t2 { background: linear-gradient(135deg,#4cb782,#2f9e6e); color:#fff; }
+  .t3 { background: linear-gradient(135deg,#e2b93d,#c9961a); color:#1a1a1e; }
+  .t4 { background: linear-gradient(135deg,#e07a5f,#c45c3e); color:#fff; }
+  .meta strong { display: block; font-size: 14px; font-weight: 550; margin-bottom: 3px; }
+  .meta span { font-size: 12px; color: var(--muted); }
+  .pill {
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    background: rgba(255,255,255,.03);
+  }
+  .pill.ext { color: #7eb6ff; border-color: rgba(126,182,255,.3); background: rgba(126,182,255,.08); }
+  .pill.int { color: #9b9bb0; }
+  .dots {
+    width: 28px; height: 28px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+  }
+  .dots:hover { background: rgba(255,255,255,.06); color: var(--ink); border-color: var(--line); }
+  .strip {
+    margin-top: 18px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+  }
+  .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .stat .v { font-size: 22px; font-weight: 600; margin-top: 6px; letter-spacing: -.03em; }
+  .stat .n { font-size: 12px; color: var(--ok); margin-top: 4px; }
+  .stat .n.dim { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="top">
+    <div class="traffic" aria-hidden="true"><i></i><i></i><i></i></div>
+    <div class="crumb">WinBosk / <b>栅栏</b></div>
+    <div class="search"><span>搜索栅栏、动作…</span><kbd>⌘K</kbd></div>
+  </div>
+  <div class="body">
+    <aside class="side">
+      <div class="lbl">视图</div>
+      <a href="#" class="on">全部栅栏 <span class="count">12</span></a>
+      <a href="#">最近编辑 <span class="count">3</span></a>
+      <a href="#">外部文件夹 <span class="count">4</span></a>
+      <a href="#">桌面镜像 <span class="count">1</span></a>
+      <div class="lbl">配置</div>
+      <a href="#">外观</a>
+      <a href="#">快捷键</a>
+      <a href="#">性能</a>
+      <a href="#">关于</a>
+    </aside>
+    <section class="main">
+      <div class="head">
+        <div>
+          <h1>栅栏总览</h1>
+          <p class="sub">键盘优先的管理视图。空格快速折叠，E 编辑外观，Enter 打开文件位置。</p>
+        </div>
+        <div class="actions">
+          <button class="btn">切换桌面</button>
+          <button class="btn pri">新建栅栏</button>
+        </div>
+      </div>
+
+      <div class="list">
+        <article class="card">
+          <div class="thumb t1">项</div>
+          <div class="meta">
+            <strong>项目</strong>
+            <span>14 个图标 · 网格 · 折叠于左侧</span>
+          </div>
+          <span class="pill int">应用内部</span>
+          <button class="dots" aria-label="更多">···</button>
+        </article>
+        <article class="card">
+          <div class="thumb t2">工</div>
+          <div class="meta">
+            <strong>工具</strong>
+            <span>9 个图标 · 列表 · 玻璃材质</span>
+          </div>
+          <span class="pill ext">D:\Tools</span>
+          <button class="dots" aria-label="更多">···</button>
+        </article>
+        <article class="card">
+          <div class="thumb t3">文</div>
+          <div class="meta">
+            <strong>文档</strong>
+            <span>22 个图标 · 网格 · 自适应高度</span>
+          </div>
+          <span class="pill ext">OneDrive\Desktop</span>
+          <button class="dots" aria-label="更多">···</button>
+        </article>
+        <article class="card">
+          <div class="thumb t4">游</div>
+          <div class="meta">
+            <strong>游戏</strong>
+            <span>6 个图标 · 侧边栏 · 折叠</span>
+          </div>
+          <span class="pill int">应用内部</span>
+          <button class="dots" aria-label="更多">···</button>
+        </article>
+      </div>
+
+      <div class="strip">
+        <div class="stat">
+          <div class="k">常驻内存</div>
+          <div class="v">24.6 MB</div>
+          <div class="n">低于 30MB 目标</div>
+        </div>
+        <div class="stat">
+          <div class="k">空闲主线程</div>
+          <div class="v">1 / 4s</div>
+          <div class="n">仅库同步心跳</div>
+        </div>
+        <div class="stat">
+          <div class="k">桌面状态</div>
+          <div class="v">已接管</div>
+          <div class="n dim">IconGuard 守卫中</div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+<script>
+  document.querySelectorAll('.side a').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      document.querySelectorAll('.side a').forEach(x => x.classList.remove('on'));
+      a.classList.add('on');
+    });
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,4190 @@
+//! 场景构建：从领域模型 + 主题排布出渲染场景（栅栏/侧边栏/控制台/命中模型）。
+
+use crate::*;
+use winbosk_core::hotkey::{HotkeyAction, HotkeyBinding};
+use winbosk_core::storage::StorageKind;
+use winbosk_render::scene::{SceneHotkeyRow, SceneIconDrag, SceneReserved, SceneSettingsPage};
+use winbosk_render::theme::{ControlMetrics, DETAIL_SIZE_RATIO};
+pub(crate) fn system_dark_mode() -> bool {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let subkey = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let value = wide("AppsUseLightTheme");
+    let mut data: u32 = 1;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut core::ffi::c_void),
+            Some(&mut size),
+        )
+    };
+    status.is_ok() && data == 0
+}
+
+/// 列表布局下建议的栅栏宽度：名称列 + 类型/修改日期/大小三列 + 内边距。
+pub(crate) fn list_auto_width(rt: &Runtime, fence: usize) -> f32 {
+    let f = &rt.desk.fences[fence];
+    let s = rt.theme.scale;
+    let max_w: f32 = f
+        .icon_ids
+        .iter()
+        .filter_map(|id| rt.desk.icons.get(id))
+        .map(|ic| label_width(&ic.display_name, rt.theme.label.size))
+        .fold(0.0, f32::max);
+    let fixed = (LIST_TYPE_W + LIST_MOD_W + LIST_SIZE_W + LIST_COL_GAP * 3.0) * s;
+    let base =
+        f.appearance.padding * s * 2.0 + LIST_ICON_SIZE * s + rt.theme.list_label_gap + max_w;
+    (base + fixed).max(420.0 * s)
+}
+
+/// 粗略估算标签文本宽度（CJK 按字号宽，ASCII 按 0.62 倍宽）。
+pub(crate) fn label_width(text: &str, font_size: f32) -> f32 {
+    let units: f32 = text
+        .chars()
+        .map(|c| if c.is_ascii() { 0.62 } else { 1.0 })
+        .sum();
+    units * font_size
+}
+
+/// 用 Shell API 获取用户桌面文件夹的真实路径。
+/// 支持用户自定义桌面位置（如移到 D 盘），比 `USERPROFILE\Desktop` 可靠。
+pub(crate) fn shell_desktop_path() -> Option<String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG};
+    unsafe {
+        let pwstr = SHGetKnownFolderPath(&FOLDERID_Desktop, KNOWN_FOLDER_FLAG(0), None).ok()?;
+        let path = pwstr.to_string().ok()?;
+        CoTaskMemFree(Some(pwstr.as_ptr() as *const _));
+        if std::path::Path::new(&path).is_dir() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+}
+
+/// 真实「公共桌面」目录（`FOLDERID_PublicDesktop`，通常 `C:\Users\Public\Desktop`）。
+///
+/// Windows 桌面上显示的是「用户桌面 + 公共桌面」两个目录的并集，桌面镜像栅栏必须两个都扫，
+/// 否则公共快捷方式（Chrome / NVIDIA App 等）在真实桌面被壳层隐藏后无处可去。
+/// 目录不存在/不可用 → `None`（镜像退化为只扫用户桌面）。
+pub(crate) fn shell_public_desktop_path() -> Option<String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        FOLDERID_PublicDesktop, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
+    };
+    unsafe {
+        let pwstr =
+            SHGetKnownFolderPath(&FOLDERID_PublicDesktop, KNOWN_FOLDER_FLAG(0), None).ok()?;
+        let path = pwstr.to_string().ok()?;
+        CoTaskMemFree(Some(pwstr.as_ptr() as *const _));
+        if std::path::Path::new(&path).is_dir() {
+            Some(path)
+        } else {
+            None
+        }
+    }
+}
+
+/// 首次运行：创建一个链接到用户桌面文件夹的默认侧边栏栅栏。
+/// 已有布局时不作任何改动（栅栏是用户显式成员列表）。
+/// 不预填 `icon_ids`——内容由随后的 `reconcile_fences` 从桌面目录同步填充。
+pub(crate) fn seed_fences(desk: &mut Desk, _items: &[DesktopItem], _theme: &Theme) {
+    if !desk.fences.is_empty() {
+        return;
+    }
+    // 默认创建一个侧边栏栅栏，链接到用户桌面文件夹。
+    // 不预填 icon_ids——reconcile_fences 会在启动后扫描文件夹自动同步内容。
+    // 用 Shell API 获取真实桌面路径（用户可能把桌面移到 D 盘等非默认位置）。
+    let desktop_dir = shell_desktop_path().unwrap_or_default();
+    let appearance = FenceAppearance {
+        layout: FenceLayout::Sidebar,
+        sidebar_pos: SidebarPosition::Top,
+        ..FenceAppearance::default()
+    };
+    let storage = if desktop_dir.is_empty() {
+        None
+    } else {
+        Some(desktop_dir)
+    };
+    tracing::info!(
+        storage = storage.as_deref().unwrap_or("(无)"),
+        "首次运行：已创建默认桌面侧边栏（内容将由文件夹同步填充）"
+    );
+    let f = Fence {
+        id: desk.next_fence_id(),
+        title: Some("桌面".into()),
+        monitor_id: 0,
+        bounds: Rect::new(0.0, 0.0, 0.0, 0.0), // sidebar_dock_rect 会在启动锚定时计算
+        state: FenceState::Expanded,
+        icon_ids: Vec::new(), // 空——由 reconcile_fences 从文件夹同步填充
+        appearance,
+        scroll: 0.0,
+        storage_path: storage,
+        sidebar_collapsed: false,
+        rule: None,
+        collapsed: false,
+    };
+    desk.fences.push(f);
+}
+
+/// 把整个桌面状态排布成场景（每个栅栏按网格/列表排布；内容超出滚动）。
+pub(crate) fn build_scene(rt: &mut Runtime, now: Instant) -> Scene {
+    let alpha = fence_alpha(rt, now);
+    let mut scene = Scene::new(rt.vw, rt.vh);
+    // 图标拖动期间**不改模型**：源栅栏只把被拖的那个图标隐藏起来（位置留空），
+    // 其余图标原位不动——这样落点下标（按排除被拖项后的成员列表算）与画面严格一致。
+    // 归属的变更只在松手时发生一次（App 的 `apply_icon_drop`）。
+    //
+    // 定位被拖项用**本帧**的 `icon_ids` 反查（不缓存按下时的下标）：拖动可能持续几秒，
+    // 期间后台 4s 库同步会增删成员，缓存的下标会指向别的图标。
+    let drag_source = rt.icon_drag.as_ref().map(|d| (d.from_fence, d.id.clone()));
+    for i in 0..rt.desk.fences.len() {
+        // 视觉矩形：拖拽/缩放补间期间用插值（模型已是目标值，场景跟随动画）
+        let mut f = rt.desk.fences[i].clone();
+        f.bounds = fence_visual_rect(rt, i);
+        // 栅栏几何圆整到整数物理像素：D2D 在非整数坐标上描 2px 圆角边会发虚，
+        // 圆整后边界落在像素网格上，配合 Per-Monitor V2（无 DWM 位图缩放）即清晰锐利。
+        // 自动高度栅栏 bounds.h==0 圆整后仍是 0，真实高度由 layout_fence 计算后再圆整。
+        f.bounds.x = f.bounds.x.round();
+        f.bounds.y = f.bounds.y.round();
+        f.bounds.w = f.bounds.w.round();
+        f.bounds.h = f.bounds.h.round();
+        let mut sf = layout_fence(
+            &rt.theme,
+            &f,
+            &rt.desk,
+            &rt.bitmap_ids,
+            rt.hover,
+            &rt.selected,
+            rt.select_band,
+            i,
+        );
+        // 正在重命名栅栏标题/图标时，隐藏原始文字避免与编辑框重叠（编辑框独立绘制）
+        if let Some(edit) = &rt.edit {
+            match edit.target {
+                EditTarget::FenceTitle { fence: ef } if ef == i => sf.title.clear(),
+                EditTarget::Item {
+                    fence: ef,
+                    icon: ei,
+                } if ef == i => {
+                    if let Some(ic) = sf.icons.get_mut(ei) {
+                        ic.label.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 被拖走的图标：隐藏原位绘制（幽灵由场景级 `icon_drag` 画在光标处）。
+        // 只隐藏、不重排——其余图标留在原位，落点下标与画面才一致。
+        if let Some((df, ref drag_id)) = drag_source {
+            if df == i {
+                sf.drag_hidden = rt.desk.fences[i].icon_ids.iter().position(|x| x == drag_id);
+            }
+        }
+        let full_height = sf.height;
+
+        // 侧边栏布局：不显示标题（Dock 无标题）；固定为完整 dock，无折叠状态。
+        if f.appearance.layout == FenceLayout::Sidebar {
+            sf.title.clear();
+        }
+        // 桌面切换整体淡入淡出
+        sf.alpha = alpha;
+        // 悬停放大：普通布局（网格/列表）在循环内做；侧边栏 Dock 放大
+        // 依赖全部栅栏的真实几何，放到循环结束后统一处理（见 build_dock_magnify）。
+        if f.appearance.layout != FenceLayout::Sidebar {
+            if let Some((hf, hi)) = rt.hover {
+                if hf == i {
+                    if let Some(ic) = sf.icons.get_mut(hi) {
+                        ic.scale = icon_hover_scale(rt, hf, hi, now);
+                    }
+                }
+            }
+
+            let scale = rt.theme.scale;
+            let pad = f.appearance.padding * scale;
+            let btn_size = (rt.theme.title.size * 1.4).round().max(16.0);
+            let btn_rect = RectF {
+                x: sf.x + sf.width - pad - btn_size,
+                y: sf.y + pad + (rt.theme.title.size * 1.6 - btn_size) / 2.0,
+                w: btn_size,
+                h: btn_size,
+            };
+            sf.collapse_btn = Some(btn_rect);
+
+            if f.collapsed {
+                sf.collapsed = true;
+                sf.height = collapsed_title_h(&rt.theme, &f.appearance);
+                sf.icons.clear();
+                sf.scroll_max = 0.0;
+                sf.scroll_view = 0.0;
+            }
+        }
+        // 回写钳制后的滚动偏移（滚轮事件在 layout 内被限制在 [0, max_scroll]）
+        rt.desk.fences[i].scroll = sf.scroll;
+        // 回写实际展开高度：自动高度栅栏（bounds.h<=0）的碰撞检测/夹屏按真实展开高度算。
+        // 只在有对应下标时回写（AddFence 后同一帧 scene 已重建，长度必对齐）。
+        // 无论当前是否折叠，last_layout_h 均记录展开时的真实物理高度（保证冷启动重叠消解不失效）。
+        if i < rt.last_layout_h.len() {
+            rt.last_layout_h[i] = full_height;
+        }
+        // 模糊风格无需任何截图/CPU 处理：`sf.blur` 已由 layout_fence 置位，
+        // 合成器据此建/删该栅栏的 BackdropBrush + GaussianBlurEffect 视觉（GPU 实时）。
+        scene.fences.push(sf);
+    }
+    // 侧边栏 Dock 放大（第二遍：全部栅栏真实几何已就绪，光标若落在其他栅栏内则
+    // 不放大，避免影响半径越过网格/列表抢走它们的悬停焦点）。
+    build_dock_magnify(rt, &mut scene.fences);
+    // 收起栅栏的原大小占位框（仅拖动期间非空）。放在最后计算：`last_layout_h`
+    // 已由上面的循环回写为本帧真实展开高度，占位矩形才与碰撞入参同帧一致。
+    scene.reserved = reserved_frames(
+        &rt.desk,
+        &rt.last_layout_h,
+        rt.drag_hint.as_ref(),
+        &rt.theme,
+        alpha,
+    );
+    // 图标拖动：幽灵 + 目标栅栏高亮 + 插入位。放在最后：`scene.fences` 的几何
+    // （含各栅栏真实高度与内容区顶点）此刻才全部就位，与前两遍同源。
+    scene.icon_drag = icon_drag_overlay(rt, &scene);
+    // 控制中心：关闭后完全不渲染（不留胶囊）；展开动画期间 panel > 0 才画。
+    let panel = rt.console_anim.panel;
+    if rt.desk.console_open || panel > 0.01 {
+        let console = build_console(rt, &rt.console_anim);
+        if let Some(re) = &console.rule_editor {
+            if let Some(active_r) = re.active_edit_rect {
+                if let Some(e) = rt.edit.as_mut() {
+                    if e.rect != active_r {
+                        e.rect = active_r;
+                        position_ime_window(rt);
+                    }
+                }
+            }
+        }
+        scene.console = Some(console);
+    }
+    // 内联编辑（最后绘制，浮于所有内容之上）
+    scene.edit = rt.edit.as_ref().map(|e| SceneEdit {
+        rect: e.rect,
+        lines: e.lines.clone(),
+        line: e.line,
+        col: e.col,
+        placeholder: e.placeholder.clone(),
+        single_line: e.single_line,
+        focused: e.focused,
+        composing: e.composing,
+        comp: e.comp.clone(),
+    });
+    scene
+}
+
+/// 收起态栅栏的可见高度（只剩标题栏）。
+///
+/// `build_scene` 的收窄与占位框"是否还有信息量"的判定共用本公式：任何一处单独改动
+/// 都会让占位框在"该显示时不显示"或"占位≈可见仍在画"之间漂移。
+pub(crate) fn collapsed_title_h(theme: &Theme, appearance: &FenceAppearance) -> f32 {
+    let pad = appearance.padding * theme.scale;
+    (theme.title.size * 1.6 + theme.title_padding_bottom + 2.0 * pad).round()
+}
+
+/// 占位框提示色（与控制台 UI 同一强调色）：不随系统明暗主题变黑白，否则在
+/// 深色壁纸上会整个消失；蓝色虚线在明暗壁纸上都能读出"这是 UI 提示"。
+const RESERVED_RGB: [f32; 3] = [0.23, 0.51, 0.96];
+/// 描边 / 填充的基础不透明度（再乘场景 alpha，与栅栏同步淡出）。
+const RESERVED_STROKE_A: f32 = 0.55;
+const RESERVED_FILL_A: f32 = 0.07;
+
+/// 计算本帧要绘制的「原大小占位框」。
+///
+/// 两个来源（用户定的语义）：
+/// 1. **被拖动的栅栏**若处于收起态 → 画它自己的原矩形：说明"它仍按原尺寸占着这里"，
+///    所以屏幕下沿/邻居处的卡位不是 bug；
+/// 2. **拒绝了本次请求位置**的其它收起栅栏 → 画它的原矩形：回答"是谁挡住了我"。
+///
+/// 判据与碰撞求解严格同源：位置判定走 `magnet::blocks_move`（与 `settle_move`
+/// 内部同一谓词），矩形走 `Fence::collision_rect`（全工程唯一碰撞口径真源）。
+/// 纯函数（不触碰 Runtime / Win32），便于单测。
+///
+/// 已知的轻微过报：`blocks_move` 只看"这次请求与它够不够远"，而 `settle_move` 的推挤
+/// 方向有主次之分（贴屏幕边缘时推挤还可能被夹屏撤销）。因此极少数边缘情形会画出
+/// 一个其实没起决定作用的栅栏的框。取舍是刻意的——**宁可多提示一帧，也不漏报**：
+/// 漏报的代价是用户又撞上无法解释的空气墙，多提示的代价只是多一个淡框。
+pub(crate) fn reserved_frames(
+    desk: &Desk,
+    last_layout_h: &[f32],
+    hint: Option<&DragHint>,
+    theme: &Theme,
+    alpha: f32,
+) -> Vec<SceneReserved> {
+    let Some(hint) = hint else {
+        return Vec::new();
+    };
+    // 桌面切换淡出到不可见时不画：与栅栏同步，避免"栅栏没了框还在"
+    let a = alpha.clamp(0.0, 1.0);
+    if a <= 0.01 {
+        return Vec::new();
+    }
+    let layout_h = |i: usize| last_layout_h.get(i).copied().unwrap_or(0.0);
+    let mut out = Vec::new();
+
+    if let Some(f) = desk.fences.get(hint.fence) {
+        let rect = f.collision_rect(layout_h(hint.fence));
+        if worth_marking(f, &rect, theme) {
+            out.push(reserved_frame(hint.fence, rect, a));
+        }
+    }
+    for (i, f) in desk.fences.iter().enumerate() {
+        if i == hint.fence {
+            continue;
+        }
+        let rect = f.collision_rect(layout_h(i));
+        if !worth_marking(f, &rect, theme) {
+            continue;
+        }
+        if winbosk_core::magnet::blocks_move(&hint.requested, &rect, FENCE_GAP) {
+            out.push(reserved_frame(i, rect, a));
+        }
+    }
+    out
+}
+
+/// 是否值得为该栅栏画占位框。
+///
+/// 复合判定（缺一不可）：**收起** + 非侧边栏（Dock 不支持折叠）+ 几何有效 +
+/// 占位明显高于收起后的可见体（几乎相等时画出来只是噪音）。
+fn worth_marking(f: &Fence, rect: &Rect, theme: &Theme) -> bool {
+    f.collapsed
+        && f.appearance.layout != FenceLayout::Sidebar
+        && rect.w > 0.0
+        && rect.h > collapsed_title_h(theme, &f.appearance) + 4.0
+}
+
+/// 组装一个占位框（颜色在此统一派生，渲染层只管画）。
+fn reserved_frame(fence: usize, rect: Rect, alpha: f32) -> SceneReserved {
+    let tint = |a: f32| [RESERVED_RGB[0], RESERVED_RGB[1], RESERVED_RGB[2], a * alpha];
+    SceneReserved {
+        rect: RectF {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+        },
+        fence,
+        stroke_color: tint(RESERVED_STROKE_A),
+        fill_color: Some(tint(RESERVED_FILL_A)),
+    }
+}
+
+/// 组装图标拖动期间的场景状态（幽灵 / 目标栅栏高亮 / 插入位）。
+///
+/// 几何一律取自**本帧已排布好的场景**（禁止另算第二份栅栏几何——两份几何一旦不同源，
+/// 插入位就会画在松手后落不到的地方）：幽灵是光标居中的图标方框；插入位取目标栅栏里
+/// 插入点两侧图标中心连线的中点，首/末位沿主排布方向外推一格。
+///
+/// 落点是否可提交走 App 层的 `icon_drop_allowed`（**与松手时真正执行的判定同一个函数**），
+/// 拒绝时渲染层把高亮画成红色，用户在被拒之前就能看出来。
+fn icon_drag_overlay(rt: &Runtime, scene: &Scene) -> Option<SceneIconDrag> {
+    let d = rt.icon_drag.as_ref()?;
+    let src = scene.fences.get(d.from_fence)?;
+    // 被拖图标在本帧的布局下标（按 id 反查，见 `drag_source` 处的注释）
+    let at = rt
+        .desk
+        .fences
+        .get(d.from_fence)?
+        .icon_ids
+        .iter()
+        .position(|x| x == &d.id)?;
+    let icon = src.icons.get(at)?;
+    let size = icon.size;
+    let mut out = SceneIconDrag {
+        from_fence: d.from_fence,
+        to_fence: None,
+        target_rect: None,
+        slot: None,
+        ghost: RectF {
+            x: d.cursor.0 - size / 2.0,
+            y: d.cursor.1 - size / 2.0,
+            w: size,
+            h: size,
+        },
+        bitmap_id: icon.bitmap_id,
+        allowed: false,
+    };
+    if let Some(t) = d.to_fence {
+        if let Some(tf) = scene.fences.get(t) {
+            out.to_fence = Some(t);
+            out.target_rect = Some(RectF {
+                x: tf.x,
+                y: tf.y,
+                w: tf.width,
+                h: tf.height,
+            });
+            // 落点就是源栅栏时，被拖图标已在画面上隐藏 → 它的原位不参与插入位插值
+            let skip = (t == d.from_fence).then_some(at);
+            out.slot = insertion_slot(tf, d.to_index, size, skip);
+            out.allowed = icon_drop_allowed(rt, d.from_fence, t, &d.id);
+        }
+    }
+    Some(out)
+}
+
+/// 目标栅栏里的插入位矩形（尺寸 = 一个图标）。
+///
+/// `skip` = 源栅栏里被隐藏的图标下标（仅目标 = 源栅栏时有效）：它已从画面上消失，
+/// 不能拿它的位置参与插值，否则同栅栏换位的插入位会偏一格。
+///
+/// 边界情形：
+/// - 目标为空栅栏 → 落在内容区左上角的第一个格位；
+/// - 插到最前/最后 → 沿主排布方向（相邻图标步距较大的那一轴）外推一格。
+fn insertion_slot(f: &SceneFence, index: usize, size: f32, skip: Option<usize>) -> Option<RectF> {
+    let centers: Vec<(f32, f32)> = f
+        .icons
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| skip != Some(*i))
+        .map(|(_, ic)| (ic.x + ic.size / 2.0, ic.y + ic.size / 2.0))
+        .collect();
+    if centers.is_empty() {
+        return Some(RectF {
+            x: f.content_left,
+            y: f.content_top,
+            w: size,
+            h: size,
+        });
+    }
+    let n = centers.len();
+    let at = index.min(n);
+    let (dx, dy) = if n >= 2 {
+        (centers[1].0 - centers[0].0, centers[1].1 - centers[0].1)
+    } else {
+        (0.0, 0.0)
+    };
+    // 只有一个图标时步距不可测，按图标尺寸外推
+    let (ox, oy) = if dx.abs() >= dy.abs() {
+        (dx.abs().max(size * 1.2), 0.0)
+    } else {
+        (0.0, dy.abs().max(size * 1.2))
+    };
+    let (cx, cy) = if at == 0 {
+        (centers[0].0 - ox, centers[0].1 - oy)
+    } else if at == n {
+        (centers[n - 1].0 + ox, centers[n - 1].1 + oy)
+    } else {
+        (
+            (centers[at - 1].0 + centers[at].0) / 2.0,
+            (centers[at - 1].1 + centers[at].1) / 2.0,
+        )
+    };
+    Some(RectF {
+        x: cx - size / 2.0,
+        y: cy - size / 2.0,
+        w: size,
+        h: size,
+    })
+}
+
+/// 控制中心设置页面自适应总高度（物理像素）。
+///
+/// 包含：标题栏 + 间隙 (8) + 标题说明区 (48) + N 行卡片（N = `HotkeyAction::ALL.len()`，
+/// 每行 52 高、行间 8）+ 间隙 (8) + 底部按钮 (CONSOLE_ADD_BTN_H) + 底部留白 (12)。
+/// 行数**必须**由动作总数推导：写死行数会在新增热键动作时让最后一行与底部按钮重叠。
+pub(crate) fn console_settings_height(s: f32) -> f32 {
+    let title_h = CONSOLE_TITLE_H * s;
+    let header_gap = 8.0 * s;
+    let header_desc_h = 48.0 * s;
+    let row_n = winbosk_core::hotkey::HotkeyAction::ALL.len() as f32;
+    let rows_h = row_n * 52.0 * s + (row_n - 1.0) * 8.0 * s;
+    let btn_gap = 8.0 * s;
+    let btn_h = CONSOLE_ADD_BTN_H * s;
+    let bottom_pad = 12.0 * s;
+    title_h + header_gap + header_desc_h + rows_h + btn_gap + btn_h + btn_gap + btn_h + bottom_pad
+}
+
+/// 控制中心内容总高度（自适应，不含屏幕夹制）。
+pub(crate) fn console_full_height(desk: &Desk, selected: usize, s: f32, page: ConsolePage) -> f32 {
+    if page == ConsolePage::Settings {
+        console_settings_height(s)
+    } else {
+        let title_h = CONSOLE_TITLE_H * s;
+        let rows = desk.fences.len().min(CONSOLE_FENCE_MAX_ROWS) as f32 * CONSOLE_FENCE_ROW_H * s;
+        // 详情区行数按选中栅栏的布局/风格动态计算（与 build_console 保持一致）
+        let detail_rows = detail_visible_rows(desk, selected, s);
+        let left_h = title_h
+            + 8.0 * s
+            + rows
+            + 8.0 * s
+            + detail_rows
+            + 8.0 * s
+            // 添加 / 一键整理 / 删除栅栏 / 切换桌面 四个等宽按钮 + 三处间隙
+            + CONSOLE_ADD_BTN_H * s * 4.0
+            + 8.0 * s * 3.0
+            // 底部留白：面板正好包住内容（`build_console` 的最后一个按钮即止于此）。
+            // 曾误写成 `12.0 * s.clamp(CONSOLE_MIN_H * s, CONSOLE_MAX_H * s)`，clamp 下限
+            // 恒为 170·s，等于给面板底部凭空多加约 170px 空白。
+            + 12.0 * s;
+        if desk.console_advanced && !desk.fences.is_empty() {
+            // 双栏高级模式：右侧规则工作台必须有充足空间容纳规则配置与说明卡片
+            left_h.max(440.0 * s)
+        } else {
+            left_h
+        }
+    }
+}
+
+/// 详情区可见行的总高度（行高 30px × 可见行数 + 标签行 24px）。
+///
+/// 必须按**当前选中栅栏**计算，与 `build_console` 渲染的栅栏严格同源——按"第一个非空栅栏"
+/// 猜测会在选中栅栏的布局/风格不同时算错高度，导致底部按钮压住详情内容。
+fn detail_visible_rows(desk: &Desk, selected: usize, s: f32) -> f32 {
+    let (layout, style) = desk
+        .fences
+        .get(selected.min(desk.fences.len().saturating_sub(1)))
+        .map(|f| (f.appearance.layout, f.appearance.bg_style))
+        .unwrap_or((FenceLayout::Grid, FenceStyle::Glass));
+    let mut n = 1usize; // 布局选择（始终显示）
+    if layout != FenceLayout::List {
+        n += 1; // 图标大小（列表布局隐藏）
+    }
+    n += 1; // 背景风格（始终显示）
+    if style != FenceStyle::Blur {
+        n += 1; // 背景色调（模糊时隐藏）
+    }
+    n += 2; // 文件位置：值行（标签+状态标签+真实路径，零按钮）+ 动作行（后果提示+动作按钮）
+    if layout == FenceLayout::Sidebar {
+        n += 1; // 侧边栏位置（仅侧边栏）
+    }
+    n += 1; // 分类规则（始终显示）
+    24.0 * s + n as f32 * 30.0 * s
+}
+
+/// 控制中心面板矩形（物理像素，虚拟屏幕坐标）。
+///
+/// 未拖动过（`console_pos == None`）时默认摆右上角；拖动后记住 `console_pos`
+/// 左上角。高度按 `panel` 进度插值（0 = 完全不渲染，1 = 完整面板；回弹期间
+/// 可 >1，按 `CONSOLE_OVERSHOOT_MAX` 截断）——顶边锚定、底边下移，形成
+/// 「卷帘揭示」：绘制侧按面板矩形整体裁切，内容自上而下露出。
+///
+/// 尺寸策略：未手动缩放过（`console_size == None`）时宽取 `CONSOLE_W`、高取
+/// `console_full_height`（标签页/内容自适应）；用户拖边缘/角缩放后
+/// `console_size` 落为具体宽高（钳制在最小尺寸之上），之后高度固定、超出滚动。
+pub(crate) fn console_geometry(
+    desk: &Desk,
+    theme: &Theme,
+    vw: f32,
+    vh: f32,
+    panel: f32,
+    selected: usize,
+    page: ConsolePage,
+) -> RectF {
+    let s = theme.scale;
+    let margin = CONSOLE_MARGIN * s;
+    // 可用高度：屏幕高度减去上下边距，并预留展开回弹的过冲余量——过冲高峰
+    // （`CONSOLE_OVERSHOOT_MAX`）不应把面板底边推出屏幕，否则末帧会画到屏外。
+    let avail = (vh - 2.0 * margin).max(CONSOLE_MIN_H * s);
+    // 可用高度预留展开回弹的过冲余量（过冲高峰不应把面板底边推出屏幕），
+    // 同时保证不小于最小高度——否则小屏上 `avail` 被最小值兜底时，
+    // 除以过冲系数后反而低于最小高，面板会被压扁。
+    let max_h = (avail / CONSOLE_OVERSHOOT_MAX).max(CONSOLE_MIN_H * s);
+    let auto_full_h = console_full_height(desk, selected, s, page)
+        .min(CONSOLE_MAX_H * s)
+        .min(max_h);
+    let target_w = if desk.console_advanced {
+        CONSOLE_ADVANCED_W * s
+    } else {
+        CONSOLE_W * s
+    };
+    let (w, full_h) = match desk.console_size {
+        Some((_w, h)) if page != ConsolePage::Settings => {
+            (target_w, h.clamp(CONSOLE_MIN_H * s, max_h))
+        }
+        _ => (target_w, auto_full_h),
+    };
+    // 允许小幅过冲（展开回弹），CONSOLE_OVERSHOOT_MAX 上限避免面板瞬时过高
+    let h = full_h * panel.clamp(0.0, CONSOLE_OVERSHOOT_MAX);
+    let (x, y) = match desk.console_pos {
+        Some(p) => (
+            p.x.min((vw - w - 8.0 * s).max(8.0 * s)),
+            p.y.min((vh - h - 8.0 * s).max(8.0 * s)),
+        ),
+        None => ((vw - w - margin).max(8.0 * s), margin.max(8.0 * s)),
+    };
+    RectF { x, y, w, h }
+}
+
+/// 计算确保选中的栅栏在控制中心列表中完全可见所需的新滚动偏移
+pub(crate) fn compute_fence_scroll_for_selection(
+    curr_scroll: f32,
+    selected_fence: usize,
+    fence_n: usize,
+    scale: f32,
+) -> f32 {
+    let row_h_f = CONSOLE_FENCE_ROW_H * scale;
+    let fence_shown = fence_n.min(CONSOLE_FENCE_MAX_ROWS);
+    if fence_n <= fence_shown {
+        return 0.0;
+    }
+    let fence_scroll_max = (fence_n - fence_shown) as f32 * row_h_f;
+    let sel = selected_fence.min(fence_n.saturating_sub(1));
+    let row_top = sel as f32 * row_h_f;
+    let row_bottom = (sel + 1) as f32 * row_h_f;
+    let view_top = curr_scroll;
+    let view_bottom = curr_scroll + fence_shown as f32 * row_h_f;
+
+    let mut new_scroll = curr_scroll;
+    if row_top < view_top {
+        new_scroll = row_top;
+    } else if row_bottom > view_bottom {
+        new_scroll = row_bottom - fence_shown as f32 * row_h_f;
+    }
+    new_scroll.clamp(0.0, fence_scroll_max)
+}
+
+/// 确保当前选中的栅栏在控制中心列表中完全可见
+pub(crate) fn ensure_selected_fence_visible(rt: &mut Runtime) {
+    rt.fence_scroll = compute_fence_scroll_for_selection(
+        rt.fence_scroll,
+        rt.selected_fence,
+        rt.desk.fences.len(),
+        rt.theme.scale,
+    );
+}
+
+/// 删除栅栏时规范化修正选中的栅栏下标
+pub(crate) fn adjust_selected_fence_on_delete(
+    selected_fence: usize,
+    deleted_idx: usize,
+    total_after_delete: usize,
+) -> usize {
+    let mut res = selected_fence;
+    if deleted_idx < res {
+        res = res.saturating_sub(1);
+    }
+    res.min(total_after_delete.saturating_sub(1))
+}
+
+/// 「文件位置」两行几何（值行 + 动作行）。
+///
+/// 字段语义与 `SceneFenceDetail` 一一对应，且**逐条写死可点性**：
+/// `tag` 是"看的东西"（状态，不是按钮）；值行里只有 `path_hit` 可点（= 打开落地目录）；
+/// `change` / `reset` 是动作行的两个按钮。命中表由 [`storage_zones`] 构造，见其文档。
+pub(crate) struct StorageRow {
+    /// 值行整行矩形（仅作标签列锚点，不参与命中）。
+    pub value_row: RectF,
+    /// 值行：状态标签（模式）。
+    pub tag: RectF,
+    /// 值行：路径文本区（仅绘制，决定省略预算与裁剪框）。
+    pub path: RectF,
+    /// 值行：中段省略后的路径文本。
+    pub path_text: String,
+    /// 值行：**路径文本的命中区**（贴着实际字形，不是整段预算）——点它 = 在资源管理器里打开。
+    ///
+    /// 刻意**不**给「打开」按钮：本行的路径预算是 `d.w − 105.2·s`（约 190·s），一个 40·s 的按钮会
+    /// 吃掉它的 1/4（实测默认宽下库路径从"完整显示"退化成 23/40 字）。让路径自己承担这个动作，
+    /// 既回收了全部宽度，又让值行成为零按钮的纯信息行。
+    /// 命中区贴字形而非铺满整段，是为了守住"看着能点的都能点"——铺满会让文字右侧的空白也吞点击。
+    pub path_hit: RectF,
+    /// 动作行：「更改文件位置…」按钮（右端对齐）。
+    pub change: RectF,
+    /// 动作行：「恢复默认」按钮（`h <= 0.0` = 不出现）。
+    pub reset: RectF,
+    /// 动作行：后果提示文本区（`h <= 0.0` = 不绘制）。
+    pub hint: RectF,
+    /// 动作行：后果提示文案（空串 = 当前宽度放不下，整条不绘制）。
+    pub hint_text: String,
+    /// 值行内 detail 字号文字（行标签 / 状态标签 / 路径）的**共用顶线**（物理像素）。
+    pub text_top: f32,
+}
+
+/// 状态标签高（DIP）、标签内边距（DIP）、标签与路径间距（DIP）。
+const STORAGE_TAG_H: f32 = 18.0;
+const STORAGE_TAG_PAD_X: f32 = 6.0;
+const STORAGE_TAG_GAP: f32 = 6.0;
+/// 动作按钮的左右内边距（DIP）与按钮间距（DIP）。
+const STORAGE_BTN_PAD_X: f32 = 8.0;
+const STORAGE_BTN_GAP: f32 = 6.0;
+/// 详情区行距（物理像素口径 = 30 × s），与 `row_y` 同源。
+const STORAGE_ROW_PITCH: f32 = 30.0;
+
+/// 计算「文件位置」两行几何（纯函数，可在内存中单测"空间互斥"）。
+///
+/// 排版契约（用户能读懂的版本）：
+/// - 第一行（值行）：`文件位置 | [模式标签] 真实路径`（**零按钮**；路径本身是「打开目录」的热区）
+/// - 第二行（动作行）：`后果提示 ……………… [更改文件位置…] [恢复默认]`
+///
+/// 宽度**全部由文案实测宽度推出**（`estimate_width` + 常数 × s），不再硬编码，
+/// 这样改文案或改 DPI 都不会挤字；放不下时按"提示语整条不画"优雅降级，绝不截半个字。
+///
+/// `detail_font` 口径 = `theme.console_label.size * DETAIL_SIZE_RATIO`（与 `formats.console_detail`
+/// 同源，已按 DPI 缩放）。控制中心文字整体比桌面栅栏大两号，宽度预算必须用控制中心
+/// 自己的字号，否则按钮/路径预算会比实际绘制偏小。
+pub(crate) fn storage_row_geometry(
+    detail: &RectF,
+    row_y: f32,
+    kind: StorageKind,
+    can_reset: bool,
+    path: &str,
+    theme: &Theme,
+) -> StorageRow {
+    let s = theme.scale;
+    let btn_h = theme.controls.btn_medium_h;
+    let label_w = 40.0 * s;
+    let detail_font = theme.console_label.size * DETAIL_SIZE_RATIO;
+    let label_font = theme.console_label.size;
+    let inner_left = detail.x + 2.0 * s;
+    let inner_right = detail.x + detail.w - 2.0 * s;
+    // 值行 / 动作行内所有 detail 字号文字的**共用顶线**：按「行高 = 1.6 × 字号」把一行文字
+    // 在 btn_medium_h 高的行带里垂直居中（1.6 与 `TextFormats` 造格式、`draw_segmented_button` 给
+    // label 字号居中的口径一致，只是这里字号换成 detail）。
+    // **必须同源**：行标签、状态标签、路径三段此前各自写死偏移，同字号却落在三条基线上，
+    // 整行看上去是歪的——这正是本次要修的病，不要再让任何一段自带偏移。
+    let text_dy = (btn_h - detail_font * 1.6) / 2.0;
+    let text_top = row_y + text_dy;
+
+    // —— 值行 ——
+    let value_row = RectF {
+        x: detail.x,
+        y: row_y,
+        w: detail.w,
+        h: btn_h,
+    };
+    let tag_w = winbosk_core::storage::chip_width(kind.badge(), detail_font, STORAGE_TAG_PAD_X * s);
+    let tag = RectF {
+        x: detail.x + label_w,
+        y: row_y + (btn_h - STORAGE_TAG_H * s) / 2.0,
+        w: tag_w,
+        h: STORAGE_TAG_H * s,
+    };
+    let path_x = tag.x + tag.w + STORAGE_TAG_GAP * s;
+    let path_w = (inner_right - path_x).max(0.0);
+    let path_rect = RectF {
+        x: path_x,
+        y: text_top,
+        w: path_w,
+        h: STORAGE_TAG_H * s,
+    };
+    let path_text =
+        winbosk_core::storage::elide_middle(path, (path_w - 2.0 * s).max(0.0), detail_font);
+    // 命中区贴实际字形宽度（不超过绘制框）：短路径不会留出一片"看不见但能点"的空白。
+    let path_hit = RectF {
+        x: path_x,
+        y: text_top,
+        w: winbosk_core::text::estimate_width(&path_text, detail_font).min(path_w),
+        h: STORAGE_TAG_H * s,
+    };
+
+    // —— 动作行（右端对齐；恢复默认在左，更改文件位置在右）——
+    let action_y = row_y + STORAGE_ROW_PITCH * s;
+    let change_w = winbosk_core::text::estimate_width("更改文件位置…", label_font)
+        + 2.0 * STORAGE_BTN_PAD_X * s;
+    let change = RectF {
+        x: inner_right - change_w,
+        y: action_y,
+        w: change_w,
+        h: btn_h,
+    };
+    let reset_w =
+        winbosk_core::text::estimate_width("恢复默认", label_font) + 2.0 * STORAGE_BTN_PAD_X * s;
+    let reset = if can_reset {
+        let x = change.x - STORAGE_BTN_GAP * s - reset_w;
+        // 出现前先确认左端不与标签列打架；面板被拖到极限时宁可不出这个次要按钮。
+        if x >= inner_left + label_w + STORAGE_BTN_GAP * s {
+            RectF {
+                x,
+                y: action_y,
+                w: reset_w,
+                h: btn_h,
+            }
+        } else {
+            RectF::default()
+        }
+    } else {
+        RectF::default()
+    };
+    let actions_left = if reset.h > 0.0 { reset.x } else { change.x };
+    let hint_w = (actions_left - STORAGE_BTN_GAP * s - inner_left).max(0.0);
+    let hint_text = winbosk_core::storage::hint_text(kind, hint_w, detail_font);
+    let hint = if hint_text.is_empty() {
+        RectF::default()
+    } else {
+        RectF {
+            x: inner_left,
+            y: action_y + text_dy,
+            w: hint_w,
+            h: STORAGE_TAG_H * s,
+        }
+    };
+
+    StorageRow {
+        value_row,
+        tag,
+        path: path_rect,
+        path_text,
+        path_hit,
+        change,
+        reset,
+        hint,
+        hint_text: hint_text.to_string(),
+        text_top,
+    }
+}
+
+/// 「文件位置」行的命中区（值行路径 + 动作行两个按钮）。
+///
+/// 抽成纯函数是为了让单测能**直接断言命中表**——几何自洽（矩形不重叠、文字不溢出）
+/// 不等于"能点的正好是画出来的"：前者由 `storage_row_geometry_*` 覆盖，后者只能在这里断言。
+///
+/// 契约（改这一行的人请照做）：
+/// - 值行**只有**路径一个热区（`OpenStoragePath`）——状态标签是状态不是按钮，**不入表**；
+/// - 「更改文件位置…」常驻（破坏性动作只走它，且它必须始终可见）；
+/// - 「恢复默认」只在非零矩形时入表（零矩形 = 不出现，杜绝死按钮）。
+pub(crate) fn storage_zones(
+    path_hit: RectF,
+    change: RectF,
+    reset: RectF,
+) -> Vec<(ConsoleZone, RectF)> {
+    let mut zones = Vec::new();
+    if path_hit.w > 0.0 && path_hit.h > 0.0 {
+        zones.push((ConsoleZone::OpenStoragePath, path_hit));
+    }
+    zones.push((ConsoleZone::ChangeStoragePath, change));
+    if reset.w > 0.0 && reset.h > 0.0 {
+        zones.push((ConsoleZone::ResetStoragePath, reset));
+    }
+    zones
+}
+
+/// 芯片流式排版结果
+struct ChipsLayout {
+    chips: Vec<(String, RectF, RectF)>,
+    add_btn: RectF,
+    edit_rect: Option<RectF>,
+    end_y: f32,
+}
+
+/// 计算带「添加」按钮的标签芯片流式自动换行排版
+#[allow(clippy::too_many_arguments)]
+fn layout_chips_with_add(
+    items: &[String],
+    add_btn_text: &str,
+    is_editing: bool,
+    start_x: f32,
+    start_y: f32,
+    max_w: f32,
+    controls: &ControlMetrics,
+    scale: f32,
+    font_size: f32,
+) -> ChipsLayout {
+    let chip_h = controls.chip_h;
+    let row_pitch = chip_h + 4.0 * scale;
+    let gap = 5.0 * scale;
+    let del_w = 14.0 * scale;
+    let mut chips = Vec::with_capacity(items.len());
+    let mut cur_x = start_x;
+    let mut cur_y = start_y;
+
+    for item in items {
+        let text_w = winbosk_core::text::estimate_width(item, font_size);
+        let chip_w = text_w + del_w + 14.0 * scale;
+        if cur_x + chip_w > start_x + max_w && cur_x > start_x {
+            cur_x = start_x;
+            cur_y += row_pitch;
+        }
+        let chip_rect = RectF {
+            x: cur_x,
+            y: cur_y,
+            w: chip_w,
+            h: chip_h,
+        };
+        let del_btn = RectF {
+            x: cur_x + chip_w - del_w - 4.0 * scale,
+            y: cur_y,
+            w: del_w + 4.0 * scale,
+            h: chip_h,
+        };
+        chips.push((item.clone(), chip_rect, del_btn));
+        cur_x += chip_w + gap;
+    }
+
+    if is_editing {
+        let edit_w = (140.0 * scale).min(max_w);
+        if cur_x + edit_w > start_x + max_w && cur_x > start_x {
+            cur_x = start_x;
+            cur_y += row_pitch;
+        }
+        let edit_rect = RectF {
+            x: cur_x,
+            y: cur_y,
+            w: edit_w,
+            h: chip_h,
+        };
+        let end_y = cur_y + chip_h;
+        ChipsLayout {
+            chips,
+            add_btn: RectF::default(),
+            edit_rect: Some(edit_rect),
+            end_y,
+        }
+    } else {
+        let add_w = winbosk_core::text::estimate_width(add_btn_text, font_size) + 16.0 * scale;
+        if cur_x + add_w > start_x + max_w && cur_x > start_x {
+            cur_x = start_x;
+            cur_y += row_pitch;
+        }
+        let add_btn = RectF {
+            x: cur_x,
+            y: cur_y,
+            w: add_w,
+            h: chip_h,
+        };
+        let end_y = cur_y + chip_h;
+        ChipsLayout {
+            chips,
+            add_btn,
+            edit_rect: None,
+            end_y,
+        }
+    }
+}
+
+/// 计算只读标签芯片的流式自动换行排版（无删除按钮、无添加按钮）
+fn layout_readonly_chips(
+    items: &[&str],
+    start_x: f32,
+    start_y: f32,
+    max_w: f32,
+    chip_h: f32,
+    scale: f32,
+    font_size: f32,
+) -> (Vec<(String, RectF)>, f32) {
+    let row_pitch = chip_h + 4.0 * scale;
+    let gap = 5.0 * scale;
+    let mut chips = Vec::with_capacity(items.len());
+    let mut cur_x = start_x;
+    let mut cur_y = start_y;
+
+    for item in items {
+        let text_w = winbosk_core::text::estimate_width(item, font_size);
+        let chip_w = (text_w + 16.0 * scale).max(28.0 * scale);
+        if cur_x + chip_w > start_x + max_w && cur_x > start_x {
+            cur_x = start_x;
+            cur_y += row_pitch;
+        }
+        let chip_rect = RectF {
+            x: cur_x,
+            y: cur_y,
+            w: chip_w,
+            h: chip_h,
+        };
+        chips.push((item.to_string(), chip_rect));
+        cur_x += chip_w + gap;
+    }
+
+    let end_y = if chips.is_empty() {
+        start_y
+    } else {
+        cur_y + chip_h
+    };
+    (chips, end_y)
+}
+
+/// 设置页面布局算法（纯几何计算，不依赖窗口与渲染句柄）。
+pub(crate) fn layout_settings_page(
+    panel: RectF,
+    s: f32,
+    detail_font: f32,
+    desk: &Desk,
+    recording_hotkey: Option<HotkeyAction>,
+    hotkey_conflicts: &std::collections::HashMap<HotkeyAction, String>,
+    controls: &ControlMetrics,
+) -> SceneSettingsPage {
+    let title_h = CONSOLE_TITLE_H * s;
+    let content_top = panel.y + title_h;
+    let pad = CONSOLE_PAD * s;
+
+    // 容器全宽：吃满面板可用全宽，严禁使用 left_w
+    let settings_w = panel.w - 2.0 * pad;
+
+    let sp_rect = RectF {
+        x: panel.x,
+        y: content_top,
+        w: panel.w,
+        h: panel.h - title_h,
+    };
+
+    let row_w = settings_w;
+    let row_h = 52.0 * s;
+    let row_gap = 8.0 * s;
+    let start_y = content_top + 8.0 * s + 48.0 * s;
+    let key_h = controls.icon_btn_size;
+
+    let mut rows = Vec::with_capacity(HotkeyAction::ALL.len());
+    for (idx, &action) in HotkeyAction::ALL.iter().enumerate() {
+        let row_y = start_y + idx as f32 * (row_h + row_gap);
+        let row_rect = RectF {
+            x: panel.x + pad,
+            y: row_y,
+            w: row_w,
+            h: row_h,
+        };
+
+        let action_str = desk.settings.hotkeys.get_action(action);
+        let key_text = match action_str {
+            Some(str_val) => HotkeyBinding::parse(str_val)
+                .map(|b| b.display_string())
+                .unwrap_or_else(|| str_val.to_string()),
+            None => String::new(),
+        };
+
+        // 药丸按钮内容自适应
+        let est_text_w = winbosk_core::text::estimate_width(&key_text, detail_font);
+        let key_w = (est_text_w + 24.0 * s).clamp(88.0 * s, 160.0 * s);
+
+        // 按需排布清除按钮
+        let right_pad = 10.0 * s;
+        let row_right = row_rect.x + row_rect.w;
+        let (key_x, clear_btn) = if action_str.is_some() {
+            let clear_w = controls.chip_h;
+            let clear_gap = 6.0 * s;
+            let cb_x = row_right - right_pad - clear_w;
+            let cb = RectF {
+                x: cb_x,
+                y: row_rect.y + (row_h - clear_w) / 2.0,
+                w: clear_w,
+                h: clear_w,
+            };
+            let kx = cb_x - clear_gap - key_w;
+            (kx, Some(cb))
+        } else {
+            let kx = row_right - right_pad - key_w;
+            (kx, None)
+        };
+
+        let key_btn = RectF {
+            x: key_x,
+            y: row_rect.y + (row_h - key_h) / 2.0,
+            w: key_w,
+            h: key_h,
+        };
+
+        // 物理安全隔离槽：左侧文本区域最大右边界，文本绝对无法碰触右侧药丸
+        let _text_max_right = key_x - 14.0 * s;
+
+        let is_recording = recording_hotkey == Some(action);
+        let conflict_msg = hotkey_conflicts.get(&action).cloned();
+
+        rows.push(SceneHotkeyRow {
+            action,
+            label: action.label(),
+            desc: action.description(),
+            rect: row_rect,
+            key_btn,
+            clear_btn,
+            key_text,
+            is_recording,
+            conflict_msg,
+        });
+    }
+
+    // 行数 = 热键动作总数（`rows` 与 `HotkeyAction::ALL` 一一对应，见上面的循环）。
+    // 口径与 `console_settings_height` 同源，新增动作只需改 `HotkeyAction::ALL`。
+    let row_count = HotkeyAction::ALL.len() as f32;
+    let rows_bottom_y = start_y + row_count * row_h + (row_count - 1.0) * row_gap;
+    let btn_y = rows_bottom_y + 8.0 * s;
+    let btn_w = settings_w;
+    let btn_h = controls.btn_large_h;
+    let btn_gap = 8.0 * s;
+    let reset_w = ((btn_w - btn_gap) * 0.38).round();
+    let back_w = btn_w - btn_gap - reset_w;
+    let reset_default_btn = RectF {
+        x: panel.x + pad,
+        y: btn_y,
+        w: reset_w,
+        h: btn_h,
+    };
+    let back_btn = RectF {
+        x: reset_default_btn.x + reset_w + btn_gap,
+        y: btn_y,
+        w: back_w,
+        h: btn_h,
+    };
+    let quit_y = btn_y + btn_h + btn_gap;
+    let quit_btn = RectF {
+        x: panel.x + pad,
+        y: quit_y,
+        w: btn_w,
+        h: btn_h,
+    };
+
+    SceneSettingsPage {
+        rect: sp_rect,
+        rows,
+        reset_default_btn,
+        back_btn,
+        quit_btn,
+    }
+}
+
+/// 供 `layout_rule_editor` 归组传参，避免长参数列表。
+pub(crate) struct RuleEditorLayoutCtx<'a> {
+    pub f: &'a Fence,
+    pub sel: usize,
+    pub panel: RectF,
+    pub left_w: f32,
+    pub content_top: f32,
+    pub title_h: f32,
+    pub theme: &'a Theme,
+    pub edit_target: Option<EditTarget>,
+}
+
+/// 高级模式规则工作台布局算法（纯几何计算，不依赖 Direct2D/DirectWrite 句柄）。
+pub(crate) fn layout_rule_editor(ctx: RuleEditorLayoutCtx<'_>) -> SceneRuleEditor {
+    let RuleEditorLayoutCtx {
+        f,
+        sel,
+        panel,
+        left_w,
+        content_top,
+        title_h,
+        theme,
+        edit_target,
+    } = ctx;
+    let s = theme.scale;
+    let rule = f.rule.clone().unwrap_or_default();
+    let right_x = panel.x + left_w;
+    let right_w = panel.w - left_w;
+    let pad = CONSOLE_PAD * s;
+    let rx = right_x + pad;
+    let rw = (right_w - 2.0 * pad).max(10.0);
+    let mut cur_y = content_top + 8.0 * s;
+
+    // 1. 标题与总开关
+    let toggle_w = 96.0 * s;
+    let toggle_h = theme.controls.btn_medium_h;
+    let toggle_btn = RectF {
+        x: rx + rw - toggle_w,
+        y: cur_y,
+        w: toggle_w,
+        h: toggle_h,
+    };
+    cur_y = toggle_btn.y + toggle_btn.h + 8.0 * s;
+
+    // 2. 预设分类快速选用 + 自定义
+    let presets = [
+        (None, "无"),
+        (Some(winbosk_core::model::CategoryPreset::Apps), "应用"),
+        (Some(winbosk_core::model::CategoryPreset::Documents), "文档"),
+        (Some(winbosk_core::model::CategoryPreset::Media), "媒体"),
+        (Some(winbosk_core::model::CategoryPreset::Archives), "压缩"),
+        (Some(winbosk_core::model::CategoryPreset::Folders), "目录"),
+    ];
+    let p_gap = 4.0 * s;
+    let p_w = ((rw - 6.0 * p_gap) / 7.0).max(20.0);
+    let mut preset_chips = Vec::new();
+    for (i, (p, _)) in presets.iter().enumerate() {
+        let pr = RectF {
+            x: rx + i as f32 * (p_w + p_gap),
+            y: cur_y,
+            w: p_w,
+            h: theme.controls.chip_h,
+        };
+        let is_sel = !rule.is_custom_mode() && rule.preset == *p;
+        preset_chips.push((*p, pr, is_sel));
+    }
+    let custom_chip_rect = RectF {
+        x: rx + 6.0 * (p_w + p_gap),
+        y: cur_y,
+        w: p_w,
+        h: theme.controls.chip_h,
+    };
+    let custom_chip = (custom_chip_rect, rule.is_custom_mode());
+    cur_y = custom_chip_rect.y + custom_chip_rect.h + 12.0 * s;
+
+    let is_custom = rule.is_custom_mode();
+    let mut edit_custom_btn = None;
+    let mut readonly_chips = Vec::new();
+    let mut readonly_desc = None;
+    let mut ext_chips = Vec::new();
+    let mut add_ext_btn = RectF::default();
+    let mut exclude_chips = Vec::new();
+    let mut add_exclude_btn = RectF::default();
+    let mut pattern_chips = Vec::new();
+    let mut add_pattern_btn = RectF::default();
+    let mut active_edit_rect = None;
+
+    if is_custom {
+        let is_editing_ext =
+            matches!(edit_target, Some(EditTarget::RuleExtension { fence }) if fence == sel);
+        let is_editing_exclude =
+            matches!(edit_target, Some(EditTarget::RuleExcludeExtension { fence }) if fence == sel);
+        let is_editing_pattern =
+            matches!(edit_target, Some(EditTarget::RulePattern { fence }) if fence == sel);
+
+        // 3. 后缀白名单芯片列表 + 添加按钮
+        let ext_layout = layout_chips_with_add(
+            &rule.custom_extensions,
+            "＋ 添加后缀",
+            is_editing_ext,
+            rx,
+            cur_y + 16.0 * s,
+            rw,
+            &theme.controls,
+            s,
+            theme.console_label.size * DETAIL_SIZE_RATIO,
+        );
+        cur_y = ext_layout.end_y + 10.0 * s;
+        ext_chips = ext_layout.chips;
+        add_ext_btn = ext_layout.add_btn;
+
+        // 4. 排除黑名单后缀芯片列表 + 添加按钮
+        let exclude_layout = layout_chips_with_add(
+            &rule.exclude_extensions,
+            "＋ 排除后缀",
+            is_editing_exclude,
+            rx,
+            cur_y + 16.0 * s,
+            rw,
+            &theme.controls,
+            s,
+            theme.console_label.size * DETAIL_SIZE_RATIO,
+        );
+        cur_y = exclude_layout.end_y + 10.0 * s;
+        exclude_chips = exclude_layout.chips;
+        add_exclude_btn = exclude_layout.add_btn;
+
+        // 5. 通配符模式芯片列表 + 添加按钮
+        let pattern_layout = layout_chips_with_add(
+            &rule.name_patterns,
+            "＋ 添加通配符",
+            is_editing_pattern,
+            rx,
+            cur_y + 16.0 * s,
+            rw,
+            &theme.controls,
+            s,
+            theme.console_label.size * DETAIL_SIZE_RATIO,
+        );
+        cur_y = pattern_layout.end_y + 12.0 * s;
+        pattern_chips = pattern_layout.chips;
+        add_pattern_btn = pattern_layout.add_btn;
+
+        active_edit_rect = ext_layout
+            .edit_rect
+            .or(exclude_layout.edit_rect)
+            .or(pattern_layout.edit_rect);
+    } else {
+        // 预设模式或无规则模式：标题栏（左侧文字标签 + 右侧【✏️ 编辑规则】按钮）
+        let edit_btn_w = 90.0 * s;
+        let edit_btn_h = theme.controls.chip_h;
+        let eb = RectF {
+            x: rx + rw - edit_btn_w,
+            y: cur_y,
+            w: edit_btn_w,
+            h: edit_btn_h,
+        };
+        edit_custom_btn = Some(eb);
+        // 推进光标：跳过标题行并预留垂直间距
+        cur_y = eb.y + eb.h + 8.0 * s;
+
+        match rule.preset {
+            Some(p) if p != winbosk_core::model::CategoryPreset::Folders => {
+                let (chips, end_y) = layout_readonly_chips(
+                    p.default_extensions(),
+                    rx,
+                    cur_y,
+                    rw,
+                    theme.controls.chip_h,
+                    s,
+                    theme.console_label.size * DETAIL_SIZE_RATIO,
+                );
+                readonly_chips = chips;
+                cur_y = end_y + 12.0 * s;
+            }
+            Some(winbosk_core::model::CategoryPreset::Folders) => {
+                let text = "自动收纳所有文件夹目录，无视扩展名。";
+                let desc_h = 22.0 * s;
+                let desc_rect = RectF {
+                    x: rx,
+                    y: cur_y,
+                    w: rw,
+                    h: desc_h,
+                };
+                readonly_desc = Some((text.to_string(), desc_rect));
+                cur_y = desc_rect.y + desc_rect.h + 12.0 * s;
+            }
+            None => {
+                let text = "当前未配置自动收纳规则（手动管理模式）。桌面文件不会自动移入此栅栏。";
+                let desc_h = 36.0 * s;
+                let desc_rect = RectF {
+                    x: rx,
+                    y: cur_y,
+                    w: rw,
+                    h: desc_h,
+                };
+                readonly_desc = Some((text.to_string(), desc_rect));
+                cur_y = desc_rect.y + desc_rect.h + 12.0 * s;
+            }
+            _ => {
+                cur_y += 12.0 * s;
+            }
+        }
+    }
+
+    // 6. 自动捕获开关
+    let auto_capture_toggle = RectF {
+        x: rx,
+        y: cur_y,
+        w: rw,
+        h: theme.controls.btn_medium_h,
+    };
+    cur_y = auto_capture_toggle.y + auto_capture_toggle.h + 8.0 * s;
+
+    // 7. 单栅栏即时整理按钮
+    let apply_btn = RectF {
+        x: rx,
+        y: cur_y,
+        w: rw,
+        h: theme.controls.btn_medium_h,
+    };
+    cur_y = apply_btn.y + apply_btn.h + 12.0 * s;
+
+    // 8. 规则提示说明卡片
+    let tip_rect = RectF {
+        x: rx,
+        y: cur_y,
+        w: rw,
+        h: 102.0 * s,
+    };
+
+    SceneRuleEditor {
+        rect: RectF {
+            x: right_x,
+            y: content_top,
+            w: right_w,
+            h: panel.h - title_h,
+        },
+        fence_title: f
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("栅栏 {}", sel + 1)),
+        rule_enabled: rule.enabled,
+        toggle_btn,
+        preset_chips,
+        custom_chip,
+        is_custom,
+        edit_custom_btn,
+        readonly_chips,
+        readonly_desc,
+        ext_chips,
+        add_ext_btn,
+        exclude_chips,
+        add_exclude_btn,
+        pattern_chips,
+        add_pattern_btn,
+        auto_capture_toggle,
+        auto_capture_val: rule.auto_capture,
+        apply_btn,
+        tip_rect,
+        active_edit_rect,
+    }
+}
+
+/// 构建控制中心面板场景（栅栏管理单页）。关闭后完全隐藏（无胶囊），
+/// 高度按 `anim.panel` 从 0 插值到完整面板。
+pub(crate) fn build_console(rt: &Runtime, anim: &ConsoleAnim) -> SceneConsole {
+    let desk = &rt.desk;
+    let theme = &rt.theme;
+    let s = theme.scale;
+    let panel = console_geometry(
+        desk,
+        theme,
+        rt.vw,
+        rt.vh,
+        anim.panel,
+        rt.selected_fence,
+        rt.console_page,
+    );
+    let title_h = CONSOLE_TITLE_H * s;
+    let content_top = panel.y + title_h;
+
+    // —— 标题栏：关闭 + 模式切换单按钮（简化/高级） + 设置按钮 ——
+    let btn_size = theme.controls.icon_btn_size;
+    let btn_y = panel.y + (title_h - btn_size) / 2.0;
+    let right_margin = 8.0 * s;
+    let btn_gap = 6.0 * s;
+
+    let close = RectF {
+        x: panel.x + panel.w - right_margin - btn_size,
+        y: btn_y,
+        w: btn_size,
+        h: btn_size,
+    };
+    let mode_toggle = RectF {
+        x: close.x - btn_gap - btn_size,
+        y: btn_y,
+        w: btn_size,
+        h: btn_size,
+    };
+    let settings_toggle = RectF {
+        x: mode_toggle.x - btn_gap - btn_size,
+        y: btn_y,
+        w: btn_size,
+        h: btn_size,
+    };
+    // —— 左栏宽度（简化模式为全宽 368，高级模式为左半栏 368） ——
+    let left_w = if desk.console_advanced {
+        CONSOLE_W * s
+    } else {
+        panel.w
+    };
+
+    let is_settings_page: bool;
+    let settings_page: Option<SceneSettingsPage>;
+    let fence_rows: Vec<SceneFenceRow>;
+    let fence_list_view: RectF;
+    let fence_detail: Option<SceneFenceDetail>;
+    let add_fence: RectF;
+    let organize_btn: RectF;
+    let remove_btn: RectF;
+    let desktop_toggle: RectF;
+    let autostart_toggle: RectF;
+    let rule_editor: Option<SceneRuleEditor>;
+
+    if rt.console_page == ConsolePage::Settings {
+        is_settings_page = true;
+        fence_rows = Vec::new();
+        fence_list_view = RectF::default();
+        fence_detail = None;
+        add_fence = RectF::default();
+        organize_btn = RectF::default();
+        remove_btn = RectF::default();
+        desktop_toggle = RectF::default();
+        autostart_toggle = RectF::default();
+        rule_editor = None;
+
+        let detail_font = rt.theme.console_label.size * DETAIL_SIZE_RATIO;
+        settings_page = Some(layout_settings_page(
+            panel,
+            s,
+            detail_font,
+            desk,
+            rt.recording_hotkey,
+            &rt.hotkey_conflicts,
+            &theme.controls,
+        ));
+    } else {
+        is_settings_page = false;
+        settings_page = None;
+        // —— 栅栏管理页 ——
+        let list_top = content_top + 8.0 * s;
+        let row_h_f = CONSOLE_FENCE_ROW_H * s;
+        let fence_n = desk.fences.len();
+        let fence_shown = fence_n.min(CONSOLE_FENCE_MAX_ROWS);
+        let fence_scroll_max = if fence_n > fence_shown {
+            (fence_n - fence_shown) as f32 * row_h_f
+        } else {
+            0.0
+        };
+        let fence_scroll = rt.fence_scroll.clamp(0.0, fence_scroll_max);
+        fence_list_view = RectF {
+            x: panel.x + CONSOLE_PAD * s,
+            y: list_top,
+            w: left_w - 2.0 * CONSOLE_PAD * s,
+            h: fence_shown as f32 * row_h_f,
+        };
+        let sel = rt.selected_fence.min(fence_n.saturating_sub(1));
+        fence_rows = desk
+            .fences
+            .iter()
+            .enumerate()
+            .map(|(i, f)| SceneFenceRow {
+                rect: RectF {
+                    x: panel.x + CONSOLE_PAD * s,
+                    y: list_top + i as f32 * row_h_f - fence_scroll,
+                    w: left_w - 2.0 * CONSOLE_PAD * s,
+                    h: row_h_f,
+                },
+                title: f.title.clone().unwrap_or_else(|| format!("栅栏 {}", i + 1)),
+                selected: i == sel,
+            })
+            .collect();
+        fence_detail = if fence_n > 0 {
+            let d = RectF {
+                x: panel.x + CONSOLE_PAD * s,
+                y: list_top + fence_shown as f32 * row_h_f + 8.0 * s,
+                w: left_w - 2.0 * CONSOLE_PAD * s,
+                h: CONSOLE_FENCE_DETAIL_H * s,
+            };
+            let app = &desk.fences[sel].appearance;
+            let btn_h = theme.controls.btn_medium_h;
+            let label_w = 40.0 * s;
+            // 动态行号：根据当前布局/风格跳过不适用的行，避免留空白
+            let mut row = 0usize;
+            let row_y = |r: usize| d.y + 24.0 * s + r as f32 * 30.0 * s;
+            // 布局选择（始终显示）
+            let layout_grid = RectF {
+                x: d.x + label_w,
+                y: row_y(row),
+                w: 52.0 * s,
+                h: btn_h,
+            };
+            let layout_list = RectF {
+                x: layout_grid.x + layout_grid.w + 6.0 * s,
+                y: row_y(row),
+                w: 52.0 * s,
+                h: btn_h,
+            };
+            let layout_sidebar = RectF {
+                x: layout_list.x + layout_list.w + 6.0 * s,
+                y: row_y(row),
+                w: 52.0 * s,
+                h: btn_h,
+            };
+            row += 1;
+            // 图标大小（列表布局隐藏；网格/侧边栏显示）
+            let show_size = app.layout != FenceLayout::List;
+            let (size_s, size_m, size_l) = if show_size {
+                let sy = row_y(row);
+                let s_s = RectF {
+                    x: d.x + label_w,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                let s_m = RectF {
+                    x: s_s.x + s_s.w + 6.0 * s,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                let s_l = RectF {
+                    x: s_m.x + s_m.w + 6.0 * s,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                row += 1;
+                (s_s, s_m, s_l)
+            } else {
+                (RectF::default(), RectF::default(), RectF::default())
+            };
+            // 背景风格（始终显示）
+            let style_glass = RectF {
+                x: d.x + label_w,
+                y: row_y(row),
+                w: 48.0 * s,
+                h: btn_h,
+            };
+            let style_outline = RectF {
+                x: style_glass.x + style_glass.w + 6.0 * s,
+                y: row_y(row),
+                w: 48.0 * s,
+                h: btn_h,
+            };
+            let style_filled = RectF {
+                x: style_outline.x + style_outline.w + 6.0 * s,
+                y: row_y(row),
+                w: 48.0 * s,
+                h: btn_h,
+            };
+            let style_blur = RectF {
+                x: style_filled.x + style_filled.w + 6.0 * s,
+                y: row_y(row),
+                w: 48.0 * s,
+                h: btn_h,
+            };
+            row += 1;
+            // 背景色调（模糊风格下隐藏——模糊无色调可调）
+            let show_tint = app.bg_style != FenceStyle::Blur;
+            let (tint_default, tints) = if show_tint {
+                let sw = 18.0 * s;
+                let gap = 6.0 * s;
+                let tint_y = row_y(row) + (btn_h - sw) / 2.0;
+                let td = RectF {
+                    x: d.x + label_w,
+                    y: tint_y,
+                    w: sw,
+                    h: sw,
+                };
+                let mut ts = Vec::with_capacity(TINT_PRESETS.len());
+                let mut x = td.x + sw + gap;
+                for _ in TINT_PRESETS {
+                    ts.push(RectF {
+                        x,
+                        y: tint_y,
+                        w: sw,
+                        h: sw,
+                    });
+                    x += sw + gap;
+                }
+                row += 1;
+                (td, ts)
+            } else {
+                (RectF::default(), Vec::new())
+            };
+            // —— 文件位置行（占两行，**不可再增行**）——
+            // 值行：标签 + 状态标签（模式）+ 真实落地路径（**零按钮**，路径自身是打开热区）
+            // 动作行：后果提示（左）+ 「更改文件位置…」「恢复默认」（右端对齐）
+            // 该行是用户唯一能得知"文件到底存在哪 / 删除是删副本还是删真身"的入口，故常显。
+            // 几何全部由 `storage_row_geometry` 纯函数推出（含"放不下就不画提示语"的降级），
+            // 以便在内存中单测空间互斥。
+            let storage = winbosk_core::storage::describe(
+                desk.fences[sel].storage_path.as_deref(),
+                &rt.library.to_string_lossy(),
+                rt.desktop_dir.as_deref(),
+            );
+            let row_geo = storage_row_geometry(
+                &d,
+                row_y(row),
+                storage.kind,
+                storage.can_reset,
+                &storage.path,
+                &rt.theme,
+            );
+            let storage_value_row = row_geo.value_row;
+            let storage_chip = row_geo.tag;
+            let storage_path_rect = row_geo.path;
+            let storage_path_text = row_geo.path_text;
+            let storage_path_hit = row_geo.path_hit;
+            let storage_hint_rect = row_geo.hint;
+            let storage_hint_text = row_geo.hint_text;
+            let storage_text_top = row_geo.text_top;
+            row += 1;
+            let storage_btn = row_geo.change;
+            let storage_reset = row_geo.reset;
+            row += 1;
+            // 侧边栏位置按钮（仅侧边栏布局有；网格/列表隐藏）
+            let show_sidebar_pos = app.layout == FenceLayout::Sidebar;
+            let (sidebar_left, sidebar_top, sidebar_right) = if show_sidebar_pos {
+                let sy = row_y(row);
+                let sl = RectF {
+                    x: d.x + label_w,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                let st = RectF {
+                    x: sl.x + sl.w + 6.0 * s,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                let sr = RectF {
+                    x: st.x + st.w + 6.0 * s,
+                    y: sy,
+                    w: 40.0 * s,
+                    h: btn_h,
+                };
+                (sl, st, sr)
+            } else {
+                (RectF::default(), RectF::default(), RectF::default())
+            };
+            if show_sidebar_pos {
+                row += 1;
+            }
+            // 分类规则按钮（始终显示）：无 / 应用 / 文档 / 媒体 / 压缩 / 目录
+            let rule_btn_w = 38.0 * s;
+            let rule_gap = 4.0 * s;
+            let rule_y = row_y(row);
+            let rule_none = RectF {
+                x: d.x + label_w,
+                y: rule_y,
+                w: 34.0 * s,
+                h: btn_h,
+            };
+            let rule_apps = RectF {
+                x: rule_none.x + rule_none.w + rule_gap,
+                y: rule_y,
+                w: rule_btn_w,
+                h: btn_h,
+            };
+            let rule_docs = RectF {
+                x: rule_apps.x + rule_apps.w + rule_gap,
+                y: rule_y,
+                w: rule_btn_w,
+                h: btn_h,
+            };
+            let rule_media = RectF {
+                x: rule_docs.x + rule_docs.w + rule_gap,
+                y: rule_y,
+                w: rule_btn_w,
+                h: btn_h,
+            };
+            let rule_archives = RectF {
+                x: rule_media.x + rule_media.w + rule_gap,
+                y: rule_y,
+                w: rule_btn_w,
+                h: btn_h,
+            };
+            let rule_folders = RectF {
+                x: rule_archives.x + rule_archives.w + rule_gap,
+                y: rule_y,
+                w: rule_btn_w,
+                h: btn_h,
+            };
+            #[allow(unused_assignments)]
+            {
+                row += 1;
+            }
+            Some(SceneFenceDetail {
+                rect: d,
+                title: desk.fences[sel]
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("栅栏 {}", sel + 1)),
+                layout: app.layout,
+                icon_size: app.icon_size,
+                style: app.bg_style,
+                tint: app.tint,
+                layout_grid,
+                layout_list,
+                layout_sidebar,
+                size_s,
+                size_m,
+                size_l,
+                style_glass,
+                style_outline,
+                style_filled,
+                style_blur,
+                tint_default,
+                tints,
+                storage_btn,
+                storage_value_row,
+                storage_kind: storage.kind,
+                storage_path_text,
+                storage_path_rect,
+                storage_chip,
+                storage_path_hit,
+                storage_hint_text,
+                storage_hint_rect,
+                storage_text_top,
+                storage_reset,
+                sidebar_pos: app.sidebar_pos,
+                sidebar_left,
+                sidebar_top,
+                sidebar_right,
+                current_preset: desk.fences[sel].rule.as_ref().and_then(|r| r.preset),
+                rule_none,
+                rule_apps,
+                rule_docs,
+                rule_media,
+                rule_archives,
+                rule_folders,
+            })
+        } else {
+            None
+        };
+        // —— 底部操作按钮：添加栅栏 / 一键整理 / 删除栅栏 / 切换桌面（自上而下，等宽等高） ——
+        let btn_w = left_w - 2.0 * CONSOLE_PAD * s;
+        let btn_h = theme.controls.btn_large_h;
+        let btn_gap = 8.0 * s;
+        let detail_h = detail_visible_rows(desk, sel, s);
+        let btn_top = list_top + fence_shown as f32 * row_h_f + 8.0 * s + detail_h + 8.0 * s;
+        add_fence = RectF {
+            x: panel.x + CONSOLE_PAD * s,
+            y: btn_top,
+            w: btn_w,
+            h: btn_h,
+        };
+        // 「一键整理」按钮：放在「添加栅栏」正下方，等宽等高。
+        organize_btn = RectF {
+            x: add_fence.x,
+            y: add_fence.y + btn_h + btn_gap,
+            w: btn_w,
+            h: btn_h,
+        };
+        // 「删除栅栏」按钮：放在「一键整理」正下方，等宽等高。
+        remove_btn = RectF {
+            x: add_fence.x,
+            y: organize_btn.y + btn_h + btn_gap,
+            w: btn_w,
+            h: btn_h,
+        };
+        // 「切回桌面 / 切换桌面」与「开机自启」按钮：位于删除栅栏下方，等分左右两半，等高
+        let half_w = ((btn_w - btn_gap) / 2.0).max(0.0);
+        let row4_y = remove_btn.y + btn_h + btn_gap;
+        desktop_toggle = RectF {
+            x: add_fence.x,
+            y: row4_y,
+            w: half_w,
+            h: btn_h,
+        };
+        autostart_toggle = RectF {
+            x: add_fence.x + half_w + btn_gap,
+            y: row4_y,
+            w: half_w,
+            h: btn_h,
+        };
+
+        // —— 高级模式：右栏规则工作台 ——
+        rule_editor = if desk.console_advanced && fence_n > 0 {
+            let f = &desk.fences[sel];
+            let edit_target = rt.edit.as_ref().map(|e| e.target);
+            Some(layout_rule_editor(RuleEditorLayoutCtx {
+                f,
+                sel,
+                panel,
+                left_w,
+                content_top,
+                title_h,
+                theme,
+                edit_target,
+            }))
+        } else {
+            None
+        };
+    }
+
+    SceneConsole {
+        x: panel.x,
+        y: panel.y,
+        width: panel.w,
+        height: panel.h,
+        title_h,
+        close,
+        desktop_toggle,
+        autostart_toggle,
+        fence_rows,
+        fence_list_view,
+        fence_detail,
+        add_fence,
+        organize_btn,
+        remove_btn,
+        fill_color: [0.062, 0.086, 0.133, 0.92],
+        border_color: [1.0, 1.0, 1.0, 0.18],
+        panel: anim.panel,
+        fade: console_fade(anim.panel),
+        hover_zone: if anim.panel >= 0.5 {
+            rt.console_hover
+        } else {
+            None
+        },
+        desktop_mode: desk.desktop_mode,
+        autostart: desk.settings.autostart,
+        advanced: desk.console_advanced,
+        mode_toggle,
+        rule_editor,
+        settings_toggle,
+        is_settings_page,
+        settings_page,
+    }
+}
+
+/// 构建一个桌面小组件的场景（待办/便签卡片；位置尺寸 = DIP × scale）。
+/// 列表布局详情列的固定宽度与间距（物理像素）。
+pub(crate) const LIST_TYPE_W: f32 = 90.0;
+pub(crate) const LIST_MOD_W: f32 = 140.0;
+pub(crate) const LIST_SIZE_W: f32 = 80.0;
+pub(crate) const LIST_COL_GAP: f32 = 16.0;
+/// 列表行内的小图标尺寸（详情列表风格，与「图标大小」无关）。
+pub(crate) const LIST_ICON_SIZE: f32 = 20.0;
+/// 列表未手动缩放时的最大可见行数（超出滚动）。
+pub(crate) const LIST_AUTO_ROWS: usize = 8;
+
+/// 单个栅栏的排布（网格 / 列表）。
+///
+/// - 宽度：用户控制的 `fence.bounds.w`（列表切过去时按最长标签自动收窄）；
+/// - 高度：未手动缩放过（`bounds.h <= 0`）时按内容自适应——网格长满、列表最多
+///   8 行（超出滚动）；手动缩放过则固定，内容超出后用滚轮滚动（右缘有指示条）；
+/// - 网格：自左向右、自上而下排布，标签在图标下方；
+/// - 列表：单列纵向，名称/类型/修改日期/大小四列 + 固定列头，滚轮滚动。
+/// - 滚动：所有图标都在场景里（位置按 `scroll` 平移），绘制时用内容区裁剪，
+///   命中模型跳过滚出可视区的项。返回的 `SceneFence.scroll` 已被钳制，
+///   `build_scene` 据此回写 `desk.fences[i].scroll`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn layout_fence(
+    theme: &Theme,
+    fence: &Fence,
+    desk: &Desk,
+    bitmap_ids: &HashMap<String, u64>,
+    hover: Option<(usize, usize)>,
+    selected: &[(usize, usize)],
+    select_band: Option<(usize, RectF)>,
+    fence_idx: usize,
+) -> SceneFence {
+    let app = &fence.appearance;
+    // 模型里的外观是 DIP 逻辑值（持久化，跨 DPI 稳定），布局时 × scale 变物理像素。
+    let scale = theme.scale;
+    let pad = app.padding * scale;
+    let n = fence.icon_ids.len();
+    let title_block_h = theme.title.size * 1.6 + theme.title_padding_bottom;
+    // 侧边栏无标题栏：内容顶边 = 栅栏顶部 + 内边距。否则标题块高度会把顶部
+    // 图标整体裁掉（内容裁剪区从 content_top 起算，而侧边栏图标从 y+pad 起排）。
+    let content_top = if app.layout == FenceLayout::Sidebar {
+        fence.bounds.y + pad
+    } else {
+        fence.bounds.y + pad + title_block_h + pad
+    };
+    let content_left = fence.bounds.x + pad;
+    let inner_w = (fence.bounds.w - 2.0 * pad).max(1.0);
+
+    // 预取名称 + 位图 + 详情列文本（布局与绘制共用）。
+    let rows: Vec<(String, u64, String, String, String)> = fence
+        .icon_ids
+        .iter()
+        .map(|id| {
+            let ic = desk.icons.get(id);
+            let label = ic.map(|i| i.display_name.clone()).unwrap_or_default();
+            let bitmap = bitmap_ids.get(id).copied().unwrap_or(u64::MAX);
+            match ic {
+                Some(i) => (
+                    label,
+                    bitmap,
+                    i.type_label.clone(),
+                    winbosk_shell::time::format_modified(i.modified_secs),
+                    winbosk_core::details::format_size(i.size_bytes),
+                ),
+                None => (label, bitmap, String::new(), String::new(), String::new()),
+            }
+        })
+        .collect();
+
+    let hover_icon = hover.filter(|&(fi, _)| fi == fence_idx).map(|(_, ii)| ii);
+    let selected: Vec<usize> = selected
+        .iter()
+        .filter(|&&(fi, _)| fi == fence_idx)
+        .map(|&(_, ii)| ii)
+        .collect();
+    let select_band = select_band
+        .filter(|&(fi, _)| fi == fence_idx)
+        .map(|(_, r)| r);
+
+    let (icons, scroll, scroll_max, scroll_view, list_cols, grid_cell_w, height) = match app.layout
+    {
+        FenceLayout::Grid => {
+            let icon_size = app.icon_size * scale;
+            let gap = app.gap * scale;
+            // 横向步距：图标 + 间距，且保底 ≥1.5×图标宽——旧配置 gap 偏小时两行
+            // 文件名标签也有足够横向空间（标签横跨整格绘制，见 draw.rs）。
+            let cell_w = grid_cell_w(icon_size, gap);
+            // 纵向步距：图标 + 标签间距 + 两行标签高（与 draw.rs 的标签框一致）。
+            let row_h = grid_row_h(theme, icon_size);
+            let cols = ((inner_w / cell_w).floor() as usize).max(1);
+            let rows_n = n.div_ceil(cols).max(1);
+            // 内容总高 = 每行（图标 + 标签）累加，末行标签也有高度
+            let content_full = rows_n as f32 * row_h;
+            let auto_h = pad + title_block_h + pad + content_full + pad;
+            let h = if fence.bounds.h > 0.0 {
+                fence.bounds.h.max(MIN_FENCE_H)
+            } else {
+                auto_h
+            };
+            let view = (h - pad - title_block_h - pad - pad).max(0.0);
+            let scroll_max = (content_full - view).max(0.0);
+            let scroll = fence.scroll.clamp(0.0, scroll_max);
+            let icons = grid_icons(
+                theme,
+                fence,
+                &rows,
+                cols,
+                cell_w,
+                row_h,
+                content_top,
+                content_left,
+                scroll,
+                icon_size,
+            );
+            (icons, scroll, scroll_max, view, None, cell_w, h)
+        }
+        FenceLayout::List => {
+            let label_h = theme.label.size * 1.6;
+            let list_icon = LIST_ICON_SIZE * scale;
+            // 行高至少容纳标签高（或图标高），再加行距；否则 24px 文字叠进下一行
+            let row_h = list_icon.max(label_h) + theme.list_row_gap;
+            let header_h = label_h + 8.0 * scale;
+            // 内容总高（所有行）
+            let content_full = if n > 0 {
+                n as f32 * row_h - theme.list_row_gap
+            } else {
+                0.0
+            };
+            // 未手动缩放：最多显示 LIST_AUTO_ROWS 行，超出滚动
+            let auto_rows = n.clamp(1, LIST_AUTO_ROWS);
+            let auto_rows_h = (auto_rows as f32 * row_h - theme.list_row_gap).max(0.0);
+            let auto_h = pad + title_block_h + pad + header_h + auto_rows_h + pad;
+            let h = if fence.bounds.h > 0.0 {
+                fence.bounds.h.max(MIN_FENCE_H)
+            } else {
+                auto_h
+            };
+            let view = (h - pad - title_block_h - pad - header_h - pad).max(0.0);
+            let scroll_max = (content_full - view).max(0.0);
+            let scroll = fence.scroll.clamp(0.0, scroll_max);
+            // 四列：名称列吃剩余宽度，其余固定（列宽同样 × scale）
+            let type_w = LIST_TYPE_W * scale;
+            let mod_w = LIST_MOD_W * scale;
+            let size_w = LIST_SIZE_W * scale;
+            let col_gap = LIST_COL_GAP * scale;
+            let name_w = (inner_w - col_gap * 3.0 - type_w - mod_w - size_w).max(60.0 * scale);
+            let type_x = content_left + name_w + col_gap;
+            let modified_x = type_x + type_w + col_gap;
+            let size_x = modified_x + mod_w + col_gap;
+            let cols = ListColumns {
+                type_x,
+                modified_x,
+                size_x,
+                header_h,
+            };
+            let icons = list_icons(
+                theme,
+                fence,
+                &rows,
+                content_top,
+                content_left,
+                header_h,
+                row_h,
+                scroll,
+                list_icon,
+            );
+            (icons, scroll, scroll_max, view, Some(cols), 0.0, h)
+        }
+        FenceLayout::Sidebar => {
+            let icon_size = app.icon_size * scale;
+            let gap = app.gap * scale;
+            let is_vert = app.sidebar_pos != SidebarPosition::Top;
+            // 侧边栏：无标题栏、无标签，仅图标排列。间距用有效间距（放大不重叠）。
+            let eff_gap = sidebar_eff_gap(icon_size, gap);
+            let content_full = if n > 0 {
+                n as f32 * (icon_size + eff_gap) - eff_gap
+            } else {
+                0.0
+            };
+            if is_vert {
+                // 纵向（左/右）：宽 = 紧贴放大图标的停靠宽（图标水平居中），
+                // 高 = 内容自适应或用户缩放。
+                let auto_h = pad + content_full + pad;
+                let h = if fence.bounds.h > 0.0 {
+                    fence.bounds.h.max(MIN_FENCE_H)
+                } else {
+                    auto_h
+                };
+                let view = (h - pad - pad).max(0.0);
+                let scroll_max = (content_full - view).max(0.0);
+                let scroll = fence.scroll.clamp(0.0, scroll_max);
+                // 图标在 dock 内水平居中：放大围绕中心展开，1.5× 时两侧对称留白。
+                let dock_w = fence.bounds.w.max(icon_size);
+                let start_x = fence.bounds.x + (dock_w - icon_size) / 2.0;
+                let icons = sidebar_icons(
+                    fence,
+                    &rows,
+                    icon_size,
+                    eff_gap,
+                    start_x,
+                    fence.bounds.y + pad,
+                    scroll,
+                    true,
+                );
+                (icons, scroll, scroll_max, view, None, 0.0, h)
+            } else {
+                // 横向（上侧）：厚度 = 紧贴放大图标的停靠高（图标垂直居中），
+                // 宽 = 内容自适应或用户缩放。
+                let auto_w = pad + content_full + pad;
+                let w = if fence.bounds.w > 0.0 {
+                    fence.bounds.w.max(MIN_FENCE_W)
+                } else {
+                    auto_w
+                };
+                let view = (w - pad - pad).max(0.0);
+                let scroll_max = (content_full - view).max(0.0);
+                let scroll = fence.scroll.clamp(0.0, scroll_max);
+                let h = sidebar_dock_thickness(icon_size, scale);
+                let start_y = fence.bounds.y + (h - icon_size) / 2.0;
+                let icons = sidebar_icons(
+                    fence,
+                    &rows,
+                    icon_size,
+                    eff_gap,
+                    fence.bounds.x + pad,
+                    start_y,
+                    scroll,
+                    false,
+                );
+                (icons, scroll, scroll_max, view, None, 0.0, h)
+            }
+        }
+    };
+
+    // 背景填充按「背景风格」决定（玻璃 / 透明 / 颜色），与旧的透明度滑块无关：
+    // - 颜色（Filled）：不透明纯色，颜色 = 背景色调（未选时用默认背景色）；
+    // - 玻璃（Glass）：半透明玻璃底，默认底色并向「背景色调」靠拢 45%（保留暗底质感）；
+    // - 透明（Outline）：完全透明，只留圆角描边（fill_color = None，边框照常绘制）。
+    let bg = app.bg_color;
+    let tint_rgb = match app.tint {
+        Some(t) => [t[0], t[1], t[2]],
+        None => [bg[0], bg[1], bg[2]],
+    };
+    let glass_rgb = match app.tint {
+        Some(t) => [
+            bg[0] + (t[0] - bg[0]) * 0.45,
+            bg[1] + (t[1] - bg[1]) * 0.45,
+            bg[2] + (t[2] - bg[2]) * 0.45,
+        ],
+        None => [bg[0], bg[1], bg[2]],
+    };
+    let fill_color = match app.bg_style {
+        FenceStyle::Filled => Some([tint_rgb[0], tint_rgb[1], tint_rgb[2], 1.0]),
+        FenceStyle::Glass => Some([glass_rgb[0], glass_rgb[1], glass_rgb[2], 0.55]),
+        FenceStyle::Outline => None,
+        // 模糊：无实心填充，背景由合成器里独立的 GaussianBlurEffect 视觉提供
+        // （GPU 实时，BackdropBrush 采样窗口背后桌面），内容区透明透出。
+        FenceStyle::Blur => None,
+    };
+    // 圆角矩形边框跟随 Windows 主题（深色=白、浅色=黑），中粗固定宽度；
+    // 透明度保持清晰可见（暗色 42% / 浅色 45%）。
+    let border_color = if system_dark_mode() {
+        [1.0, 1.0, 1.0, 0.42]
+    } else {
+        [0.0, 0.0, 0.0, 0.45]
+    };
+    let border_width = (MEDIUM_BORDER_WIDTH * scale).round().max(1.0);
+
+    SceneFence {
+        x: fence.bounds.x.round(),
+        y: fence.bounds.y.round(),
+        width: fence.bounds.w.round(),
+        height: height.round(),
+        title: fence.title.clone().unwrap_or_default(),
+        icons,
+        layout: app.layout,
+        list_cols,
+        grid_cell_w,
+        scroll,
+        scroll_max,
+        scroll_view,
+        content_top,
+        content_left,
+        hover_icon,
+        selected,
+        select_band,
+        border_width,
+        border_color,
+        fill_color,
+        // 模糊风格：合成器据此为该栅栏建 BackdropBrush + 高斯模糊视觉（GPU 实时）
+        blur: app.bg_style == FenceStyle::Blur,
+        alpha: 1.0,
+        // 侧边栏工具提示矩形由 build_dock_magnify 在第二遍计算后填入
+        tooltip_rect: None,
+        // 被拖走的图标由 build_scene 在栅栏循环里按 `icon_drag` 置位
+        drag_hidden: None,
+        collapsed: false,
+        collapse_btn: None,
+    }
+}
+
+/// 网格排布全部图标位置（不裁剪；滚动用 `scroll` 平移，绘制时裁剪）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grid_icons(
+    theme: &Theme,
+    _fence: &Fence,
+    rows: &[(String, u64, String, String, String)],
+    cols: usize,
+    cell_w: f32,
+    row_h: f32,
+    content_top: f32,
+    content_left: f32,
+    scroll: f32,
+    icon_size: f32,
+) -> Vec<SceneIcon> {
+    let _ = theme;
+    rows.iter()
+        .enumerate()
+        .map(|(i, (label, bitmap, ct, cm, cs))| SceneIcon {
+            label: label.clone(),
+            bitmap_id: *bitmap,
+            // 图标在格内**居中**：格宽（`grid_cell_w`）保底 1.5×图标宽，贴格左缘摆会把
+            // 多出来的半格全留在右侧（整排看起来左挤右空）；且文件名标签按整格居中绘制
+            // （见 draw.rs 的网格标签框）——图标不居中，标签就落不到图标正下方。
+            x: content_left + (i % cols) as f32 * cell_w + (cell_w - icon_size) / 2.0,
+            y: content_top + (i / cols) as f32 * row_h - scroll,
+            size: icon_size,
+            col_type: ct.clone(),
+            col_modified: cm.clone(),
+            col_size: cs.clone(),
+            scale: 1.0,
+        })
+        .collect()
+}
+
+/// 网格格宽：图标宽 + 间距，且不小于 1.5 倍图标宽。两行文件名标签横跨整格绘制，
+/// 格宽不足会退化成单行截断——保底保证旧配置（gap 偏小）也有足够的横向空间。
+pub(crate) fn grid_cell_w(icon_size: f32, gap: f32) -> f32 {
+    (icon_size + gap).max(icon_size * 1.5)
+}
+
+/// 网格行高：图标 + 标签间距 + 两行标签高（与 draw.rs 的标签框同一 `GRID_CAPTION_H_MULT`）。
+pub(crate) fn grid_row_h(theme: &Theme, icon_size: f32) -> f32 {
+    icon_size + theme.icon_caption_gap + theme.label.size * GRID_CAPTION_H_MULT
+}
+
+/// 列表排布全部图标位置（单列纵向；滚动用 `scroll` 平移，绘制时裁剪）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn list_icons(
+    theme: &Theme,
+    fence: &Fence,
+    rows: &[(String, u64, String, String, String)],
+    content_top: f32,
+    content_left: f32,
+    header_h: f32,
+    row_h: f32,
+    scroll: f32,
+    size: f32,
+) -> Vec<SceneIcon> {
+    let _ = (theme, fence);
+    rows.iter()
+        .enumerate()
+        .map(|(i, (label, bitmap, ct, cm, cs))| SceneIcon {
+            label: label.clone(),
+            bitmap_id: *bitmap,
+            x: content_left,
+            y: content_top + header_h + i as f32 * row_h - scroll,
+            size,
+            col_type: ct.clone(),
+            col_modified: cm.clone(),
+            col_size: cs.clone(),
+            scale: 1.0,
+        })
+        .collect()
+}
+
+/// 计算侧边栏的推荐停靠矩形（位置切换 / 首次切换 / 启动归一化共用）。
+///
+/// 侧边栏 dock 厚度（纵向 dock 的宽 / 横向 dock 的高）：放大后最大图标宽（1.5×图标）
+/// 加两侧呼吸边（每侧 6 逻辑 px）。紧贴放大图标——放大到 1.5× 的图标恰在 dock 内居中，
+/// 两侧各留少量边距，不被 dock 边缘裁掉。
+pub(crate) fn sidebar_dock_thickness(icon_size: f32, scale: f32) -> f32 {
+    let margin = 6.0 * scale;
+    icon_size * 1.5 + margin * 2.0
+}
+
+/// 侧边栏有效图标间距：把间距调大到「相邻两图标都放大到 1.5× 时恰好不相叠」。
+/// `step = icon_size + eff_gap = 1.5×icon_size`（默认 icon 32：间距 10 → 26 逻辑）。
+/// 布局/放大/dock 尺寸三处统一用它，口径一致。
+fn sidebar_eff_gap(icon_size: f32, gap: f32) -> f32 {
+    gap + icon_size * 0.5
+}
+
+/// 把侧边栏 dock 夹在工作区内（任务栏扣除后，`wa` 由 `SPI_GETWORKAREA` 取得）：
+/// 纵向（左/右）dock 的下沿不越过任务栏——限 `h` 到工作区高、`y` 夹到
+/// `[wa.y, wa.bottom-h]`；横向（上）dock 右沿同理限 `w`/`x`，`y` 也夹进工作区。
+/// 拖动、缩放高度、切换停靠边与启动 re-anchor 统一用它，dock 永远进不了任务栏以下。
+pub(crate) fn clamp_sidebar_work_rect(r: Rect, wa: Rect, pos: SidebarPosition) -> Rect {
+    let mut out = r;
+    match pos {
+        SidebarPosition::Left | SidebarPosition::Right => {
+            if out.h > wa.h {
+                out.h = wa.h;
+            }
+            out.y = out.y.clamp(wa.y, wa.bottom() - out.h);
+        }
+        SidebarPosition::Top => {
+            if out.w > wa.w {
+                out.w = wa.w;
+            }
+            out.x = out.x.clamp(wa.x, wa.right() - out.w);
+            if out.h > wa.h {
+                out.h = wa.h;
+            }
+            out.y = out.y.clamp(wa.y, wa.bottom() - out.h);
+        }
+    }
+    out
+}
+
+/// 夹到工作区内：纵向（左/右）宽 = 紧贴放大图标（1.5×图标 + 两侧 6 逻辑 px 呼吸边），
+/// 高随图标数自适应但不超过工作区高（超出则滚动）；横向（上）厚度对称于纵向、
+/// 宽自适应但不超过工作区宽。`fence.appearance.sidebar_pos` 决定停靠在哪一侧。
+/// `wa` 为工作区矩形（扣除任务栏后），dock 不会越过任务栏。
+pub(crate) fn sidebar_dock_rect(scale: f32, fence: &Fence, wa: &Rect) -> Rect {
+    let icon_size = fence.appearance.icon_size * scale;
+    let gap = fence.appearance.gap * scale;
+    let pad = 12.0 * scale;
+    let n = fence.icon_ids.len();
+    let eff_gap = sidebar_eff_gap(icon_size, gap);
+    let content = if n > 0 {
+        n as f32 * (icon_size + eff_gap) - eff_gap
+    } else {
+        0.0
+    };
+    match fence.appearance.sidebar_pos {
+        SidebarPosition::Left | SidebarPosition::Right => {
+            // 紧贴放大图标：宽 = 1.5×图标 + 两侧呼吸边，图标在 dock 内居中（放大围绕
+            // 中心展开），1.5× 时恰被完整容纳。高 = 内容 + 上下内边距，夹到工作区内。
+            let w = sidebar_dock_thickness(icon_size, scale);
+            let h = (content + pad * 2.0).clamp(100.0 * scale, wa.h);
+            let x = if fence.appearance.sidebar_pos == SidebarPosition::Left {
+                wa.x
+            } else {
+                (wa.right() - w).max(wa.x)
+            };
+            Rect::new(x, wa.y + ((wa.h - h) / 2.0).max(0.0), w, h)
+        }
+        SidebarPosition::Top => {
+            // 横向 dock：厚度对称于纵向（1.5×图标 + 两侧呼吸边），宽随内容自适应。
+            let h = sidebar_dock_thickness(icon_size, scale);
+            let w = (content + pad * 2.0).clamp(100.0 * scale, wa.w);
+            Rect::new(wa.x + ((wa.w - w) / 2.0).max(0.0), wa.y, w, h)
+        }
+    }
+}
+
+/// 侧边栏排布全部图标位置（单行/单列，无标签；滚动用 `scroll` 平移）。
+/// `vertical` = true 时纵向排列（左/右停靠），false 时横向排列（上侧停靠）。
+/// 不处理排序——排序在 build_scene 中用实际渲染位置后处理。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sidebar_icons(
+    _fence: &Fence,
+    rows: &[(String, u64, String, String, String)],
+    icon_size: f32,
+    gap: f32,
+    start_x: f32,
+    start_y: f32,
+    scroll: f32,
+    vertical: bool,
+) -> Vec<SceneIcon> {
+    let step = icon_size + gap;
+    rows.iter()
+        .enumerate()
+        .map(|(i, (label, bitmap, ct, cm, cs))| {
+            let (x, y) = if vertical {
+                (start_x, start_y + i as f32 * step - scroll)
+            } else {
+                (start_x + i as f32 * step - scroll, start_y)
+            };
+            SceneIcon {
+                label: label.clone(),
+                bitmap_id: *bitmap,
+                x,
+                y,
+                size: icon_size,
+                col_type: ct.clone(),
+                col_modified: cm.clone(),
+                col_size: cs.clone(),
+                scale: 1.0,
+            }
+        })
+        .collect()
+}
+
+/// 侧边栏 Dock 放大效果：根据鼠标位置计算每个图标的缩放。
+/// 返回 (hovered_index, scales)，scales[i] 是第 i 个图标的缩放因子。
+/// 鼠标未悬停在任何图标上时返回 (None, vec![1.0; n])。
+/// 侧边栏 Dock 放大：按光标到每个图标中心的**距离**连续缩放，跨图标平滑过渡。
+///
+/// 影响半径 = 4 个图标步距（icon_size + gap）；中心 1.5x、每远一步递减，
+/// 与旧的分级曲线 1.5/1.3/1.15/1.05 一致，但每个像素都是平滑的：
+/// 光标在两个图标之间移动时，两个图标各自按距离连续变化，不再跳档。
+/// 返回 `(最近图标, 各图标缩放)`；光标离开影响半径后返回 `(None, 全 1.0)`。
+pub(crate) fn sidebar_magnify(
+    icons: &[SceneIcon],
+    cursor: Option<(f32, f32)>,
+    icon_size: f32,
+    gap: f32,
+) -> (Option<usize>, Vec<f32>) {
+    let n = icons.len();
+    if n == 0 {
+        return (None, Vec::new());
+    }
+    let Some((mx, my)) = cursor else {
+        return (None, vec![1.0; n]);
+    };
+    let step = (icon_size + gap).max(1.0);
+    let radius = 4.0 * step;
+    let max_scale = 1.5;
+    let mut scales = vec![1.0f32; n];
+    let mut nearest: Option<usize> = None;
+    let mut nearest_d = f32::INFINITY;
+    for (i, ic) in icons.iter().enumerate() {
+        let cx = ic.x + ic.size / 2.0;
+        let cy = ic.y + ic.size / 2.0;
+        let dx = mx - cx;
+        let dy = my - cy;
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist < nearest_d {
+            nearest_d = dist;
+            nearest = Some(i);
+        }
+        if dist >= radius {
+            continue;
+        }
+        // 二次衰减：t=1 在圆心（1.5x），t=0 在半径边缘（1.0x）
+        let t = (1.0 - dist / radius).max(0.0);
+        scales[i] = 1.0 + (max_scale - 1.0) * t * t;
+    }
+    // 光标离所有图标都超出影响半径 → 视为未悬停（全部复位，避免 Dock 悬空）
+    if nearest_d > radius {
+        nearest = None;
+    }
+    (nearest, scales)
+}
+
+/// 侧边栏 Dock 放大（第二遍，全部栅栏真实几何就绪后调用）。
+///
+/// 只有光标**不在任何非侧边栏栅栏内**时才放大：否则 Dock 的影响半径会越过
+/// 网格/列表并抢走它们的悬停焦点（Dock 放大与工具提示跟随最近图标）。
+pub(crate) fn build_dock_magnify(rt: &mut Runtime, scene_fences: &mut [SceneFence]) {
+    let Some((mx, my)) = rt.cursor else {
+        return;
+    };
+    // 光标落在某个非侧边栏栅栏（且未淡出）内 → 本帧所有 Dock 都不放大
+    let in_other = scene_fences.iter().enumerate().any(|(j, of)| {
+        rt.desk.fences[j].appearance.layout != FenceLayout::Sidebar
+            && of.alpha > 0.01
+            && mx >= of.x
+            && mx <= of.x + of.width
+            && my >= of.y
+            && my <= of.y + of.height
+    });
+    // 光标落在控制中心面板内 → 同样不放大（避免面板上方触发 Dock 工具提示）
+    let in_console = rt.desk.console_open && {
+        let cp = console_geometry(
+            &rt.desk,
+            &rt.theme,
+            rt.vw,
+            rt.vh,
+            1.0,
+            rt.selected_fence,
+            rt.console_page,
+        );
+        mx >= cp.x && mx <= cp.x + cp.w && my >= cp.y && my <= cp.y + cp.h
+    };
+    // 拖动排序期间保持放大但禁用工具提示（避免 tooltip 反复触发 surface 重建）
+    let cursor = if in_other || in_console {
+        None
+    } else {
+        Some((mx, my))
+    };
+    for (i, sf) in scene_fences.iter_mut().enumerate() {
+        let layout = rt.desk.fences[i].appearance.layout;
+        if layout != FenceLayout::Sidebar {
+            continue;
+        }
+        let icon_size = rt.desk.fences[i].appearance.icon_size * rt.theme.scale;
+        let gap = rt.desk.fences[i].appearance.gap * rt.theme.scale;
+        let (hovered, scales) = sidebar_magnify(
+            &sf.icons,
+            cursor,
+            icon_size,
+            sidebar_eff_gap(icon_size, gap),
+        );
+        for (ic, &sc) in sf.icons.iter_mut().zip(scales.iter()) {
+            ic.scale = sc;
+        }
+        // 悬停目标跟随光标最近的图标（高亮/工具提示与放大一致）。
+        // 仅当光标进入影响半径（hovered 为 Some）才覆盖 rt.hover，否则会把
+        // 其他栅栏上的悬停一并清掉。
+        sf.hover_icon = hovered;
+        // 图标拖动期间抑制工具提示（避免反复出现/消失导致 surface 重建闪烁）
+        if let Some(hi) = hovered {
+            rt.hover = Some((i, hi));
+            if rt.icon_drag.is_none() {
+                if let Some(icon) = sf.icons.get(hi) {
+                    let geom = SidebarGeom {
+                        vw: rt.vw,
+                        vh: rt.vh,
+                        font_size: rt.theme.label.size,
+                        scale: rt.theme.scale,
+                        pos: rt.desk.fences[i].appearance.sidebar_pos,
+                    };
+                    sf.tooltip_rect = Some(sidebar_tooltip_rect(&geom, icon, &icon.label));
+                }
+            }
+        } else {
+            sf.tooltip_rect = None;
+        }
+    }
+}
+
+/// 估算文本物理宽度（委托 core 统一口径：CJK 按字号宽，ASCII 按 0.62 倍宽）。
+pub(crate) fn estimate_text_width(text: &str, font_size: f32) -> f32 {
+    winbosk_core::text::estimate_width(text, font_size)
+}
+
+/// 侧边栏工具提示所需的屏幕/主题几何（虚拟屏尺寸、字号、缩放、停靠边），
+/// 供 `sidebar_tooltip_rect` 归组传参，避免长参数列表。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SidebarGeom {
+    pub vw: f32,
+    pub vh: f32,
+    pub font_size: f32,
+    pub scale: f32,
+    pub pos: SidebarPosition,
+}
+
+/// 侧边栏悬停工具提示矩形：完整名称放在图标旁侧，钳制到虚拟屏幕内。
+///
+/// 纵向 dock（左/右）放图标右侧/左侧、垂直居中对齐；横向 dock（上）放图标下方、
+/// 水平居中对齐。宽度按文本估算 + 20% 安全余量，保证绘制层按同一口径判断时
+/// 不会截断文字。
+pub(crate) fn sidebar_tooltip_rect(geom: &SidebarGeom, icon: &SceneIcon, label: &str) -> RectF {
+    let pad = 7.0 * geom.scale;
+    let w = (estimate_text_width(label, geom.font_size) * 1.2 + pad * 2.0).max(geom.font_size);
+    let h = geom.font_size * 1.6 + pad * 2.0;
+    let gap = 10.0 * geom.scale;
+    let (mut x, mut y) = match geom.pos {
+        SidebarPosition::Left => {
+            let y = icon.y + icon.size / 2.0 - h / 2.0;
+            (icon.x + icon.size + gap, y)
+        }
+        SidebarPosition::Right => {
+            let y = icon.y + icon.size / 2.0 - h / 2.0;
+            (icon.x - gap - w, y)
+        }
+        SidebarPosition::Top => {
+            let x = icon.x + icon.size / 2.0 - w / 2.0;
+            (x, icon.y + icon.size + gap)
+        }
+    };
+    // 钳制到虚拟屏幕内（宽/高超出屏幕时贴边即可，不再外溢）
+    x = x.max(4.0).min((geom.vw - w).max(4.0));
+    y = y.max(4.0).min((geom.vh - h).max(4.0));
+    RectF { x, y, w, h }
+}
+
+/// 由场景几何生成命中模型：栅栏（标题移动把手 + 右下角缩放把手 + 整体区域）与
+/// 图标（双击打开）。`fence`/`icon` 下标与 `desk.fences` / `icon_ids` 对应。
+pub(crate) fn hit_model_from(theme: &Theme, scene: &Scene, _desk: &Desk) -> HitModel {
+    let mut fences = Vec::with_capacity(scene.fences.len());
+    let mut icons = Vec::new();
+    for (fi, f) in scene.fences.iter().enumerate() {
+        // 桌面切换淡出中的栅栏不参与命中（区域随之收缩，点击穿透到桌面）
+        if f.alpha <= 0.01 {
+            continue;
+        }
+        let body = RectF {
+            x: f.x,
+            y: f.y,
+            w: f.width,
+            h: f.height,
+        };
+        let title_h =
+            (theme.title.size * 1.6 + theme.title_padding_bottom + 2.0 * theme.fence_padding)
+                .min(f.height);
+        fences.push(FenceHit {
+            body,
+            title: RectF {
+                x: f.x,
+                y: f.y,
+                w: f.width,
+                h: title_h,
+            },
+            grip: RectF {
+                x: f.x + f.width - GRIP_SIZE,
+                y: f.y + f.height - GRIP_SIZE,
+                w: GRIP_SIZE,
+                h: GRIP_SIZE,
+            },
+            id: fi,
+            tooltip: f.tooltip_rect,
+            is_sidebar: f.layout == FenceLayout::Sidebar,
+            collapse_btn: f.collapse_btn,
+            collapsed: f.collapsed,
+        });
+        // 可视区（列头之下）：滚出可视区的图标不参与命中，避免误点。
+        let view_top = f.content_top + f.list_cols.map(|c| c.header_h).unwrap_or(0.0);
+        let view_bottom = view_top + f.scroll_view;
+        for (ii, icon) in f.icons.iter().enumerate() {
+            if icon.y + icon.size < view_top || icon.y > view_bottom {
+                continue;
+            }
+            // 列表布局整行可点（图标 + 名称 + 详情列），双击/右键/悬停都对整行生效，
+            // 不再只有那一小块图标有反应（列表栅栏「点了没反应」根因）。
+            let rect = if f.layout == FenceLayout::List {
+                let pad = f.content_left - f.x;
+                let row_extent = icon.size.max(theme.label.size * 1.6) + theme.list_row_gap;
+                RectF {
+                    x: f.content_left,
+                    y: icon.y,
+                    w: (f.width - 2.0 * pad).max(1.0),
+                    h: row_extent,
+                }
+            } else {
+                RectF {
+                    x: icon.x,
+                    y: icon.y,
+                    w: icon.size,
+                    h: icon.size,
+                }
+            };
+            icons.push(IconHit {
+                rect,
+                fence: fi,
+                icon: ii,
+            });
+        }
+    }
+    // 控制中心命中（与绘制几何同源）。关闭/淡出中（panel < 0.5）不接收点击；
+    // 展开面板：关闭 / 切换桌面 / 栅栏列表 / 详情控制 / 添加 / 移出。
+    let mut console = None;
+    if let Some(c) = &scene.console {
+        let mut zones = Vec::new();
+        let body = RectF {
+            x: c.x,
+            y: c.y,
+            w: c.width,
+            h: c.height,
+        };
+        if c.panel >= 0.5 {
+            zones.push((ConsoleZone::Close, c.close));
+            zones.push((ConsoleZone::ToggleAdvancedMode, c.mode_toggle));
+            zones.push((ConsoleZone::ToggleSettingsPage, c.settings_toggle));
+
+            if c.is_settings_page {
+                if let Some(sp) = &c.settings_page {
+                    for row in &sp.rows {
+                        zones.push((ConsoleZone::HotkeyRecord(row.action), row.key_btn));
+                        if let Some(clear_btn) = row.clear_btn {
+                            zones.push((ConsoleZone::HotkeyClear(row.action), clear_btn));
+                        }
+                    }
+                    if sp.reset_default_btn.w > 0.0 {
+                        zones.push((ConsoleZone::HotkeyResetDefault, sp.reset_default_btn));
+                    }
+                    if sp.back_btn.w > 0.0 {
+                        zones.push((ConsoleZone::ToggleSettingsPage, sp.back_btn));
+                    }
+                    if sp.quit_btn.w > 0.0 {
+                        zones.push((ConsoleZone::QuitApp, sp.quit_btn));
+                    }
+                }
+            } else {
+                zones.push((ConsoleZone::AddFence, c.add_fence));
+                zones.push((ConsoleZone::AutoOrganize, c.organize_btn));
+                zones.push((ConsoleZone::RemoveFence, c.remove_btn));
+                zones.push((ConsoleZone::DesktopToggle, c.desktop_toggle));
+                zones.push((ConsoleZone::AutostartToggle, c.autostart_toggle));
+                for (i, r) in c.fence_rows.iter().enumerate() {
+                    // 滚出可视区的行不参与命中（避免点到详情区时误中隐藏行）
+                    if r.rect.y + r.rect.h < c.fence_list_view.y
+                        || r.rect.y > c.fence_list_view.y + c.fence_list_view.h
+                    {
+                        continue;
+                    }
+                    zones.push((ConsoleZone::FenceSelect(i), r.rect));
+                }
+                if let Some(d) = &c.fence_detail {
+                    // 值行只有路径可点（= 打开落地目录）；状态标签**不是热区**（它是"状态"不是按钮）。
+                    // 此前把路径整块接成 `ChangeStoragePath`，导致"看着像灰字却能点、
+                    // 看着像按钮的状态标签却点不动"这对反转，用户读不出哪个是动作。
+                    // 现在路径接的是**无害且可逆**的"打开目录"，且 hover 会提亮 + 下划线（见 draw 层），
+                    // 所以"可点"这件事是看得见的——与破坏性的"更改文件位置…"彻底分开。
+                    // 命中区构造抽在 `storage_zones`（纯函数，单测直接断言这张表）。
+                    zones.extend(storage_zones(
+                        d.storage_path_hit,
+                        d.storage_btn,
+                        d.storage_reset,
+                    ));
+                    zones.push((ConsoleZone::FenceLayout(FenceLayout::Grid), d.layout_grid));
+                    zones.push((ConsoleZone::FenceLayout(FenceLayout::List), d.layout_list));
+                    zones.push((
+                        ConsoleZone::FenceLayout(FenceLayout::Sidebar),
+                        d.layout_sidebar,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceSidebarPos(SidebarPosition::Left),
+                        d.sidebar_left,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceSidebarPos(SidebarPosition::Top),
+                        d.sidebar_top,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceSidebarPos(SidebarPosition::Right),
+                        d.sidebar_right,
+                    ));
+                    zones.push((ConsoleZone::FenceIconSize(32.0), d.size_s));
+                    zones.push((ConsoleZone::FenceIconSize(48.0), d.size_m));
+                    zones.push((ConsoleZone::FenceIconSize(64.0), d.size_l));
+                    zones.push((ConsoleZone::FenceStyle(FenceStyle::Glass), d.style_glass));
+                    zones.push((
+                        ConsoleZone::FenceStyle(FenceStyle::Outline),
+                        d.style_outline,
+                    ));
+                    zones.push((ConsoleZone::FenceStyle(FenceStyle::Filled), d.style_filled));
+                    zones.push((ConsoleZone::FenceStyle(FenceStyle::Blur), d.style_blur));
+                    zones.push((ConsoleZone::FenceTint(None), d.tint_default));
+                    for (i, r) in d.tints.iter().enumerate() {
+                        if let Some((_, c)) = TINT_PRESETS.get(i) {
+                            zones.push((ConsoleZone::FenceTint(Some(*c)), *r));
+                        }
+                    }
+                    zones.push((ConsoleZone::FenceRulePreset(None), d.rule_none));
+                    zones.push((
+                        ConsoleZone::FenceRulePreset(Some(
+                            winbosk_core::model::CategoryPreset::Apps,
+                        )),
+                        d.rule_apps,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceRulePreset(Some(
+                            winbosk_core::model::CategoryPreset::Documents,
+                        )),
+                        d.rule_docs,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceRulePreset(Some(
+                            winbosk_core::model::CategoryPreset::Media,
+                        )),
+                        d.rule_media,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceRulePreset(Some(
+                            winbosk_core::model::CategoryPreset::Archives,
+                        )),
+                        d.rule_archives,
+                    ));
+                    zones.push((
+                        ConsoleZone::FenceRulePreset(Some(
+                            winbosk_core::model::CategoryPreset::Folders,
+                        )),
+                        d.rule_folders,
+                    ));
+                }
+                if let Some(re) = &c.rule_editor {
+                    zones.push((ConsoleZone::RuleToggleEnabled, re.toggle_btn));
+                    for (preset, rect, _) in &re.preset_chips {
+                        zones.push((ConsoleZone::FenceRulePreset(*preset), *rect));
+                    }
+                    zones.push((ConsoleZone::RuleEnterCustom, re.custom_chip.0));
+                    if let Some(eb) = re.edit_custom_btn {
+                        zones.push((ConsoleZone::RuleEnterCustom, eb));
+                    }
+                    for (i, (_, _, del_btn)) in re.ext_chips.iter().enumerate() {
+                        zones.push((ConsoleZone::RuleDeleteExtension(i), *del_btn));
+                    }
+                    if re.add_ext_btn.w > 0.0 {
+                        zones.push((ConsoleZone::RuleAddExtension, re.add_ext_btn));
+                    }
+                    for (i, (_, _, del_btn)) in re.exclude_chips.iter().enumerate() {
+                        zones.push((ConsoleZone::RuleDeleteExcludeExtension(i), *del_btn));
+                    }
+                    if re.add_exclude_btn.w > 0.0 {
+                        zones.push((ConsoleZone::RuleAddExcludeExtension, re.add_exclude_btn));
+                    }
+                    for (i, (_, _, del_btn)) in re.pattern_chips.iter().enumerate() {
+                        zones.push((ConsoleZone::RuleDeletePattern(i), *del_btn));
+                    }
+                    if re.add_pattern_btn.w > 0.0 {
+                        zones.push((ConsoleZone::RuleAddPattern, re.add_pattern_btn));
+                    }
+                    zones.push((ConsoleZone::RuleToggleAutoCapture, re.auto_capture_toggle));
+                    zones.push((ConsoleZone::RuleApplyFence, re.apply_btn));
+                }
+            }
+        }
+        console = Some(ConsoleHit {
+            rect: body,
+            title: RectF {
+                x: c.x,
+                y: c.y,
+                w: c.width,
+                h: c.title_h,
+            },
+            zones,
+        });
+    }
+    HitModel {
+        fences,
+        icons,
+        console,
+        // 内联编辑框浮于栅栏之上：overlay 据此把框内点击路由到 EditCaret（定位光标）
+        edit_rect: scene.edit.as_ref().map(|e| e.rect),
+        // 占位框只并入窗口区域（区域外画不出来），不进入 `fences` —— 它绝不能
+        // 变成命中热区，否则会出现"看不见却能点"的死区。
+        reserved: scene.reserved.iter().map(|r| r.rect).collect(),
+        // 拖动幽灵同理：它跟着光标能跑到裸桌面上（区域外），不并入就被裁掉。
+        icon_drag_ghost: scene.icon_drag.map(|d| d.ghost),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_fence(layout: FenceLayout) -> Fence {
+        Fence {
+            id: 1,
+            title: Some("测试".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: vec!["a".into(), "b".into(), "c".into()],
+            appearance: FenceAppearance {
+                layout,
+                icon_size: 48.0,
+                gap: 10.0,
+                ..FenceAppearance::default()
+            },
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed: false,
+        }
+    }
+
+    /// 纵向 dock 被拖到任务栏以下 → 夹回工作区：下沿恰好贴住任务栏上沿。
+    #[test]
+    fn clamp_sidebar_work_rect_keeps_dock_above_taskbar() {
+        // 工作区 = 全屏扣掉底部 120px 任务栏
+        let wa = Rect::new(0.0, 0.0, 1920.0, 1560.0);
+        let dock = Rect::new(0.0, 1580.0, 168.0, 472.0); // 底 2052 > wa.bottom
+        let out = clamp_sidebar_work_rect(dock, wa, SidebarPosition::Left);
+        assert_eq!(out.bottom(), wa.bottom());
+        assert!(out.y >= wa.y);
+    }
+
+    /// 纵向 dock 高度超出工作区 → 收缩到工作区高并贴顶，不溢出。
+    #[test]
+    fn clamp_sidebar_work_rect_shrinks_oversized_dock() {
+        let wa = Rect::new(0.0, 0.0, 1920.0, 1560.0);
+        let dock = Rect::new(0.0, 0.0, 168.0, 3000.0);
+        let out = clamp_sidebar_work_rect(dock, wa, SidebarPosition::Right);
+        assert_eq!(out.h, wa.h);
+        assert_eq!(out.y, wa.y);
+        assert!(out.bottom() <= wa.bottom());
+    }
+
+    /// 横向 dock 右沿越出工作区 → 夹回工作区右缘，左边不越界。
+    #[test]
+    fn clamp_sidebar_work_rect_top_dock_horizontal() {
+        let wa = Rect::new(0.0, 0.0, 1920.0, 1560.0);
+        let dock = Rect::new(1800.0, 0.0, 400.0, 168.0); // 右 2200 > wa.right
+        let out = clamp_sidebar_work_rect(dock, wa, SidebarPosition::Top);
+        assert_eq!(out.right(), wa.right());
+        assert!(out.x >= wa.x);
+    }
+
+    /// 已在工作区内的 dock 原样保留（不动）。
+    #[test]
+    fn clamp_sidebar_work_rect_untouched_when_inside() {
+        let wa = Rect::new(0.0, 0.0, 1920.0, 1560.0);
+        let dock = Rect::new(0.0, 400.0, 168.0, 472.0);
+        assert_eq!(
+            clamp_sidebar_work_rect(dock, wa, SidebarPosition::Left),
+            dock
+        );
+    }
+
+    /// 纵向 dock：宽 = 紧贴放大图标（1.5×图标 + 两侧 6 逻辑 px 呼吸边），
+    /// 高随图标数自适应但不超过屏幕。
+    #[test]
+    fn sidebar_dock_rect_vertical_fits_within_screen() {
+        // scale=2：icon=96, gap=20, eff_gap=68, pad=24；3 图标内容 = 3*96+2*68 = 424
+        let f = test_fence(FenceLayout::Sidebar);
+        let wa = Rect::new(0.0, 0.0, 3072.0, 1920.0);
+        let r = sidebar_dock_rect(2.0, &f, &wa);
+        assert_eq!(r.x, 0.0);
+        assert_eq!(r.w, 168.0); // 96*1.5 + 6*2*2
+        assert_eq!(r.h, 472.0); // 424 + 48
+        assert_eq!(r.y, (1920.0 - 472.0) / 2.0);
+        assert!(r.y >= 0.0 && r.y + r.h <= 1920.0);
+    }
+
+    /// 图标多到放不下时，高度被夹到屏幕高、顶部贴屏幕边缘（不会跑到屏幕外）。
+    #[test]
+    fn sidebar_dock_rect_clamps_full_height_for_many_icons() {
+        let mut f = test_fence(FenceLayout::Sidebar);
+        f.icon_ids = (0..29).map(|i| format!("icon{i}")).collect();
+        let wa = Rect::new(0.0, 0.0, 1920.0, 1920.0);
+        let r = sidebar_dock_rect(2.0, &f, &wa);
+        assert_eq!(r.h, 1920.0);
+        assert_eq!(r.y, 0.0);
+        assert!(r.x + r.w <= 1920.0);
+    }
+
+    /// 右侧停靠：dock 贴屏幕右缘。
+    #[test]
+    fn sidebar_dock_rect_right_anchors_to_right_edge() {
+        let mut f = test_fence(FenceLayout::Sidebar);
+        f.appearance.sidebar_pos = SidebarPosition::Right;
+        let wa = Rect::new(0.0, 0.0, 3072.0, 1920.0);
+        let r = sidebar_dock_rect(2.0, &f, &wa);
+        assert_eq!(r.x, 3072.0 - r.w);
+        assert!(r.x >= 0.0);
+    }
+
+    /// 上侧停靠：横向 dock（厚度 = 紧贴放大图标、宽自适应），贴屏幕顶缘。
+    #[test]
+    fn sidebar_dock_rect_top_makes_horizontal_dock() {
+        let mut f = test_fence(FenceLayout::Sidebar);
+        f.appearance.sidebar_pos = SidebarPosition::Top;
+        let wa = Rect::new(0.0, 0.0, 3072.0, 1920.0);
+        let r = sidebar_dock_rect(2.0, &f, &wa);
+        assert_eq!(r.h, 168.0); // 96*1.5 + 6*2*2
+        assert_eq!(r.y, 0.0);
+        assert_eq!(r.w, 472.0); // 424 + 48
+        assert_eq!(r.x, (3072.0 - 472.0) / 2.0);
+        assert!(r.x >= 0.0 && r.x + r.w <= 3072.0);
+    }
+
+    /// 空栅栏：至少留出一个可点击的最小 dock 尺寸。
+    #[test]
+    fn sidebar_dock_rect_empty_fence_keeps_min_size() {
+        let mut f = test_fence(FenceLayout::Sidebar);
+        f.icon_ids.clear();
+        let wa = Rect::new(0.0, 0.0, 1920.0, 1920.0);
+        let r = sidebar_dock_rect(2.0, &f, &wa);
+        assert_eq!(r.h, 200.0); // clamp 下限 100*scale
+        assert_eq!(r.w, 168.0); // 96*1.5 + 6*2*2
+    }
+
+    /// 有效间距：step = icon + eff_gap ≥ 1.5×icon，相邻两图标都放大到 1.5× 时不相叠。
+    #[test]
+    fn sidebar_eff_gap_prevents_magnified_overlap() {
+        let icon = 48.0;
+        let gap = 10.0;
+        let eff = sidebar_eff_gap(icon, gap);
+        assert_eq!(eff, gap + icon * 0.5);
+        let step = icon + eff;
+        assert!(step >= icon * 1.5, "step {step} 应 ≥ 1.5×图标");
+        // 两图标都放大到 1.5× 时，相邻边缘应不相交（≥ 恰好贴合）
+        assert!(step - icon * 1.5 >= -0.001);
+    }
+
+    fn test_icon(x: f32, y: f32, size: f32) -> SceneIcon {
+        SceneIcon {
+            label: String::new(),
+            bitmap_id: 0,
+            x,
+            y,
+            size,
+            col_type: String::new(),
+            col_modified: String::new(),
+            col_size: String::new(),
+            scale: 1.0,
+        }
+    }
+
+    /// 光标不在任何图标附近：全部复位 1.0，无悬停。
+    #[test]
+    fn magnify_resets_when_cursor_far() {
+        let icons = vec![test_icon(0.0, 0.0, 48.0), test_icon(0.0, 116.0, 48.0)];
+        // 影响半径 = 4*(48+10)=232，中心约在 (24, 24)/(24, 140)
+        let (hovered, scales) = sidebar_magnify(&icons, Some((24.0, 1000.0)), 48.0, 10.0);
+        assert!(hovered.is_none());
+        assert!(scales.iter().all(|&s| s == 1.0));
+    }
+
+    /// 光标在图标正中心：该图标 1.5x，最近 = 该图标。
+    #[test]
+    fn magnify_peak_at_icon_center() {
+        let icons = vec![test_icon(0.0, 0.0, 48.0), test_icon(0.0, 116.0, 48.0)];
+        let (hovered, scales) = sidebar_magnify(&icons, Some((24.0, 24.0)), 48.0, 10.0);
+        assert_eq!(hovered, Some(0));
+        assert!((scales[0] - 1.5).abs() < 0.001);
+        assert!(scales[1] > 1.0 && scales[1] < 1.5);
+    }
+
+    /// 在两个图标中点：两个图标缩放相等（连续过渡不跳档），最近 = 先遇到的。
+    #[test]
+    fn magnify_is_continuous_between_icons() {
+        let icons = vec![test_icon(0.0, 0.0, 48.0), test_icon(0.0, 116.0, 48.0)];
+        // 中点 y=58（图标中心 24 与 140 的中点）
+        let (hovered, scales) = sidebar_magnify(&icons, Some((24.0, 82.0)), 48.0, 10.0);
+        assert_eq!(hovered, Some(0)); // 距离相等时保持先遇到的
+        assert!((scales[0] - scales[1]).abs() < 0.001);
+        assert!(scales[0] > 1.0);
+    }
+
+    /// 越靠近图标中心缩放越大（单调）；靠近中心一侧的图标更大。
+    #[test]
+    fn magnify_monotonic_toward_center() {
+        let icons = vec![test_icon(0.0, 0.0, 48.0), test_icon(0.0, 116.0, 48.0)];
+        let center = (24.0, 24.0);
+        let (_, s_at_center) = sidebar_magnify(&icons, Some(center), 48.0, 10.0);
+        let (_, s_mid) = sidebar_magnify(&icons, Some((24.0, 60.0)), 48.0, 10.0);
+        // 中心图标在自身中心处比靠近中点时更大
+        assert!(s_at_center[0] > s_mid[0]);
+        // 靠近中点时第二个图标开始被带起来
+        assert!(s_mid[1] > 1.0);
+    }
+
+    #[test]
+    fn compute_fence_scroll_for_selection_bounds() {
+        let scale = 1.0;
+        let row_h = CONSOLE_FENCE_ROW_H * scale; // 36.0
+        let max_rows = CONSOLE_FENCE_MAX_ROWS; // 5
+        let n = 10;
+        let max_scroll = (n - max_rows) as f32 * row_h; // 5 * 36 = 180.0
+
+        // 栅栏数不足 5 行时，滚动恒为 0
+        assert_eq!(compute_fence_scroll_for_selection(50.0, 2, 4, scale), 0.0);
+
+        // 选中第一行 (index 0)，若原本在底部 (180.0)，应向上滚动到 0.0
+        assert_eq!(compute_fence_scroll_for_selection(180.0, 0, n, scale), 0.0);
+
+        // 选中第 2 行 (index 1)，在当前视口 [0, 180] 内，应保持原滚动位置不变
+        assert_eq!(compute_fence_scroll_for_selection(0.0, 1, n, scale), 0.0);
+
+        // 选中最后一行 (index 9)，若原本在顶部 (0.0)，应向下滚动到 180.0
+        assert_eq!(
+            compute_fence_scroll_for_selection(0.0, 9, n, scale),
+            max_scroll
+        );
+
+        // 选中第 7 行 (index 6)，若原本在顶部 (0.0)，行底为 7*36=252，视口高 5*36=180，应滚动至 252 - 180 = 72.0
+        assert_eq!(compute_fence_scroll_for_selection(0.0, 6, n, scale), 72.0);
+    }
+
+    #[test]
+    fn resolve_desktop_fence_semantics() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        let mut f_work = test_fence(FenceLayout::Grid);
+        f_work.id = 1;
+        f_work.title = Some("工作".into());
+
+        let mut f_desktop = test_fence(FenceLayout::Grid);
+        f_desktop.id = 2;
+        f_desktop.title = Some("桌面".into());
+
+        desk.fences = vec![f_work.clone(), f_desktop.clone()];
+
+        // 1. 优先解析名为「桌面」的栅栏
+        assert_eq!(resolve_desktop_fence(&desk, None), Some(2));
+
+        // 2. 当「桌面」栅栏被排除（如正在删除它）时，回退到普通栅栏
+        assert_eq!(resolve_desktop_fence(&desk, Some(2)), Some(1));
+
+        // 3. 当全部栅栏均被排除时，返回 None
+        assert_eq!(resolve_desktop_fence(&desk, Some(1)), Some(2));
+        desk.fences = vec![f_work];
+        assert_eq!(resolve_desktop_fence(&desk, Some(1)), None);
+    }
+
+    #[test]
+    fn adjust_selected_fence_on_delete_behavior() {
+        // 场景：共 5 个栅栏 [0, 1, 2, 3, 4]
+        // 1. 当前选中 index 3，删除 index 1（在前）：选中变为 2
+        assert_eq!(adjust_selected_fence_on_delete(3, 1, 4), 2);
+
+        // 2. 当前选中 index 1，删除 index 3（在后）：选中保持 1
+        assert_eq!(adjust_selected_fence_on_delete(1, 3, 4), 1);
+
+        // 3. 当前选中 index 4（最后一项），删除 index 4：选中变为 3
+        assert_eq!(adjust_selected_fence_on_delete(4, 4, 4), 3);
+
+        // 4. 当前选中 index 0，删除 index 0，剩余 4 个：选中保持 0
+        assert_eq!(adjust_selected_fence_on_delete(0, 0, 4), 0);
+
+        // 5. 边界：只剩 1 个栅栏并被删除，剩余 0 个：钳制为 0
+        assert_eq!(adjust_selected_fence_on_delete(0, 0, 0), 0);
+    }
+
+    /// 守住「`12.0 * s.clamp(MIN_H*s, MAX_H*s)` ≡ 2040·s」笔误回归——曾把面板底部凭空
+    /// 多出约 2040 像素空白，几乎撑满屏幕；这里断言底部留白恰好 `12.0 * s`，且
+    /// 空桌面（无栅栏）下面板总高不超过屏幕一半（4K 屏 2160/2=1080）。
+    #[test]
+    fn console_full_height_no_bogus_bottom_padding() {
+        use winbosk_core::{config::AppSettings, model::Desk};
+        let desk = Desk::new(AppSettings::default());
+        let s = 1.0_f32;
+        let full = console_full_height(&desk, 0, s, ConsolePage::Fences);
+        // 内容底部 = 标题 + 列表(0 行) + 详情 + 四个按钮 + 三处间隙
+        let detail = detail_visible_rows(&desk, 0, s);
+        let rows_h =
+            (desk.fences.len().min(CONSOLE_FENCE_MAX_ROWS)) as f32 * CONSOLE_FENCE_ROW_H * s;
+        let content_bottom = CONSOLE_TITLE_H * s
+            + 8.0 * s
+            + rows_h
+            + 8.0 * s
+            + detail
+            + 8.0 * s
+            + CONSOLE_ADD_BTN_H * s * 4.0
+            + 8.0 * s * 3.0;
+        let bottom_padding = full - content_bottom;
+        assert!(
+            (bottom_padding - 12.0 * s).abs() < 1e-3,
+            "底部留白应恰好 12*s（s=1 时为 12），实测 {bottom_padding}"
+        );
+        // 二道防线：空桌面下总高不应撑过屏幕一半
+        assert!(
+            full < 1080.0,
+            "面板总高 {full} 异常——疑似 clamp 笔误让高度再次爆涨"
+        );
+    }
+
+    /// 卷帘揭示的几何契约（plan 06 §G1/G4）：
+    /// - panel=0 → 高度为 0；panel=1 → 高度贴合内容；过冲段高度被钳到 `CONSOLE_OVERSHOOT_MAX`
+    ///   倍且面板底边不越屏；极小屏下面板高度不小于 `CONSOLE_MIN_H`。
+    #[test]
+    fn console_geometry_reveals_by_panel_progress() {
+        use winbosk_core::{config::AppSettings, model::Desk};
+        use winbosk_render::theme::Theme;
+        let desk = Desk::new(AppSettings::default());
+        // 用结构体更新语法而非 `Default::default()` 后再改字段（clippy::field_reassign_with_default）
+        let theme = Theme {
+            scale: 1.0,
+            ..Theme::default()
+        };
+        let vw = 3840.0_f32;
+        let vh = 2160.0_f32;
+        let full_h = console_full_height(&desk, 0, 1.0, ConsolePage::Fences);
+
+        // 折叠：panel=0 完全不渲染
+        let zero = console_geometry(&desk, &theme, vw, vh, 0.0, 0, ConsolePage::Fences);
+        assert_eq!(zero.h, 0.0, "panel=0 应完全折叠");
+
+        // 展开中：panel=0.5 高度恰为 full_h * 0.5
+        let half = console_geometry(&desk, &theme, vw, vh, 0.5, 0, ConsolePage::Fences);
+        assert!(
+            (half.h - full_h * 0.5).abs() < 1e-3,
+            "panel=0.5 高度={}, 期望={}",
+            half.h,
+            full_h * 0.5
+        );
+
+        // 稳态：panel=1 高度 = 内容高度
+        let full = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Fences);
+        assert!(
+            (full.h - full_h).abs() < 1e-3,
+            "panel=1 高度={}, 期望={}",
+            full.h,
+            full_h
+        );
+        assert!(full.h < vh / 2.0, "panel=1 高度 {} 已撑过屏幕一半", full.h);
+
+        // 过冲钳制：panel=2.0（理论过冲 100%）被钳到 max_h，
+        // 面板底边绝不越出屏幕
+        let over = console_geometry(&desk, &theme, vw, vh, 2.0, 0, ConsolePage::Fences);
+        let max_h = ((vh - 2.0 * CONSOLE_MARGIN) / CONSOLE_OVERSHOOT_MAX).max(CONSOLE_MIN_H);
+        assert!(
+            over.h <= max_h + 1e-3,
+            "过冲钳制失效：over.h={}, max_h={}",
+            over.h,
+            max_h
+        );
+        assert!(
+            over.y + over.h <= vh,
+            "过冲后面板底边 {} 越出屏 {}",
+            over.y + over.h,
+            vh
+        );
+
+        // 极小屏：max_h 被 MIN_H 兜底，面板仍可交互
+        let tiny = console_geometry(&desk, &theme, 800.0, 100.0, 1.0, 0, ConsolePage::Fences);
+        assert!(
+            tiny.h >= CONSOLE_MIN_H,
+            "小屏高度 {} 小于最小高 {}",
+            tiny.h,
+            CONSOLE_MIN_H
+        );
+    }
+
+    /// 收起态栅栏的碰撞矩形（供占位框测试）。
+    fn collapsed_grid_fence(x: f32, y: f32) -> Fence {
+        let mut f = test_fence(FenceLayout::Grid);
+        f.bounds = Rect::new(x, y, 300.0, 400.0);
+        f.collapsed = true;
+        f
+    }
+
+    /// 占位框的出现条件：被拖动的收起栅栏 + 拒绝了本次请求位置的收起栅栏。
+    /// 几何必须等于碰撞矩形本身（同源），否则提示会与实际阻挡脱节。
+    #[test]
+    fn reserved_frames_follow_drag_and_blockers() {
+        use winbosk_core::config::AppSettings;
+        let theme = Theme::default();
+        let mut desk = Desk::new(AppSettings::default());
+        desk.fences.push(collapsed_grid_fence(500.0, 200.0)); // 被拖的（原尺寸 300x400）
+        desk.fences.push(collapsed_grid_fence(900.0, 200.0)); // 挡路的
+        let layout_h = vec![400.0, 400.0];
+
+        // 无拖动 → 一个都不画
+        assert!(reserved_frames(&desk, &layout_h, None, &theme, 1.0).is_empty());
+
+        // 桌面切换淡出到不可见 → 不画（与栅栏同步）
+        let hint = DragHint {
+            fence: 1,
+            requested: Rect::new(560.0, 200.0, 300.0, 400.0),
+        };
+        assert!(reserved_frames(&desk, &layout_h, Some(&hint), &theme, 0.0).is_empty());
+
+        // 拖动 1 号压向 0 号：自己的占位框 + 挡路者的占位框
+        let frames = reserved_frames(&desk, &layout_h, Some(&hint), &theme, 1.0);
+        assert_eq!(frames.len(), 2, "自身 + 挡路者各一个");
+        assert_eq!(frames[0].fence, 1, "先列被拖动的栅栏");
+        assert_eq!(frames[1].fence, 0, "再列挡住它的收起栅栏");
+        assert_eq!(
+            frames[1].rect,
+            RectF {
+                x: 500.0,
+                y: 200.0,
+                w: 300.0,
+                h: 400.0
+            },
+            "占位矩形必须等于碰撞矩形（同源）"
+        );
+        assert!(frames[1].stroke_color[3] > 0.0);
+        assert!(
+            frames[1].fill_color.expect("应带极淡填充")[3] < frames[1].stroke_color[3],
+            "填充必须比描边更淡"
+        );
+
+        // 请求位置远离 0 号 → 只剩被拖的自己（不再误报"挡路"）
+        let far = DragHint {
+            fence: 1,
+            requested: Rect::new(1600.0, 800.0, 300.0, 400.0),
+        };
+        let frames = reserved_frames(&desk, &layout_h, Some(&far), &theme, 1.0);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].fence, 1);
+    }
+
+    /// 展开态与侧边栏都不画占位框：前者视觉=模型无需解释，后者不支持折叠
+    ///（即便配置里残留了 collapsed 标记）。
+    #[test]
+    fn reserved_frames_skips_expanded_and_sidebar() {
+        use winbosk_core::config::AppSettings;
+        let theme = Theme::default();
+        let mut desk = Desk::new(AppSettings::default());
+        let mut expanded = test_fence(FenceLayout::Grid);
+        expanded.bounds = Rect::new(100.0, 100.0, 300.0, 400.0);
+        desk.fences.push(expanded);
+        let mut dock = test_fence(FenceLayout::Sidebar);
+        dock.bounds = Rect::new(0.0, 0.0, 168.0, 400.0);
+        dock.collapsed = true;
+        desk.fences.push(dock);
+
+        let hint = DragHint {
+            fence: 0,
+            requested: Rect::new(100.0, 100.0, 300.0, 400.0),
+        };
+        assert!(reserved_frames(&desk, &[400.0, 400.0], Some(&hint), &theme, 1.0).is_empty());
+    }
+
+    /// 原矩形与收起后的可见高度几乎一致时不画：那只是噪音，没有要解释的约束。
+    #[test]
+    fn reserved_frames_skips_negligible_height_gap() {
+        use winbosk_core::config::AppSettings;
+        let theme = Theme::default();
+        let mut desk = Desk::new(AppSettings::default());
+        let mut f = test_fence(FenceLayout::Grid);
+        let title_h = collapsed_title_h(&theme, &f.appearance);
+        let h = title_h + 2.0;
+        f.bounds = Rect::new(100.0, 100.0, 300.0, h);
+        f.collapsed = true;
+        desk.fences.push(f);
+
+        let hint = DragHint {
+            fence: 0,
+            requested: Rect::new(100.0, 100.0, 300.0, h),
+        };
+        assert!(reserved_frames(&desk, &[h], Some(&hint), &theme, 1.0).is_empty());
+    }
+
+    /// 详情区矩形（与 `build_console` 同源口径）。
+    ///
+    /// 注意 `panel_w` 是**DIP 常量**（`CONSOLE_W` / `CONSOLE_MIN_W`），面板实际宽度是
+    /// `panel_w * s`——漏乘 `s` 会让高 DPI 下的测试用一条假想的窄面板去判定重叠。
+    fn test_detail_rect(panel_w: f32, s: f32) -> RectF {
+        RectF {
+            x: 100.0,
+            y: 200.0,
+            w: panel_w * s - 2.0 * CONSOLE_PAD * s,
+            h: CONSOLE_FENCE_DETAIL_H * s,
+        }
+    }
+
+    /// 按 DPI 缩放系数取主题（与 `main.rs` 的启动路径同一函数，保证口径同源）。
+    fn test_theme(s: f32) -> Theme {
+        let mut theme = Theme::default();
+        apply_theme_scale(&mut theme, s);
+        theme
+    }
+
+    /// 「文件位置」行**参与排布**的全部矩形（`value_row` 是标签锚点、不绘制，故不计入）。
+    ///
+    /// `path_hit` 刻意不在内：它是 `path` 的**子矩形**（同 x/y、宽度贴字形 ≤ `path.w`），
+    /// 天然与 `path` 重叠。它的契约由 `storage_row_geometry_path_hit_hugs_text` 单独覆盖。
+    fn storage_rects(row: &StorageRow) -> [(&'static str, RectF); 5] {
+        [
+            ("tag", row.tag),
+            ("path", row.path),
+            ("change", row.change),
+            ("reset", row.reset),
+            ("hint", row.hint),
+        ]
+    }
+
+    /// 两个矩形是否真的相交（1e-3 容差，避免浮点擦边判成重叠）。
+    fn overlaps(a: &RectF, b: &RectF) -> bool {
+        a.x < b.x + b.w - 1e-3
+            && b.x < a.x + a.w - 1e-3
+            && a.y < b.y + b.h - 1e-3
+            && b.y < a.y + a.h - 1e-3
+    }
+
+    /// 空间互斥（指南 §4.1）：全宽/最小宽 × 三种 DPI × 两种模式 × `can_reset` 两种取值下，
+    /// 「文件位置」行的五个**排布**矩形两两不重叠，且全部落在详情区左右内缘之内。
+    /// （`path_hit` 不在内：它是 `path` 的子矩形，由 `..._path_hit_hugs_text` 单独覆盖。）
+    /// 这条断言是"标签归标签、值归值、动作归动作"在几何上的最终保险。
+    #[test]
+    fn storage_row_geometry_is_pairwise_disjoint() {
+        let long_path = r"D:\归档\非常长的中文目录名称\另一个子目录\最后的文件夹";
+        for (panel_w, s) in [
+            (CONSOLE_W, 1.0_f32),
+            (CONSOLE_MIN_W, 1.0),
+            (CONSOLE_W, 1.5),
+            (CONSOLE_MIN_W, 2.0),
+        ] {
+            let theme = test_theme(s);
+            let d = test_detail_rect(panel_w, s);
+            let inner_left = d.x + 2.0 * s;
+            let inner_right = d.x + d.w - 2.0 * s;
+            for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                for can_reset in [false, true] {
+                    let row = storage_row_geometry(&d, 300.0, kind, can_reset, long_path, &theme);
+                    let rects = storage_rects(&row);
+                    for (i, (na, a)) in rects.iter().enumerate() {
+                        if a.w <= 0.0 || a.h <= 0.0 {
+                            continue; // 零矩形 = 不出现
+                        }
+                        assert!(
+                            a.x >= inner_left - 1e-3 && a.x + a.w <= inner_right + 1e-3,
+                            "panel={panel_w} s={s} {kind:?} reset={can_reset}: {na} 越出详情区 \
+                             [{inner_left}, {inner_right}]，实际 [{}, {}]",
+                            a.x,
+                            a.x + a.w
+                        );
+                        for (nb, b) in &rects[i + 1..] {
+                            if b.w <= 0.0 || b.h <= 0.0 {
+                                continue;
+                            }
+                            assert!(
+                                !overlaps(a, b),
+                                "panel={panel_w} s={s} {kind:?} reset={can_reset}: \
+                                 {na}{a:?} 与 {nb}{b:?} 重叠"
+                            );
+                        }
+                    }
+                    // 路径与标签永不为零（值行必须能显示"存在哪"）
+                    assert!(row.tag.w > 0.0 && row.tag.h > 0.0);
+                    assert!(
+                        row.path_hit.w > 0.0,
+                        "路径必须可点（它是值行唯一的动作：打开落地目录）"
+                    );
+                    assert!(row.change.w > 0.0, "「更改文件位置…」必须始终可见");
+                }
+            }
+        }
+    }
+
+    /// 后果提示的显隐契约：
+    /// - **默认面板宽度**下两种模式都必须常显（这是本行的核心信息，不能靠 hover 才看见）；
+    /// - 面板被拖到最小宽时空间不足，允许整条不画（**有意的降级**——宁可不说，
+    ///   也不截半个字或压住动作按钮）；
+    /// - 任何宽度下"空文案 ⟺ 零矩形"必须成立，否则会画出空框或画出没有矩形的文字。
+    #[test]
+    fn storage_row_geometry_hint_visibility() {
+        let theme = test_theme(1.0);
+        let full = test_detail_rect(CONSOLE_W, 1.0);
+        let path = r"D:\归档";
+
+        for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+            let row = storage_row_geometry(
+                &full,
+                0.0,
+                kind,
+                kind == StorageKind::ExternalFolder,
+                path,
+                &theme,
+            );
+            assert!(
+                !row.hint_text.is_empty(),
+                "默认宽度下 {kind:?} 必须显示后果提示"
+            );
+            assert!(row.hint.h > 0.0 && row.hint.w > 0.0);
+        }
+
+        for panel_w in [CONSOLE_W, CONSOLE_MIN_W] {
+            let d = test_detail_rect(panel_w, 1.0);
+            for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                for can_reset in [false, true] {
+                    let row = storage_row_geometry(&d, 0.0, kind, can_reset, path, &theme);
+                    assert_eq!(
+                        row.hint_text.is_empty(),
+                        row.hint.h <= 0.0,
+                        "panel={panel_w} {kind:?} reset={can_reset}：文案与矩形必须同时在场或同时缺席"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 「恢复默认」缺席时必须是零矩形（应用内部库已是默认，无按钮可点），
+    /// 且此时动作行右侧只剩「更改文件位置…」——提示语预算因此更大。
+    #[test]
+    fn storage_row_geometry_reset_absent_is_zero_rect() {
+        let theme = test_theme(1.0);
+        let d = test_detail_rect(CONSOLE_W, 1.0);
+        let without =
+            storage_row_geometry(&d, 0.0, StorageKind::AppLibrary, false, "C:\\x", &theme);
+        assert!(
+            without.reset.h <= 0.0 && without.reset.w <= 0.0,
+            "不可回退时「恢复默认」必须是零矩形"
+        );
+        let with =
+            storage_row_geometry(&d, 0.0, StorageKind::ExternalFolder, true, "C:\\x", &theme);
+        assert!(with.reset.w > 0.0, "外部文件夹模式必须给出「恢复默认」");
+        assert!(
+            with.reset.x + with.reset.w < with.change.x,
+            "「恢复默认」必须排在「更改文件位置…」左侧且不重叠"
+        );
+        assert!(
+            without.hint.w > with.hint.w,
+            "少了「恢复默认」，提示语预算应变宽"
+        );
+    }
+
+    /// 路径必须**吃满值行剩余宽度**——值行里不允许再出现任何占位控件。
+    ///
+    /// 这是「路径预算被按钮悄悄吃掉」的回归保险：曾经值行右端有一个 40·s 的「打开」幽灵按钮，
+    /// 实测让默认面板宽下的库路径从"完整显示（40 字）"退化成 `G:\…\debug\data\library`（23 字）。
+    /// 现在动作改由路径自身承担（点路径 = 打开目录），故路径右缘必须精确落在详情区内缘。
+    #[test]
+    fn storage_row_geometry_path_owns_rest_of_value_row() {
+        for s in [1.0f32, 1.25, 1.5, 2.0] {
+            for panel_w in [CONSOLE_W, CONSOLE_MIN_W] {
+                for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                    for can_reset in [false, true] {
+                        let theme = test_theme(s);
+                        let d = test_detail_rect(panel_w, s);
+                        let row = storage_row_geometry(
+                            &d,
+                            0.0,
+                            kind,
+                            can_reset,
+                            r"D:\归档\资料库",
+                            &theme,
+                        );
+                        let inner_right = d.x + d.w - 2.0 * s;
+                        assert!(
+                            (row.path.x + row.path.w - inner_right).abs() < 1e-3,
+                            "panel={panel_w} s={s} {kind:?} reset={can_reset}: 路径未吃满到内缘 \
+                             （右缘 {:.3}，内缘 {inner_right:.3}）——值行又被塞了占位控件？",
+                            row.path.x + row.path.w
+                        );
+                        // 状态标签必须仍与路径不重叠（吃满不能靠压住标签换）
+                        assert!(
+                            row.tag.x + row.tag.w <= row.path.x + 1e-3,
+                            "panel={panel_w} s={s}: 路径左端压住了状态标签"
+                        );
+                        // 路径左端必须**紧贴**标签、只隔一个固定间距——这是"吃满"的起点。
+                        // 若有人往标签与路径之间塞任何东西（图标、第二个标签、又一个按钮），
+                        // 这条等式会立刻失败，而不是悄悄把路径预算吃掉（本次就是被这样吃掉的）。
+                        assert!(
+                            (row.path.x - (row.tag.x + row.tag.w + STORAGE_TAG_GAP * s)).abs() < 1e-3,
+                            "panel={panel_w} s={s} {kind:?} reset={can_reset}: 标签与路径之间被塞了东西 \
+                             （实际间距 {:.3}，应为 {:.3}）",
+                            row.path.x - (row.tag.x + row.tag.w),
+                            STORAGE_TAG_GAP * s
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 路径命中区**贴实际字形**，且永不超出绘制框；空路径必须退化为零命中区。
+    ///
+    /// 三个方向都要卡住：
+    /// - 太宽（铺满整段预算）→ 文字右侧的空白也吞点击，"看不见却能点"的老毛病复发；
+    /// - 超出绘制框 → 命中区伸进状态标签或详情区外缘，点到不该点的地方；
+    /// - 没有文字却留着热区 → 一块看不见的死区，鼠标划过还会亮下划线。
+    ///
+    /// 覆盖全矩阵：两档面板宽 × 四种 DPI 缩放 × 两种存储模式 × `can_reset` 两种取值，
+    /// 外加**空路径**输入——上一版该测试的唯一输入是 `D:\归档\资料库`，永远非空，
+    /// 于是"空路径 → 零命中区"那条断言恒真、从未执行（对抗性审查 P2-1）。
+    #[test]
+    fn storage_row_geometry_path_hit_hugs_text() {
+        // 自证覆盖：下面这个矩阵必须真的走到"被省略"这条分支。上一版正因为没有长路径输入，
+        // 让"截断后命中区仍贴字形"这条断言从未被检验过——所以这里显式数一次，不许靠运气。
+        let mut saw_elided = 0u32;
+        for s in [1.0f32, 1.25, 1.5, 2.0] {
+            for panel_w in [CONSOLE_W, CONSOLE_MIN_W] {
+                let theme = test_theme(s);
+                let d = test_detail_rect(panel_w, s);
+                let font = theme.console_label.size * DETAIL_SIZE_RATIO;
+                for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                    for can_reset in [false, true] {
+                        // 三种输入各有分工：`短路径` = 原样显示；`长路径` = 会被 `elide_middle`
+                        // 省略（覆盖"截断后命中区仍贴字形"）；`空路径` = 必须退化为零命中区。
+                        // 上一版只有第一个输入，长路径与空路径两个分支从未执行。
+                        for path in [
+                            r"D:\归档\资料库",
+                            r"D:\归档\非常长的中文目录名称\另一个子目录\最后的文件夹",
+                            "",
+                        ] {
+                            let row = storage_row_geometry(&d, 0.0, kind, can_reset, path, &theme);
+                            let ctx = format!(
+                                "panel={panel_w} s={s} {kind:?} reset={can_reset} path={path:?}"
+                            );
+
+                            // 1) 命中区必须是绘制框的子矩形：同 x / 同 y / 同高 / 不宽于。
+                            assert!(
+                                (row.path_hit.x - row.path.x).abs() < 1e-3
+                                    && (row.path_hit.y - row.path.y).abs() < 1e-3
+                                    && (row.path_hit.h - row.path.h).abs() < 1e-3,
+                                "{ctx}: 命中区与绘制框不同源（hit={:?} draw={:?}）",
+                                row.path_hit,
+                                row.path
+                            );
+                            assert!(
+                                row.path_hit.w <= row.path.w + 1e-3,
+                                "{ctx}: 命中区 {} 超出了绘制框 {}",
+                                row.path_hit.w,
+                                row.path.w
+                            );
+
+                            if row.path_text.is_empty() {
+                                // 2) 空路径 → 零命中区，且不得入命中表（不留看不见的热区）。
+                                assert!(
+                                    row.path_hit.w <= 0.0,
+                                    "{ctx}: 没有文字却留着 {} 宽的命中区",
+                                    row.path_hit.w
+                                );
+                                assert!(
+                                    storage_zones(row.path_hit, row.change, row.reset)
+                                        .iter()
+                                        .all(|(z, _)| !matches!(z, ConsoleZone::OpenStoragePath)),
+                                    "{ctx}: 空路径仍把 OpenStoragePath 放进了命中表"
+                                );
+                            } else {
+                                let text_w =
+                                    winbosk_core::text::estimate_width(&row.path_text, font);
+                                if row.path_text != path {
+                                    saw_elided += 1;
+                                }
+                                // 3) 命中区永不宽于字形——右侧空白不吞点击。
+                                assert!(
+                                    row.path_hit.w <= text_w + 1e-3,
+                                    "{ctx}: 命中区 {} 宽于字形 {text_w}（右侧空白也在吞点击）",
+                                    row.path_hit.w
+                                );
+                                // 4) 不能白丢可点区域：命中区宽度 == `min(字形宽, 绘制框宽)`。
+                                //    常规输入下字形永远装得进绘制框（`elide_middle` 保证省略结果
+                                //    ≤ 预算 < 框宽），所以实际走的是"严丝合缝贴字形"这一支；
+                                //    `min` 的另一支只在路径短到无法再省略、字形反而比框宽时才出现，
+                                //    此时钳到框宽是唯一正解——命中区绝不能伸到框外。
+                                //    （上一版把这一支写成 `truncated && clamped`，而 `truncated`
+                                //    为真时 `elide_middle` 必然已把字宽压到预算内、永远不钳位
+                                //    → 该断言恒假分支、不可证伪，已删。）
+                                let expected = text_w.min(row.path.w);
+                                assert!(
+                                    (row.path_hit.w - expected).abs() < 1e-3,
+                                    "{ctx}: 命中区 {} 应为 {expected}（字形 {text_w} / 绘制框 {}）",
+                                    row.path_hit.w,
+                                    row.path.w
+                                );
+                                // 5) 命中区不得压住状态标签。
+                                assert!(
+                                    row.path_hit.x >= row.tag.x + row.tag.w - 1e-3,
+                                    "{ctx}: 命中区伸进了状态标签"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_elided > 0,
+            "矩阵里没有任何输入触发 `elide_middle`——长路径用例失效了，\
+             「截断后命中区仍贴字形」这条断言等于没测"
+        );
+    }
+
+    /// 值行的命中表**有且只有**路径一个热区（`OpenStoragePath`），且矩形逐字段等于 `path_hit`。
+    ///
+    /// 这是"看着像按钮的却点不动、看着像灰字的却能点"那个病的最终保险：几何自洽
+    /// （`storage_row_geometry_*`）只保证矩形互不重叠，管不住**映射**——值行里冒出第二个热区
+    /// （状态标签、或把整段预算接成 `ChangeStoragePath`）只有在这里才会失败。
+    #[test]
+    fn storage_zones_value_row_has_exactly_the_path() {
+        for s in [1.0f32, 2.0] {
+            let theme = test_theme(s);
+            let d = test_detail_rect(CONSOLE_W, s);
+            for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                for can_reset in [false, true] {
+                    let row =
+                        storage_row_geometry(&d, 0.0, kind, can_reset, r"D:\归档\资料库", &theme);
+                    let zones = storage_zones(row.path_hit, row.change, row.reset);
+                    let ctx = format!("s={s} {kind:?} reset={can_reset}");
+
+                    // 值行唯一热区 = 路径本身。
+                    let opens: Vec<RectF> = zones
+                        .iter()
+                        .filter(|(z, _)| matches!(z, ConsoleZone::OpenStoragePath))
+                        .map(|(_, r)| *r)
+                        .collect();
+                    assert_eq!(
+                        opens.len(),
+                        1,
+                        "{ctx}: 值行必须恰好有一个打开热区，实际命中表 {zones:?}"
+                    );
+                    assert!(
+                        (opens[0].x - row.path_hit.x).abs() < 1e-3
+                            && (opens[0].y - row.path_hit.y).abs() < 1e-3
+                            && (opens[0].w - row.path_hit.w).abs() < 1e-3
+                            && (opens[0].h - row.path_hit.h).abs() < 1e-3,
+                        "{ctx}: 打开热区与 path_hit 不一致（{:?} vs {:?}）",
+                        opens[0],
+                        row.path_hit
+                    );
+                    // 打开热区必须落在路径绘制框内，绝不覆盖状态标签。
+                    assert!(
+                        opens[0].x >= row.tag.x + row.tag.w - 1e-3
+                            && opens[0].x + opens[0].w <= row.path.x + row.path.w + 1e-3,
+                        "{ctx}: 打开热区越出路径绘制框 / 压住状态标签"
+                    );
+                    // 破坏性动作只走「更改文件位置…」，且它必须常驻。
+                    assert!(
+                        zones
+                            .iter()
+                            .any(|(z, _)| matches!(z, ConsoleZone::ChangeStoragePath)),
+                        "{ctx}: 「更改文件位置…」必须常驻命中表"
+                    );
+                    // 「恢复默认」入表 ⟺ 有非零矩形（零矩形 = 不出现，杜绝死按钮）。
+                    let has_reset = zones
+                        .iter()
+                        .any(|(z, _)| matches!(z, ConsoleZone::ResetStoragePath));
+                    assert_eq!(
+                        has_reset,
+                        row.reset.w > 0.0 && row.reset.h > 0.0,
+                        "{ctx}: 「恢复默认」入表与矩形在场必须一致"
+                    );
+                    // 值行里不允许出现任何其它热区（状态标签是状态，不是按钮）。
+                    assert_eq!(
+                        zones.len(),
+                        1 + 1 + usize::from(has_reset),
+                        "{ctx}: 命中表混入了额外热区 {zones:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 值行内三段 detail 字号文字（行标签 / 状态标签 / 路径）**必须共用唯一顶线**，
+    /// 且该顶线让整行文字落在值行带内。
+    ///
+    /// 这条断言是「整行看着歪」那个病的回归保险：曾经行标签写死 `+2·s`、状态标签就地按
+    /// `label.size × 1.6` 估行高居中（字号其实是 `detail`，估出来的行高比标签框还高、
+    /// 文字被顶出框）、路径写死 `+4·s`——三段同字号却落在三条基线上。
+    /// 行标签与状态标签的绘制顶线都取自 `row.text_top`，路径取 `row.path.y`，
+    /// 故只要 `path.y == text_top` 就等价于三者同源（绘制层不再有任何自带偏移）。
+    #[test]
+    fn storage_row_geometry_shares_one_text_top() {
+        // 覆盖本机实际会遇到的两档缩放 + 两个整数档（`apply_theme_scale` 是线性乘法，
+        // 非整数档不会引入新的分支，取 1.25 作为代表即可）。
+        for s in [1.0f32, 1.25, 1.5, 2.0] {
+            for kind in [StorageKind::AppLibrary, StorageKind::ExternalFolder] {
+                for can_reset in [false, true] {
+                    let theme = test_theme(s);
+                    let d = test_detail_rect(CONSOLE_W, s);
+                    let row_y = 100.0 * s;
+                    let row = storage_row_geometry(
+                        &d,
+                        row_y,
+                        kind,
+                        can_reset,
+                        "C:\\Users\\x\\Desktop",
+                        &theme,
+                    );
+
+                    // 1) 路径文本区顶 == 共用顶线（等价于行标签/状态标签/路径同基线）。
+                    assert!(
+                        (row.path.y - row.text_top).abs() < 1e-3,
+                        "s={s} {kind:?} can_reset={can_reset}: 路径未落在共用顶线上"
+                    );
+                    // 2) 动作行提示语与值行文字用**同一偏移**（各自的行带起点不同）。
+                    if row.hint.h > 0.0 {
+                        let dy_value = row.text_top - row.value_row.y;
+                        let dy_action = row.hint.y - row.change.y; // change.y == 动作行行带顶
+                        assert!(
+                            (dy_value - dy_action).abs() < 1e-3,
+                            "s={s} {kind:?} can_reset={can_reset}: 动作行提示语偏移与值行不一致"
+                        );
+                    }
+                    // 3) 顶线本身落在值行带内，且一整行文字（行高 = 1.6 × detail 字号）
+                    //    不会溢出到下一行——溢出就会被行带的裁剪吃掉。
+                    let line_h = theme.console_label.size * DETAIL_SIZE_RATIO * 1.6;
+                    assert!(
+                        row.text_top > row.value_row.y,
+                        "s={s}: 顶线跑到值行带上方了"
+                    );
+                    assert!(
+                        row.text_top + line_h <= row.value_row.y + row.value_row.h + 1e-3,
+                        "s={s} {kind:?}: 一行文字（{line_h}）溢出了值行带"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 验证控制中心底部第 4 行左右并排按钮几何：
+    /// 左侧「切换桌面」与右侧「开机自启」无重叠、间距严格等于 btn_gap，且右边缘与全宽按钮对齐。
+    #[test]
+    fn console_bottom_buttons_geometry() {
+        for s in [1.0_f32, 1.25, 1.5, 2.0] {
+            let panel_w = CONSOLE_W * s;
+            let btn_w = panel_w - 2.0 * CONSOLE_PAD * s;
+            let btn_gap = 8.0 * s;
+            let half_w = ((btn_w - btn_gap) / 2.0).max(0.0);
+            let left_btn_x = CONSOLE_PAD * s;
+            let right_btn_x = left_btn_x + half_w + btn_gap;
+            let right_btn_right = right_btn_x + half_w;
+
+            // 两按钮无重叠
+            assert!(left_btn_x + half_w <= right_btn_x);
+            // 间距严格为 btn_gap
+            assert!((right_btn_x - (left_btn_x + half_w) - btn_gap).abs() < 1e-4);
+            // 右按钮右边缘与全宽按钮右边缘完全重合
+            let full_btn_right = CONSOLE_PAD * s + btn_w;
+            assert!((right_btn_right - full_btn_right).abs() < 1e-4);
+        }
+    }
+
+    /// 验证控制中心高级模式与简化模式下的几何尺寸与贴边：
+    /// 简化模式宽度为 CONSOLE_W * s，高级模式宽度为 CONSOLE_ADVANCED_W * s，且展开时不越界。
+    #[test]
+    fn console_geometry_advanced_mode() {
+        use winbosk_core::{config::AppSettings, model::Desk};
+        use winbosk_render::theme::Theme;
+        let mut desk = Desk::new(AppSettings::default());
+        let theme = Theme {
+            scale: 1.0,
+            ..Theme::default()
+        };
+        let vw = 1920.0_f32;
+        let vh = 1080.0_f32;
+
+        // 默认简化模式：宽为 CONSOLE_W (368.0)
+        assert!(!desk.console_advanced);
+        let simple_geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Fences);
+        assert_eq!(simple_geom.w, CONSOLE_W);
+        assert!(simple_geom.x + simple_geom.w <= vw);
+
+        // 切换高级模式：宽展开为 CONSOLE_ADVANCED_W (736.0)
+        desk.console_advanced = true;
+        let adv_geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Fences);
+        assert_eq!(adv_geom.w, CONSOLE_ADVANCED_W);
+        assert!(adv_geom.x + adv_geom.w <= vw);
+        // 验证展开后依然在屏幕右侧贴边预留 margin
+        assert_eq!(adv_geom.x, vw - CONSOLE_ADVANCED_W - CONSOLE_MARGIN);
+    }
+
+    /// 验证控制中心设置页面自适应面板高度计算与贴合契约
+    #[test]
+    fn console_settings_page_height_contract() {
+        use winbosk_core::{config::AppSettings, hotkey::HotkeyAction, model::Desk};
+        let desk = Desk::new(AppSettings::default());
+        let s = 1.0_f32;
+        let h = console_full_height(&desk, 0, s, ConsolePage::Settings);
+        // 期望高度 = 标题栏(40) + 间隙(8) + 标题说明区(48) + N 行卡片 + 间隙(8)
+        //          + 底部按钮(34) + 间隙(8) + 退出按钮(34) + 留白(12)
+        // 其中 N = 热键动作数（5：控制中心 / 栅栏前置 / 切换桌面 / 一键整理 / 紧急退出），
+        // 行区 = 5*52 + 4*8 = 292 → 合计 484。
+        // 这是**黄金数**：新增热键动作会同时改变行数与本值，测试失败即提醒作者重新核对
+        // 设置页末行与底部按钮是否重叠（历史上 `rows_bottom_y` 曾写死 4 行）。
+        let n = HotkeyAction::ALL.len() as f32;
+        assert_eq!(n, 5.0, "热键动作数变了：请重新核对设置页高度并更新本断言");
+        assert!((h - 484.0).abs() < 1e-3, "设置页高度期望 484.0，实际 {h}");
+        assert_eq!(h, console_settings_height(s));
+    }
+
+    /// 验证高级模式（双栏）下设置页占满全宽与长按键（"Ctrl + Shift + F10"）药丸宽度自适应
+    #[test]
+    fn console_settings_advanced_mode_full_width_and_pill_adaptive() {
+        use std::collections::HashMap;
+        use winbosk_core::{config::AppSettings, hotkey::HotkeyAction, model::Desk};
+        use winbosk_render::theme::Theme;
+
+        let mut desk = Desk::new(AppSettings::default());
+        desk.console_advanced = true;
+        // 配置一个超长快捷键
+        desk.settings.hotkeys.console_toggle = Some("Ctrl + Shift + F10".into());
+        // 清除一个快捷键用以验证无快捷键时的靠右对齐与 clear_btn 为 None
+        desk.settings.hotkeys.desktop_toggle = None;
+
+        let theme = Theme {
+            scale: 1.0,
+            ..Theme::default()
+        };
+        let s = theme.scale;
+        let pad = CONSOLE_PAD * s;
+        let vw = 1920.0_f32;
+        let vh = 1080.0_f32;
+
+        let geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Settings);
+        // 高级模式下总宽应为 CONSOLE_ADVANCED_W (736.0)
+        assert_eq!(geom.w, CONSOLE_ADVANCED_W * s);
+
+        let detail_font = theme.console_label.size * DETAIL_SIZE_RATIO;
+        let conflicts = HashMap::new();
+        let sp = layout_settings_page(
+            geom,
+            s,
+            detail_font,
+            &desk,
+            None,
+            &conflicts,
+            &theme.controls,
+        );
+
+        let expected_settings_w = geom.w - 2.0 * pad;
+        assert_eq!(sp.rect.w, geom.w, "设置页容器宽度应占满面板全宽");
+
+        // 验证每行卡片均吃满 settings_w，而不是被限制在 left_w (368.0)
+        for row in &sp.rows {
+            assert_eq!(
+                row.rect.w, expected_settings_w,
+                "高级模式下设置行卡片应吃满全宽 {}",
+                expected_settings_w
+            );
+            assert_eq!(row.rect.x, geom.x + pad);
+            assert_eq!(row.rect.h, 52.0 * s, "行高应为 52.0 * s");
+        }
+
+        // 验证超长按键 "Ctrl + Shift + F10" 药丸宽度自适应（大于旧版 104.0 并 clamp 在 160.0 以内）
+        let console_row = sp
+            .rows
+            .iter()
+            .find(|r| r.action == HotkeyAction::ConsoleToggle)
+            .expect("应存在控制中心快捷键行");
+        assert_eq!(console_row.key_text, "Ctrl + Shift + F10");
+        let est_w = winbosk_core::text::estimate_width(&console_row.key_text, detail_font);
+        let expected_key_w = (est_w + 24.0 * s).clamp(88.0 * s, 160.0 * s);
+        assert_eq!(console_row.key_btn.w, expected_key_w);
+        assert!(
+            console_row.key_btn.w > 104.0 * s,
+            "长按键宽度 {} 应大于旧版硬编码 104.0",
+            console_row.key_btn.w
+        );
+        assert!(console_row.clear_btn.is_some(), "有快捷键时应有清除按钮");
+        let cb = console_row.clear_btn.unwrap();
+        // 清除按钮紧随右侧内边距 10.0 * s
+        assert_eq!(
+            cb.x + cb.w,
+            console_row.rect.x + console_row.rect.w - 10.0 * s
+        );
+        // 药丸按钮在清除按钮左侧，间隙为 6.0 * s
+        assert_eq!(
+            console_row.key_btn.x + console_row.key_btn.w + 6.0 * s,
+            cb.x
+        );
+
+        // 验证无快捷键项：clear_btn 为 None，药丸按钮直接靠右内边距（10.0 * s）对齐
+        let desktop_row = sp
+            .rows
+            .iter()
+            .find(|r| r.action == HotkeyAction::DesktopToggle)
+            .expect("应存在切换桌面快捷键行");
+        assert!(
+            desktop_row.clear_btn.is_none(),
+            "无快捷键时清除按钮应为 None"
+        );
+        assert_eq!(
+            desktop_row.key_btn.x + desktop_row.key_btn.w,
+            desktop_row.rect.x + desktop_row.rect.w - 10.0 * s,
+            "无快捷键时药丸按钮应靠右内边距 10.0 * s 对齐"
+        );
+
+        // 验证物理安全隔离槽
+        for row in &sp.rows {
+            let isolation = row.key_btn.x - (row.rect.x + 14.0 * s);
+            assert!(
+                isolation > 0.0,
+                "左侧文本到药丸按钮应保持物理安全隔离，实际隔离距离 {}",
+                isolation
+            );
+        }
+
+        // 末行卡片不得与底部按钮重叠：设置页高度与行数必须同一口径推导
+        // （`rows_bottom_y` 与 `console_settings_height` 都取 `HotkeyAction::ALL.len()`）
+        if let Some(last) = sp.rows.last() {
+            assert!(
+                last.rect.y + last.rect.h <= sp.reset_default_btn.y,
+                "末行卡片底 {:.1} 越过了底部按钮顶 {:.1}：设置页高度未随行数增长",
+                last.rect.y + last.rect.h,
+                sp.reset_default_btn.y
+            );
+        }
+        assert_eq!(
+            sp.rows.len(),
+            HotkeyAction::ALL.len(),
+            "每个热键动作都必须有一行"
+        );
+
+        // 验证底部双联按钮黄金分割与全宽契约
+        let btn_gap = 8.0 * s;
+        let expected_reset_w = ((expected_settings_w - btn_gap) * 0.38).round();
+        let expected_back_w = expected_settings_w - btn_gap - expected_reset_w;
+        assert_eq!(sp.reset_default_btn.w, expected_reset_w);
+        assert_eq!(sp.back_btn.w, expected_back_w);
+        assert_eq!(
+            sp.reset_default_btn.w + btn_gap + sp.back_btn.w,
+            expected_settings_w,
+            "两按钮加间距应精确吃满全宽 settings_w"
+        );
+        assert_eq!(
+            sp.quit_btn.w, expected_settings_w,
+            "退出按钮应吃满全宽 settings_w"
+        );
+        assert!(sp.quit_btn.h > 0.0, "退出按钮应具有有效高度");
+    }
+
+    /// 验证当 page == ConsolePage::Settings 时，忽略 desk.console_size 的高度记忆，强制使用 auto_full_h
+    #[test]
+    fn console_geometry_settings_ignores_console_size_height() {
+        use winbosk_core::{config::AppSettings, model::Desk};
+        use winbosk_render::theme::Theme;
+
+        let mut desk = Desk::new(AppSettings::default());
+        let theme = Theme::default();
+        let vw = 1920.0_f32;
+        let vh = 1080.0_f32;
+
+        // 模拟用户在栅栏管理页手动拉伸控制中心面板到 650.0 高
+        desk.console_size = Some((CONSOLE_W, 650.0));
+
+        // 栅栏管理页遵从手动缩放
+        let fences_geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Fences);
+        assert_eq!(fences_geom.h, 650.0);
+
+        // 设置页忽略 650.0 高度记忆，强制使用自适应高度 auto_full_h
+        let settings_geom = console_geometry(&desk, &theme, vw, vh, 1.0, 0, ConsolePage::Settings);
+        let expected_h = console_settings_height(theme.scale);
+        assert_eq!(
+            settings_geom.h, expected_h,
+            "设置页应忽略 manual console_size 高度，强制自适应贴合内容"
+        );
+    }
+
+    /// 验证规则芯片流式自动换行排版函数 layout_chips_with_add：
+    /// - 空项时仅有一个添加按钮
+    /// - 多个项超出 max_w 时正常换行且 y 递增
+    /// - 每个芯片的删除按钮均包含在其芯片矩形内部
+    #[test]
+    fn test_layout_chips_with_add_wrapping() {
+        let items = vec![
+            "pdf".to_string(),
+            "docx".to_string(),
+            "xlsx".to_string(),
+            "pptx".to_string(),
+            "markdown_notes".to_string(),
+            "archive_backup".to_string(),
+        ];
+        let start_x = 100.0;
+        let start_y = 50.0;
+        let max_w = 200.0;
+        let scale = 1.0;
+        let font_size = 12.0;
+        let controls = ControlMetrics::default().scale(scale);
+
+        let normal = layout_chips_with_add(
+            &items,
+            "＋ 添加后缀",
+            false,
+            start_x,
+            start_y,
+            max_w,
+            &controls,
+            scale,
+            font_size,
+        );
+
+        assert_eq!(normal.chips.len(), items.len());
+        assert!(normal.edit_rect.is_none());
+        // 宽度限制在 200.0，较长文字必然导致换行
+        let mut saw_wrap = false;
+        for (i, (name, rect, del_btn)) in normal.chips.iter().enumerate() {
+            assert_eq!(name, &items[i]);
+            // 芯片在 x 轴起点不小于 start_x
+            assert!(rect.x >= start_x);
+            // 删除按钮位于芯片内部右侧
+            assert!(del_btn.x >= rect.x);
+            assert!(del_btn.x + del_btn.w <= rect.x + rect.w + 1e-3);
+            if rect.y > start_y {
+                saw_wrap = true;
+            }
+        }
+        assert!(saw_wrap, "多项长名称应触发换行");
+        assert!(normal.add_btn.w > 0.0 && normal.add_btn.h > 0.0);
+        assert!(normal.end_y >= normal.add_btn.y + normal.add_btn.h);
+
+        // 测试编辑模式：add_btn 隐藏，生成 edit_rect 且位于芯片之后
+        let edit_mode = layout_chips_with_add(
+            &items,
+            "＋ 添加后缀",
+            true,
+            start_x,
+            start_y,
+            max_w,
+            &controls,
+            scale,
+            font_size,
+        );
+        assert_eq!(edit_mode.add_btn.w, 0.0);
+        assert_eq!(edit_mode.add_btn.h, 0.0);
+        let er = edit_mode.edit_rect.expect("编辑模式必须生成 edit_rect");
+        assert!(er.x >= start_x);
+        assert!(er.w > 0.0);
+        assert!(er.h > 0.0);
+        assert!(edit_mode.end_y >= er.y + er.h);
+    }
+
+    /// 验证规则工作台（SceneRuleEditor）在所有模式下各垂直组件严格两两不相交（零重叠契约）：
+    /// 涵盖：
+    /// 1. 无规则模式（None）：分类栏 -> 编辑按钮 -> 说明文本 -> 自动捕获 -> 立即整理 -> 提示卡片
+    /// 2. 目录预设模式（Folders）：分类栏 -> 编辑按钮 -> 目录说明 -> 自动捕获 -> 立即整理 -> 提示卡片
+    /// 3. 应用预设模式（Apps）：分类栏 -> 编辑按钮 -> 只读芯片 -> 自动捕获 -> 立即整理 -> 提示卡片
+    /// 4. 自定义模式（Custom）：分类栏 -> 后缀列表 -> 排除列表 -> 通配符列表 -> 自动捕获 -> 立即整理 -> 提示卡片
+    #[test]
+    fn test_scene_rule_editor_geometry_is_pairwise_disjoint() {
+        use winbosk_core::model::{CategoryPreset, Fence, FenceRule};
+        use winbosk_render::theme::Theme;
+
+        let theme = Theme::default();
+        let panel = RectF {
+            x: 100.0,
+            y: 50.0,
+            w: 736.0,
+            h: 600.0,
+        };
+        let left_w = 340.0;
+        let content_top = 90.0;
+        let title_h = 40.0;
+
+        let make_fence = |rule: Option<FenceRule>| Fence {
+            id: 1,
+            title: Some("测试栅栏".into()),
+            monitor_id: 0,
+            bounds: winbosk_core::model::Rect::new(10.0, 10.0, 200.0, 200.0),
+            state: winbosk_core::model::FenceState::default(),
+            icon_ids: Vec::new(),
+            appearance: winbosk_core::model::FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule,
+            collapsed: false,
+        };
+
+        // 测试只读/预设三种模式
+        for preset in [
+            None,
+            Some(CategoryPreset::Folders),
+            Some(CategoryPreset::Apps),
+        ] {
+            let mut rule = FenceRule::default();
+            rule.preset = preset;
+            let fence = make_fence(Some(rule));
+
+            let re = layout_rule_editor(RuleEditorLayoutCtx {
+                f: &fence,
+                sel: 0,
+                panel,
+                left_w,
+                content_top,
+                title_h,
+                theme: &theme,
+                edit_target: None,
+            });
+
+            // 1. 总开关行（位于顶部）
+            assert!(re.toggle_btn.y >= re.rect.y);
+
+            // 2. 预设分类芯片栏（位于总开关下方）
+            for (_, chip_r, _) in &re.preset_chips {
+                assert!(
+                    chip_r.y >= re.toggle_btn.y + re.toggle_btn.h,
+                    "分类胶囊应位于总开关下方"
+                );
+            }
+
+            // 3. 编辑按钮
+            let edit_btn = re.edit_custom_btn.expect("预设模式必须有编辑按钮");
+            let preset_bottom = re
+                .preset_chips
+                .iter()
+                .map(|(_, r, _)| r.y + r.h)
+                .fold(0.0_f32, f32::max);
+            assert!(edit_btn.y >= preset_bottom, "编辑按钮应位于分类芯片栏下方");
+
+            // 4. 只读内容区（说明文本或芯片）
+            let content_bottom = if let Some((_, desc_r)) = &re.readonly_desc {
+                assert!(
+                    desc_r.y >= edit_btn.y + edit_btn.h,
+                    "只读说明文本 [{:?}] 顶部 {} 必须在编辑按钮底部 {} 之下（严禁重叠！）",
+                    preset,
+                    desc_r.y,
+                    edit_btn.y + edit_btn.h
+                );
+                desc_r.y + desc_r.h
+            } else {
+                assert!(!re.readonly_chips.is_empty(), "非文本预设必须有只读芯片");
+                let first_chip_y = re.readonly_chips[0].1.y;
+                assert!(
+                    first_chip_y >= edit_btn.y + edit_btn.h,
+                    "只读芯片顶部必须在编辑按钮底部之下"
+                );
+                re.readonly_chips
+                    .iter()
+                    .map(|(_, r)| r.y + r.h)
+                    .fold(0.0_f32, f32::max)
+            };
+
+            // 5. 自动捕获按钮（必须严格在只读内容区下方）
+            assert!(
+                re.auto_capture_toggle.y >= content_bottom,
+                "自动捕获按钮顶部 {} 必须在只读内容底部 {} 之下（严禁重叠遮挡！）",
+                re.auto_capture_toggle.y,
+                content_bottom
+            );
+
+            // 6. 立即整理按钮（必须严格在自动捕获按钮下方）
+            assert!(
+                re.apply_btn.y >= re.auto_capture_toggle.y + re.auto_capture_toggle.h,
+                "立即整理按钮必须在自动捕获按钮下方"
+            );
+
+            // 7. 提示说明卡片（必须严格在立即整理按钮下方）
+            assert!(
+                re.tip_rect.y >= re.apply_btn.y + re.apply_btn.h,
+                "提示卡片必须在立即整理按钮下方"
+            );
+        }
+
+        // 测试自定义模式
+        {
+            let mut rule = FenceRule::default();
+            rule.custom_extensions = vec!["pdf".into(), "docx".into()];
+            rule.exclude_extensions = vec!["tmp".into()];
+            rule.name_patterns = vec!["*report*".into()];
+            let fence = make_fence(Some(rule));
+
+            let re = layout_rule_editor(RuleEditorLayoutCtx {
+                f: &fence,
+                sel: 0,
+                panel,
+                left_w,
+                content_top,
+                title_h,
+                theme: &theme,
+                edit_target: None,
+            });
+
+            assert!(re.is_custom);
+            assert!(re.edit_custom_btn.is_none());
+            // 包含后缀 -> 排除后缀 -> 通配符模式 -> 自动捕获 -> 立即整理 -> 提示卡片
+            assert!(re.add_ext_btn.y + re.add_ext_btn.h <= re.add_exclude_btn.y);
+            assert!(re.add_exclude_btn.y + re.add_exclude_btn.h <= re.add_pattern_btn.y);
+            assert!(re.add_pattern_btn.y + re.add_pattern_btn.h <= re.auto_capture_toggle.y);
+            assert!(re.auto_capture_toggle.y + re.auto_capture_toggle.h <= re.apply_btn.y);
+            assert!(re.apply_btn.y + re.apply_btn.h <= re.tip_rect.y);
+        }
+    }
+}

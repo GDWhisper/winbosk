@@ -1,0 +1,494 @@
+//! 桌面图标枚举。
+//!
+//! 通过 `IShellFolder`（桌面文件夹）枚举图标，不依赖 `SHELLDLL_DefView` 是否存在，
+//! 因此用户开启「隐藏桌面图标」时依然可用。
+//!
+//! 前提：调用方已完成 COM 初始化（`CoInitializeEx`）。
+
+use std::path::Path;
+
+use windows::core::{HRESULT, PCWSTR};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::Common::{
+    ITEMIDLIST, STRRET, STRRET_CSTR, STRRET_TYPE, STRRET_WSTR,
+};
+use windows::Win32::UI::Shell::{
+    IShellFolder, SHGetDesktopFolder, SHGetPathFromIDListW, SHParseDisplayName, ShellExecuteW,
+    SHCONTF_FOLDERS, SHCONTF_NONFOLDERS, SHGDNF, SHGDN_FORPARSING,
+};
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+use winbosk_core::model::{ItemId, ItemKind};
+
+// windows-rs 0.62 未自动生成的 shell 属性位（稳定文档值）。
+const SFGAO_LINK: u32 = 0x0001_0000;
+const SFGAO_FOLDER: u32 = 0x2000_0000;
+/// 枚举器意外的空值（正常情况下 EnumObjects 成功必有枚举器）→ E_FAIL。
+const E_ENUM_EMPTY: i32 = 0x8000_4005u32 as i32;
+
+/// 一个桌面图标项。持有自己的 PIDL（Drop 时释放）。
+#[derive(Debug)]
+pub struct DesktopItem {
+    pub id: ItemId,
+    pub display_name: String,
+    pub kind: ItemKind,
+    /// 文件系统路径（虚拟项为 None），用于打开 / 拖拽等场景。
+    pub path: Option<String>,
+    /// 指向该 shell 项的绝对 PIDL，供图标提取 / 拖拽等后续使用。
+    pub pidl: *mut ITEMIDLIST,
+}
+
+impl Drop for DesktopItem {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.pidl as *const _)) };
+    }
+}
+
+impl DesktopItem {
+    /// 用系统默认动作打开该项（等价于桌面双击）。
+    ///
+    /// - 有路径 → `ShellExecuteW`（原有路线）；
+    /// - 无路径且 pidl 非空 → `SEE_MASK_INVOKEIDLIST` 走 PIDL（虚拟壳项，如回收站）；
+    /// - 两者都不可用 → `Err`。
+    ///
+    /// 返回错误而不是丢弃：静默失败在 UI 上表现为「点了没反应」，调用方至少能留一行日志。
+    pub fn launch(&self) -> windows::core::Result<()> {
+        if let Some(path) = self.path.as_deref() {
+            let file = wide(path);
+            let r = unsafe {
+                ShellExecuteW(
+                    None, // 无父窗口
+                    None, // 默认动作（open）
+                    PCWSTR(file.as_ptr()),
+                    None,
+                    None,
+                    SW_SHOWNORMAL,
+                )
+            };
+            // ShellExecuteW 的返回是 HINSTANCE 口径（错误码落在 0..=32），不是 GetLastError。
+            return if (r.0 as isize) > 32 {
+                Ok(())
+            } else {
+                Err(windows::core::Error::from_hresult(HRESULT(
+                    r.0 as i32 & 0xFFFF,
+                )))
+            };
+        }
+        if self.pidl.is_null() {
+            return Err(windows::core::Error::from_hresult(HRESULT(E_ENUM_EMPTY)));
+        }
+        match crate::virtual_items::open_shell_item(self.pidl) {
+            true => Ok(()),
+            false => Err(windows::core::Error::from_hresult(HRESULT(E_ENUM_EMPTY))),
+        }
+    }
+
+    /// 解析名（`::{645FF040-…}`）——虚拟壳项 Shell 菜单预热 / 打开的键源。
+    ///
+    /// 文件系统项同样返回自己的解析名（等于路径），但调用方只对虚拟项用得上
+    /// （文件项有 `path`）。PIDL 为空或查询失败时返回空串。
+    pub fn parsing_name(&self) -> String {
+        crate::virtual_items::parsing_name_of(self.pidl)
+    }
+}
+
+/// 用系统默认动作打开一个目录（资源管理器）。与 `DesktopItem::launch` 同一套 `ShellExecuteW` 手法。
+///
+/// **只在用户显式点击时调用**（控制中心里点击「文件位置」行的路径）——不要放进任何每帧/每重绘路径。
+/// 路径不存在时 Shell 会自行失败，本函数不预检、不重试、不阻塞。
+///
+/// 返回是否成功拉起。判据是 `ShellExecuteW` 的返回值 **> 32**——它的返回是 `HINSTANCE`
+/// 口径（错误码落在 0..=32），**不是** `GetLastError`，所以这里不看 `last_os_error`。
+/// 之所以要返回而不是丢弃：静默失败在 UI 上表现为「点了没反应」，调用方至少能留一行日志。
+pub fn open_folder(path: &str) -> bool {
+    let file = wide(path);
+    unsafe {
+        let r = ShellExecuteW(
+            None, // 无父窗口
+            None, // 默认动作（目录 → 在资源管理器中打开）
+            PCWSTR(file.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+        (r.0 as isize) > 32
+    }
+}
+
+/// 枚举桌面全部图标。
+pub fn enumerate_desktop_items() -> windows::core::Result<Vec<DesktopItem>> {
+    let desktop: IShellFolder = unsafe { SHGetDesktopFolder()? };
+
+    // 枚举所有可见的文件夹与非文件夹（EnumObjects 的 grfflags 是裸 u32，SHCONTF.0 是 i32）
+    let flags = (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0) as u32;
+    let mut enum_opt: Option<windows::Win32::UI::Shell::IEnumIDList> = None;
+    unsafe {
+        desktop
+            .EnumObjects(HWND::default(), flags, &mut enum_opt)
+            .ok()?
+    };
+    let enum_idl =
+        enum_opt.ok_or_else(|| windows::core::Error::from_hresult(HRESULT(E_ENUM_EMPTY)))?;
+
+    let mut items = Vec::new();
+    // 单元素槽：Windows 每次返回一个 PIDL
+    let mut slot = [std::ptr::null_mut::<ITEMIDLIST>()];
+    loop {
+        let mut fetched: u32 = 0;
+        let hr = unsafe { enum_idl.Next(&mut slot, Some(&mut fetched)) };
+        if hr.is_err() || fetched == 0 {
+            break;
+        }
+        let pidl = slot[0];
+        slot[0] = std::ptr::null_mut();
+
+        if let Some(item) = build_item(&desktop, pidl) {
+            items.push(item);
+        } else {
+            unsafe { CoTaskMemFree(Some(pidl as *const _)) };
+        }
+    }
+    Ok(items)
+}
+
+/// 从文件系统路径构建一个 `DesktopItem`（拖入 / 粘贴添加任意文件用）。
+///
+/// 与桌面枚举共用同一套分类 / 标识逻辑：id 用小写路径，显示名取文件名
+/// （快捷方式去掉 `.lnk`/`.url`/`.appref-ms` 扩展名），双击打开走 `ShellExecuteW`。
+pub fn item_from_path(path: &str) -> windows::core::Result<DesktopItem> {
+    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    let p = wide(path);
+    unsafe {
+        SHParseDisplayName(PCWSTR(p.as_ptr()), None, &mut pidl, 0, None)?;
+    }
+    if pidl.is_null() {
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+            E_ENUM_EMPTY,
+        )));
+    }
+    let display_name = display_name_from_path(path);
+    let kind = kind_from(0, false, Some(path), &display_name);
+    let id = item_id(Some(path.into()), &display_name, None);
+    Ok(DesktopItem {
+        id,
+        display_name,
+        kind,
+        path: Some(path.into()),
+        pidl,
+    })
+}
+
+/// 显示名：文件名（快捷方式去掉 `.lnk`/`.url`/`.appref-ms` 扩展名，与桌面一致）。
+fn display_name_from_path(path: &str) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_owned());
+    let lower = name.to_ascii_lowercase();
+    for ext in ["lnk", "url", "appref-ms"] {
+        if lower.ends_with(&format!(".{ext}")) {
+            return name[..name.len() - ext.len() - 1].to_string();
+        }
+    }
+    name
+}
+
+/// 从单个 PIDL 构建 `DesktopItem`；失败时返回 None（由调用方负责释放 pidl）。
+fn build_item(desktop: &IShellFolder, pidl: *mut ITEMIDLIST) -> Option<DesktopItem> {
+    let display_name = display_name_of(desktop, pidl)?;
+    let path = path_of(pidl);
+    // 虚拟项（无路径）额外取一次解析名切出 CLSID 片段：同名虚拟项必须拿到不同 id。
+    // 只对虚拟项调（有路径项仍走小写路径口径）；实测单项 0.5~1.5 µs，可忽略。
+    let clsid = if path.is_none() {
+        parsing_name_of(desktop, pidl).as_deref().and_then(clsid_of)
+    } else {
+        None
+    };
+    let kind = kind_of(desktop, pidl, &display_name, path.as_deref());
+    let id = item_id(path.clone(), &display_name, clsid.as_deref());
+
+    Some(DesktopItem {
+        id,
+        display_name,
+        kind,
+        path,
+        pidl,
+    })
+}
+
+/// 从解析名 `::{XXXX-…}` 中切出 CLSID（`{XXXX-…}`，首尾大括号齐全）。
+fn clsid_of(parsing_name: &str) -> Option<String> {
+    let start = parsing_name.find('{')?;
+    let end = parsing_name.rfind('}')?;
+    (end > start)
+        .then(|| parsing_name[start..=end].to_string())
+        .filter(|s| s.len() >= 10)
+}
+
+/// 获取解析名（`SHGDN_FORPARSING`）——虚拟项的 CLSID 来源。
+fn parsing_name_of(desktop: &IShellFolder, pidl: *const ITEMIDLIST) -> Option<String> {
+    let mut strret = STRRET::default();
+    unsafe {
+        desktop
+            .GetDisplayNameOf(pidl, SHGDN_FORPARSING, &mut strret)
+            .ok()?;
+    }
+    Some(strret_to_string(&strret))
+}
+
+/// 获取显示名称（SHGDNF_NORMAL）。
+fn display_name_of(desktop: &IShellFolder, pidl: *const ITEMIDLIST) -> Option<String> {
+    let mut strret = STRRET::default();
+    unsafe {
+        desktop
+            .GetDisplayNameOf(pidl, SHGDNF(0), &mut strret)
+            .ok()?
+    };
+    Some(strret_to_string(&strret))
+}
+
+/// 文件系统项返回路径；虚拟项返回 None。
+fn path_of(pidl: *const ITEMIDLIST) -> Option<String> {
+    let mut buf = [0u16; 260];
+    let ok = unsafe { SHGetPathFromIDListW(pidl, &mut buf) };
+    if !ok.as_bool() {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+/// 依据 shell 属性、扩展名与文件系统状态判定类别（仅用于渲染表现，不参与归类）。
+///
+/// 分层判定，每层都能独立兜底：
+/// 1. 扩展名快路径（exe / lnk / url / appref-ms 语义明确）；
+/// 2. shell 属性（`GetAttributesOf`，仅当返回非零时采信——Win11 桌面对
+///    历史 API 常返回 S_OK + 0，此时不可信）；
+/// 3. 文件系统兜底：目录 → Folder，其余有路径 → Doc。
+fn kind_of(
+    desktop: &IShellFolder,
+    pidl: *const ITEMIDLIST,
+    name: &str,
+    path: Option<&str>,
+) -> ItemKind {
+    let mut attrs: u32 = 0;
+    let pidls = [pidl];
+    let hr = unsafe { desktop.GetAttributesOf(&pidls, &mut attrs) };
+    // 仅当调用成功且返回了非零属性时才采信 shell 属性
+    let attrs_ok = hr.is_ok() && attrs != 0;
+    kind_from(attrs, attrs_ok, path, name)
+}
+
+/// 纯分类逻辑（可单测），返回顺序即优先级。
+fn kind_from(attrs: u32, attrs_ok: bool, path: Option<&str>, name: &str) -> ItemKind {
+    // 1. shell 属性（attrs 可信时最权威，捕获虚拟项/快捷方式；Win11 桌面常返回 0 → 跳过）
+    if attrs_ok {
+        if attrs & SFGAO_FOLDER != 0 {
+            return ItemKind::Folder;
+        }
+        if attrs & SFGAO_LINK != 0 {
+            return ItemKind::Link;
+        }
+    }
+    // 2. 扩展名快路径（语义明确的类型）
+    if let Some(p) = path {
+        let ext = Path::new(p)
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase());
+        match ext.as_deref() {
+            Some("exe") | Some("appref-ms") | Some("url") => return ItemKind::App,
+            Some("lnk") => return ItemKind::Link,
+            _ => {}
+        }
+    }
+    // 3. 文件系统兜底
+    if let Some(p) = path {
+        if Path::new(p).is_dir() {
+            return ItemKind::Folder;
+        }
+        return ItemKind::Doc;
+    }
+    let _ = name;
+    ItemKind::Unknown
+}
+
+/// 稳定标识符：文件系统项用小写路径，虚拟项退回 `shell:<显示名>-<clsid 前 8 位>`（H5）。
+fn item_id(path: Option<String>, display_name: &str, clsid: Option<&str>) -> ItemId {
+    match path {
+        Some(p) => p.to_ascii_lowercase(),
+        None => match clsid {
+            Some(c) => crate::virtual_items::virtual_item_id(display_name, c),
+            // 解析名都取不到时退回显示名（保底可用，仅影响极端失败路径）
+            None => format!("shell:{}", display_name),
+        },
+    }
+}
+
+/// 把 STRRET 转换为 String，并释放 COM 分配的宽字符串。
+pub(crate) fn strret_to_string(strret: &STRRET) -> String {
+    let ty = STRRET_TYPE(strret.uType as i32);
+    if ty == STRRET_WSTR {
+        let ptr = unsafe { strret.Anonymous.pOleStr };
+        // PWSTR 可能是空指针
+        let s = unsafe { ptr.to_string() }.unwrap_or_default();
+        unsafe { CoTaskMemFree(Some(ptr.0 as *const _)) };
+        s
+    } else if ty == STRRET_CSTR {
+        let bytes = unsafe { strret.Anonymous.cStr };
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    } else {
+        // STRRET_OFFSET：无父缓冲区时无法解析
+        String::new()
+    }
+}
+
+/// UTF-16 编码（含结尾 NUL），供 Win32 宽字符串参数使用。
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_by_extension() {
+        assert_eq!(
+            kind_from(0, false, Some(r"C:\Program Files\a.exe"), "a"),
+            ItemKind::App
+        );
+        assert_eq!(
+            kind_from(0, false, Some(r"C:\docs\a.txt"), "a"),
+            ItemKind::Doc
+        );
+        assert_eq!(
+            kind_from(0, false, Some(r"C:\docs\a.lnk"), "a"),
+            ItemKind::Link
+        );
+        assert_eq!(kind_from(0, false, None, "回收站"), ItemKind::Unknown);
+    }
+
+    #[test]
+    fn shell_attributes_take_precedence() {
+        // SFGAO_FOLDER 置位 → Folder（即使路径是 .exe）
+        assert_eq!(
+            kind_from(SFGAO_FOLDER, true, Some(r"C:\a.exe"), "a"),
+            ItemKind::Folder
+        );
+        assert_eq!(
+            kind_from(SFGAO_LINK, true, Some(r"C:\a.txt"), "a"),
+            ItemKind::Link
+        );
+    }
+
+    #[test]
+    fn item_id_prefers_lowercase_path() {
+        assert_eq!(
+            item_id(Some(r"C:\Docs\A.Exe".into()), "A", None),
+            "c:\\docs\\a.exe"
+        );
+        // 虚拟项：clsid 在 → H5 口径；不在 → 退回显示名
+        assert_eq!(
+            item_id(
+                None,
+                "回收站",
+                Some("{645FF040-5081-101B-9F08-00AA002F954E}")
+            ),
+            "shell:回收站-645ff040"
+        );
+        assert_eq!(item_id(None, "回收站", None), "shell:回收站");
+    }
+
+    #[test]
+    fn clsid_of_slices_parsing_name() {
+        assert_eq!(
+            clsid_of("::{645FF040-5081-101B-9F08-00AA002F954E}"),
+            Some("{645FF040-5081-101B-9F08-00AA002F954E}".to_string())
+        );
+        // 不带大括号 / 太短 / 空 → None（调用方退回显示名口径）
+        assert_eq!(clsid_of("645FF040-5081"), None);
+        assert_eq!(clsid_of(""), None);
+    }
+
+    #[test]
+    fn virtual_id_distinguishes_same_display_name() {
+        // 两个同名「控制面板」：CLSID 不同 → id 不同（旧口径 `shell:<显示名>` 会撞）
+        let a = item_id(
+            None,
+            "控制面板",
+            Some("{5399E694-F7B0-4E1B-9B0C-1F3E2D4C5B6A}"),
+        );
+        let b = item_id(
+            None,
+            "控制面板",
+            Some("{21EC2020-3AEA-1069-A2DD-08002B30309D}"),
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn display_name_strips_shortcut_extensions() {
+        assert_eq!(
+            display_name_from_path(r"C:\Users\a\Desktop\chrome.lnk"),
+            "chrome"
+        );
+        assert_eq!(display_name_from_path(r"C:\Users\a\Desktop\web.url"), "web");
+        assert_eq!(
+            display_name_from_path(r"C:\Users\a\Desktop\app.appref-ms"),
+            "app"
+        );
+        assert_eq!(
+            display_name_from_path(r"C:\Users\a\Desktop\report.pdf"),
+            "report.pdf"
+        );
+        assert_eq!(
+            display_name_from_path(r"C:\Users\a\Desktop\New Folder"),
+            "New Folder"
+        );
+        // 根目录无文件名 → 回退到完整路径
+        assert_eq!(display_name_from_path(r"C:\"), "C:\\");
+    }
+
+    #[test]
+    fn live_item_from_path_builds_desktop_item() {
+        // 任意路径（非桌面枚举）→ DesktopItem 冒烟：验证拖入/粘贴管线入口可用。
+        if crate::com::init().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join("winbosk_item_test.txt");
+        let _ = std::fs::write(&path, "hi");
+        let ok = path.exists();
+        if !ok {
+            return;
+        }
+        let p = path.to_string_lossy().into_owned();
+        match item_from_path(&p) {
+            Ok(item) => {
+                assert_eq!(item.path.as_deref(), Some(p.as_str()));
+                assert_eq!(item.display_name, "winbosk_item_test.txt");
+                // .txt 文件至少不应被归类为 Unknown
+                assert_ne!(item.kind, winbosk_core::model::ItemKind::Unknown);
+                // 图标提取不阻断添加，这里仅验证不 panic
+                let _ = crate::icons::extract_icon(&item, 32);
+            }
+            Err(e) => eprintln!("item_from_path failed (skipping): {e}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn live_enumerate_real_desktop() {
+        // 真实桌面冒烟：COM 初始化后枚举不应出错；隐藏了图标的桌面允许为空。
+        if crate::com::init().is_err() {
+            return;
+        }
+        let items = enumerate_desktop_items().expect("枚举桌面图标不应失败");
+        eprintln!("enumerated {} desktop items", items.len());
+        for it in items.iter().take(8) {
+            eprintln!("  - {:?} [{:?}] id={}", it.display_name, it.kind, it.id);
+        }
+    }
+}

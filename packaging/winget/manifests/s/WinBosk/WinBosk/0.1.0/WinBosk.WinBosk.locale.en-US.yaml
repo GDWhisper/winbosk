@@ -1,0 +1,23 @@
+PackageIdentifier: WinBosk.WinBosk
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: WinBosk
+PublisherUrl: https://github.com/GDWhisper/winbosk
+PackageName: WinBosk
+PackageUrl: https://github.com/GDWhisper/winbosk
+License: MIT
+LicenseUrl: https://github.com/GDWhisper/winbosk/blob/main/LICENSE
+ShortDescription: A lightweight desktop fence organizer for Windows.
+Description: |-
+  WinBosk is a low-footprint desktop fence organizer for Windows:
+  - Create fences anywhere on the desktop, in grid or list layout
+  - Fences snap and never overlap; one-click switch back to the original desktop
+  - A control center manages fence layout, background style and tint
+  - Lives in the tray; double-click to toggle the control center
+Moniker: winbosk
+Tags:
+  - desktop
+  - fences
+  - organizer
+ManifestType: locale
+ManifestVersion: 1.6.0

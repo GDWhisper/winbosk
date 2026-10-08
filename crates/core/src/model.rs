@@ -1,0 +1,2117 @@
+//! 领域模型：桌面、栅栏、图标等核心类型。
+//!
+//! 本模块只包含纯数据定义与默认值，不含任何平台相关逻辑，
+//! 以便 `winbosk-core` 保持零 Win32 依赖、可完全单元测试。
+
+use serde::{Deserialize, Serialize};
+
+use std::collections::HashMap;
+
+/// 图标的稳定标识符。
+///
+/// 由 Shell 层的项指纹（PIDL / 路径哈希）生成，跨重启稳定，
+/// 用于持久化成员关系与排序。
+pub type ItemId = String;
+
+/// 二维点。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Vec2 {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// 矩形（逻辑坐标，与 DPI 无关；渲染时由 Render 层按 DPI 换算像素）。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Rect {
+    pub fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h }
+    }
+
+    /// 右边界。
+    pub fn right(&self) -> f32 {
+        self.x + self.w
+    }
+
+    /// 下边界。
+    pub fn bottom(&self) -> f32 {
+        self.y + self.h
+    }
+
+    /// 点是否在矩形内（含边界）。
+    pub fn contains(&self, p: Vec2) -> bool {
+        p.x >= self.x && p.x <= self.right() && p.y >= self.y && p.y <= self.bottom()
+    }
+
+    /// 向内收缩 `d`（负值向外扩张）。不会缩到负宽高。
+    pub fn inset(&self, d: f32) -> Self {
+        Self {
+            x: self.x + d,
+            y: self.y + d,
+            w: (self.w - 2.0 * d).max(0.0),
+            h: (self.h - 2.0 * d).max(0.0),
+        }
+    }
+}
+
+/// 图标的类别。仅用于渲染表现（如快捷方式角标）与右键菜单，
+/// **不参与任何自动归类**——归属完全由用户拖拽决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ItemKind {
+    /// 应用程序。
+    App,
+    /// 文件夹。
+    Folder,
+    /// 文档。
+    Doc,
+    /// 驱动器/卷。
+    Drive,
+    /// 快捷方式。
+    Link,
+    /// 未知。
+    Unknown,
+}
+
+/// 栅栏的折叠状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FenceState {
+    /// 展开：显示栅栏区域与全部图标。
+    #[default]
+    Expanded,
+    /// 折叠：仅显示标题栏。
+    Folded,
+}
+
+/// 栅栏背景风格（决定背景填充与不透明度）。
+///
+/// v3 起替代「透明度滑块」：栅栏背景只分几种固定风格，不再用 0..1 滑块细调。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FenceStyle {
+    /// 颜色：不透明纯色填充（色调来自「背景色调」；未选时用默认背景色）。
+    Filled,
+    /// 透明：内部完全透明，仅保留圆角描边。
+    Outline,
+    /// 玻璃：默认半透明玻璃感（可叠加「背景色调」着色，45% 混合）。
+    #[default]
+    Glass,
+    /// 模糊：背景 = 栅栏底下桌面内容的高斯模糊（磨砂玻璃；CPU 侧降采样 + 高斯）。
+    Blur,
+}
+
+impl FenceStyle {
+    /// 菜单/设置显示名。
+    pub fn label(&self) -> &'static str {
+        match self {
+            FenceStyle::Filled => "颜色",
+            FenceStyle::Outline => "透明",
+            FenceStyle::Glass => "玻璃",
+            FenceStyle::Blur => "模糊",
+        }
+    }
+}
+
+/// 栅栏的布局格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FenceLayout {
+    /// 网格：图标自左向右、自上而下按列排布，标签在图标下方。
+    Grid,
+    /// 列表：图标单列纵向排布，标签在图标右侧。
+    List,
+    /// 侧边栏：仿 Mac Dock，仅显示图标，悬停放大 + 名称预览。
+    Sidebar,
+}
+
+impl FenceLayout {
+    /// 控制台/菜单显示名。
+    pub fn label(&self) -> &'static str {
+        match self {
+            FenceLayout::Grid => "网格",
+            FenceLayout::List => "列表",
+            FenceLayout::Sidebar => "侧边栏",
+        }
+    }
+
+    /// 循环切换到下一个格式。
+    pub fn next(self) -> Self {
+        match self {
+            FenceLayout::Grid => FenceLayout::List,
+            FenceLayout::List => FenceLayout::Sidebar,
+            FenceLayout::Sidebar => FenceLayout::Grid,
+        }
+    }
+}
+
+/// 侧边栏停靠位置。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SidebarPosition {
+    /// 屏幕左侧（纵向排列）。
+    #[default]
+    Left,
+    /// 屏幕上侧（横向排列）。
+    Top,
+    /// 屏幕右侧（纵向排列）。
+    Right,
+}
+
+impl SidebarPosition {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SidebarPosition::Left => "左侧",
+            SidebarPosition::Top => "上侧",
+            SidebarPosition::Right => "右侧",
+        }
+    }
+}
+
+/// 栅栏外观配置。
+///
+/// `#[serde(default)]`：旧版 `desk.json` 缺少新增字段时自动取默认值，
+/// 保证配置向后兼容。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FenceAppearance {
+    /// 背景色 RGBA（0.0..=1.0）；描边模式下不使用。
+    pub bg_color: [f32; 4],
+    /// 圆角半径（逻辑 px）。
+    pub corner_radius: f32,
+    /// 是否启用亚克力毛玻璃（Win11 生效，Win10 降级半透明）。
+    pub acrylic: bool,
+    /// 标题栏高度（逻辑 px）。
+    pub title_bar_height: f32,
+    /// 栅栏内边距。
+    pub padding: f32,
+    /// 图标尺寸（逻辑 px）。
+    pub icon_size: f32,
+    /// 图标间距（逻辑 px）。
+    pub gap: f32,
+    /// 布局格式（网格 / 列表）。
+    pub layout: FenceLayout,
+    /// 背景风格（玻璃 / 透明 / 颜色）。v3 起替代透明度滑块，决定填充与不透明度。
+    #[serde(default = "default_bg_style")]
+    pub bg_style: FenceStyle,
+    /// 边框描边宽度（逻辑 px；描边模式用中粗线）。
+    pub border_width: f32,
+    /// 栅栏背景不透明度（0.0=完全透明，1.0=不透明；滑块调节）。
+    ///
+    /// v3 起滑块移除，「风格」取代它；字段保留仅供旧配置反序列化兼容，渲染不再读取。
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
+    /// 背景色调（RGB 0.0..=1.0）：None = 默认底色；Some = 着色。
+    /// 「玻璃」风格下 45% 向色调靠拢；「颜色」风格下作为纯色填充。
+    #[serde(default)]
+    pub tint: Option<[f32; 3]>,
+    /// 侧边栏停靠位置（仅 Sidebar 布局有效）。
+    #[serde(default)]
+    pub sidebar_pos: SidebarPosition,
+}
+
+/// `bg_style` 未持久化时的默认值：玻璃（保持旧版滑块默认的半透明观感）。
+fn default_bg_style() -> FenceStyle {
+    FenceStyle::Glass
+}
+
+/// `opacity` 未持久化时的默认值（与旧版 `bg_color` 的 alpha 一致，迁移平滑）。
+fn default_opacity() -> f32 {
+    0.55
+}
+
+impl Default for FenceAppearance {
+    fn default() -> Self {
+        Self {
+            bg_color: [0.08, 0.08, 0.12, 0.55],
+            corner_radius: 12.0,
+            acrylic: true,
+            title_bar_height: 32.0,
+            padding: 12.0,
+            icon_size: 48.0,
+            gap: 10.0,
+            layout: FenceLayout::Grid,
+            bg_style: FenceStyle::Glass,
+            border_width: 1.75,
+            opacity: 0.55,
+            tint: None,
+            sidebar_pos: SidebarPosition::Left,
+        }
+    }
+}
+
+/// 分类规则预设模板。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CategoryPreset {
+    /// 应用程序与快捷方式
+    Apps,
+    /// 常用文档
+    Documents,
+    /// 图片、视频与音频媒体
+    Media,
+    /// 压缩包与磁盘镜像
+    Archives,
+    /// 文件夹目录
+    Folders,
+}
+
+impl CategoryPreset {
+    pub const ALL: [CategoryPreset; 5] = [
+        CategoryPreset::Apps,
+        CategoryPreset::Documents,
+        CategoryPreset::Media,
+        CategoryPreset::Archives,
+        CategoryPreset::Folders,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Apps => "应用",
+            Self::Documents => "文档",
+            Self::Media => "媒体",
+            Self::Archives => "压缩",
+            Self::Folders => "目录",
+        }
+    }
+
+    /// 获取该预设包含的所有内置扩展名（用于渲染展示与继承克隆）。
+    pub fn default_extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::Apps => EXT_APPS,
+            Self::Documents => EXT_DOCS,
+            Self::Media => EXT_MEDIA,
+            Self::Archives => EXT_ARCHIVES,
+            Self::Folders => &[],
+        }
+    }
+
+    /// 自动创建分类栅栏时的默认专属标题。
+    pub fn default_fence_title(self) -> &'static str {
+        match self {
+            Self::Apps => "常用应用",
+            Self::Documents => "办公文档",
+            Self::Media => "图片媒体",
+            Self::Archives => "压缩文件",
+            Self::Folders => "文件目录",
+        }
+    }
+
+    /// 根据图标属性与扩展名智能判定所属的预设类别。
+    pub fn classify_icon(icon: &Icon) -> Option<CategoryPreset> {
+        let ext = icon
+            .path
+            .as_deref()
+            .and_then(file_extension)
+            .or_else(|| file_extension(&icon.display_name))
+            .map(|s| s.to_ascii_lowercase());
+
+        // 1. 文件夹优先判定
+        if icon.kind == ItemKind::Folder {
+            return Some(CategoryPreset::Folders);
+        }
+
+        // 2. 常用应用与快捷方式
+        if icon.kind == ItemKind::App
+            || icon.kind == ItemKind::Link
+            || ext
+                .as_deref()
+                .map(|e| EXT_APPS.contains(&e))
+                .unwrap_or(false)
+        {
+            return Some(CategoryPreset::Apps);
+        }
+
+        // 3. 压缩文件
+        if ext
+            .as_deref()
+            .map(|e| EXT_ARCHIVES.contains(&e))
+            .unwrap_or(false)
+        {
+            return Some(CategoryPreset::Archives);
+        }
+
+        // 4. 图片媒体
+        if ext
+            .as_deref()
+            .map(|e| EXT_MEDIA.contains(&e))
+            .unwrap_or(false)
+        {
+            return Some(CategoryPreset::Media);
+        }
+
+        // 5. 办公文档（明确在文档扩展名列表中，或无扩展名但属于 Doc）
+        if ext
+            .as_deref()
+            .map(|e| EXT_DOCS.contains(&e))
+            .unwrap_or(false)
+            || (ext.is_none() && icon.kind == ItemKind::Doc)
+        {
+            return Some(CategoryPreset::Documents);
+        }
+
+        None
+    }
+}
+
+/// 栅栏绑定的分类规则。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FenceRule {
+    /// 是否启用规则。
+    pub enabled: bool,
+    /// 是否为自定义规则模式。
+    /// - false: 遵循 preset 分类逻辑（若 preset 为 None 则为无规则/手动模式）；
+    /// - true: 遵循 custom_extensions / exclude_extensions / name_patterns 自定义规则。
+    pub is_custom: bool,
+    /// 预设类别（当 !is_custom 时生效）。
+    pub preset: Option<CategoryPreset>,
+    /// 用户自定义扩展名白名单（例如 ["png", "jpg", "webp"]）。
+    pub custom_extensions: Vec<String>,
+    /// 排除的扩展名黑名单（例如 ["psd", "raw"]，优先于预设与白名单生效）。
+    pub exclude_extensions: Vec<String>,
+    /// 文件名通配符/关键字白名单（例如 ["*draft*", "backup_*", "test_*.log"]）。
+    pub name_patterns: Vec<String>,
+    /// 文件名排除通配符/关键字（例如 ["*.tmp", "~*"]）。
+    pub exclude_patterns: Vec<String>,
+    /// 是否在桌面出现新文件时自动捕获进此栅栏。
+    pub auto_capture: bool,
+}
+
+impl Default for FenceRule {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            is_custom: false,
+            preset: None,
+            custom_extensions: Vec::new(),
+            exclude_extensions: Vec::new(),
+            name_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            auto_capture: true,
+        }
+    }
+}
+
+impl FenceRule {
+    /// 是否处于自定义模式（向后兼容旧配置中未设置 is_custom 但存在自定义后缀的情况）。
+    pub fn is_custom_mode(&self) -> bool {
+        self.is_custom
+            || (self.preset.is_none()
+                && (!self.custom_extensions.is_empty() || !self.name_patterns.is_empty()))
+    }
+
+    /// 规则是否包含实际生效的匹配条件。
+    pub fn is_effective(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.is_custom_mode() {
+            !self.custom_extensions.is_empty() || !self.name_patterns.is_empty()
+        } else {
+            self.preset.is_some()
+        }
+    }
+
+    /// 将指定预设的规则内容继承克隆到当前自定义规则中，并切换为自定义模式。
+    pub fn inherit_from_preset(&mut self, preset: Option<CategoryPreset>) {
+        self.is_custom = true;
+        self.preset = None;
+        if let Some(p) = preset {
+            if p == CategoryPreset::Folders {
+                self.custom_extensions.clear();
+            } else {
+                self.custom_extensions = p
+                    .default_extensions()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+            }
+        }
+    }
+}
+
+/// 针对文件名的轻量通配符/关键字匹配（不区分大小写）。
+///
+/// - 若包含 `*` 或 `?`，按经典 Glob 通配符双指针匹配；
+/// - 若不含通配符，判定是否作为子串包含（方便用户直接输入关键词如 `draft`）；
+/// - 空字符串或全空格模式忽略（返回 false）。
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return false;
+    }
+    let p_lower = p.to_ascii_lowercase();
+    let t_lower = text.to_ascii_lowercase();
+
+    if !p.contains('*') && !p.contains('?') {
+        return t_lower.contains(&p_lower);
+    }
+
+    let p_chars: Vec<char> = p_lower.chars().collect();
+    let t_chars: Vec<char> = t_lower.chars().collect();
+    let mut px = 0;
+    let mut tx = 0;
+    let mut star_px = None;
+    let mut match_tx = 0;
+
+    while tx < t_chars.len() {
+        if px < p_chars.len() && (p_chars[px] == '?' || p_chars[px] == t_chars[tx]) {
+            px += 1;
+            tx += 1;
+        } else if px < p_chars.len() && p_chars[px] == '*' {
+            star_px = Some(px);
+            px += 1;
+            match_tx = tx;
+        } else if let Some(spx) = star_px {
+            px = spx + 1;
+            match_tx += 1;
+            tx = match_tx;
+        } else {
+            return false;
+        }
+    }
+
+    while px < p_chars.len() && p_chars[px] == '*' {
+        px += 1;
+    }
+
+    px == p_chars.len()
+}
+
+const EXT_APPS: &[&str] = &[
+    "lnk",
+    "exe",
+    "bat",
+    "cmd",
+    "url",
+    "appref-ms",
+    "msi",
+    "ps1",
+    "vbs",
+];
+const EXT_DOCS: &[&str] = &[
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "markdown", "wps", "rtf",
+    "csv", "epub", "mobi", "pages", "numbers", "key", "html", "htm", "xml", "json", "yaml", "yml",
+];
+const EXT_MEDIA: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "psd", "ai", "raw", "cr2", "nef",
+    "mp4", "mkv", "avi", "mov", "flv", "wmv", "webm", "m4v", "mp3", "wav", "flac", "aac", "m4a",
+    "ogg", "wma",
+];
+const EXT_ARCHIVES: &[&str] = &[
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "dmg", "cab", "tgz",
+];
+
+/// 从文件名或路径中提取扩展名（不含点，小写）。
+fn file_extension(name_or_path: &str) -> Option<&str> {
+    let s = name_or_path.rsplit(['/', '\\']).next()?;
+    let dot = s.rfind('.')?;
+    if dot == 0 || dot == s.len() - 1 {
+        None
+    } else {
+        Some(&s[dot + 1..])
+    }
+}
+
+impl FenceRule {
+    /// 判断图标是否满足此分类规则。
+    pub fn matches_icon(&self, icon: &Icon) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let ext = icon
+            .path
+            .as_deref()
+            .and_then(file_extension)
+            .or_else(|| file_extension(&icon.display_name))
+            .map(|s| s.to_ascii_lowercase());
+
+        let name = icon
+            .path
+            .as_deref()
+            .and_then(|p| p.rsplit(['/', '\\']).next())
+            .unwrap_or(&icon.display_name);
+
+        // 1. 黑名单短路检查（优先拒绝）
+        if let Some(ref ext_str) = ext {
+            if self
+                .exclude_extensions
+                .iter()
+                .any(|ee| ee.trim_start_matches('.').eq_ignore_ascii_case(ext_str))
+            {
+                return false;
+            }
+        }
+        if self
+            .exclude_patterns
+            .iter()
+            .any(|pat| glob_match(pat, name))
+        {
+            return false;
+        }
+
+        // 2. 白名单与通配符检查（命中任一即通过）
+        if let Some(ref ext_str) = ext {
+            if self
+                .custom_extensions
+                .iter()
+                .any(|ce| ce.trim_start_matches('.').eq_ignore_ascii_case(ext_str))
+            {
+                return true;
+            }
+        }
+        if self.name_patterns.iter().any(|pat| glob_match(pat, name)) {
+            return true;
+        }
+
+        // 3. 预设类别匹配（非纯自定义模式下检查预设分类）
+        if !self.is_custom {
+            match self.preset {
+                Some(CategoryPreset::Folders) => icon.kind == ItemKind::Folder,
+                Some(CategoryPreset::Apps) => {
+                    icon.kind == ItemKind::App
+                        || icon.kind == ItemKind::Link
+                        || ext
+                            .as_deref()
+                            .map(|e| EXT_APPS.contains(&e))
+                            .unwrap_or(false)
+                }
+                Some(CategoryPreset::Documents) => {
+                    if let Some(ref e) = ext {
+                        EXT_DOCS.contains(&e.as_str())
+                    } else {
+                        icon.kind == ItemKind::Doc
+                    }
+                }
+                Some(CategoryPreset::Media) => ext
+                    .as_deref()
+                    .map(|e| EXT_MEDIA.contains(&e))
+                    .unwrap_or(false),
+                Some(CategoryPreset::Archives) => ext
+                    .as_deref()
+                    .map(|e| EXT_ARCHIVES.contains(&e))
+                    .unwrap_or(false),
+                None => false,
+            }
+        } else {
+            false
+        }
+    }
+}
+
+/// 栅栏。绑定「显式图标成员列表」，可选分类规则。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Fence {
+    pub id: u64,
+    /// 用户自拟标题，可留空。
+    pub title: Option<String>,
+    /// 所属显示器（逻辑坐标基准）。
+    pub monitor_id: u32,
+    /// 栅栏几何（物理像素；与 overlay 虚拟屏幕坐标一致，渲染直接用）。
+    pub bounds: Rect,
+    pub state: FenceState,
+    /// 成员顺序即布局顺序。
+    pub icon_ids: Vec<ItemId>,
+    pub appearance: FenceAppearance,
+    /// 内容滚动偏移（物理像素；0 = 未滚动）。内容超出可视区时用滚轮滚动。
+    #[serde(default)]
+    pub scroll: f32,
+    /// 栅栏内项目的自定义存储位置（绝对路径）。None = 使用默认内部库。
+    /// 用户可在控制台中更改此路径，已有的库内项会被移动到新位置。
+    #[serde(default)]
+    pub storage_path: Option<String>,
+    /// 侧边栏是否折叠（仅 Sidebar 布局有效）。折叠后只显示一个小箭头。
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
+    /// 分类规则配置。None = 无分类规则。
+    #[serde(default)]
+    pub rule: Option<FenceRule>,
+    /// 栅栏是否收起（折叠仅留标题栏）。
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+impl Fence {
+    /// 碰撞 / 夹屏用的真实高度（物理像素）。
+    ///
+    /// `bounds.h > 0` = 用户手动缩放过的固定高度；`bounds.h <= 0` = 自动高度，真实高度
+    /// 由最近一次布局回写的 `layout_h` 提供（0 高当真实高度用会把碰撞检测与夹屏一起带偏）。
+    ///
+    /// **收起态不改变本口径**：折叠只影响视觉高度，原矩形始终是碰撞占位的依据——
+    /// 否则展开时会与其他栅栏重叠，而展开并不做重新避让。
+    pub fn collision_height(&self, layout_h: f32) -> f32 {
+        if self.bounds.h > 0.0 {
+            self.bounds.h
+        } else {
+            layout_h
+        }
+    }
+
+    /// 碰撞 / 夹屏用的真实矩形：左上角与宽度取 `bounds`，高度按 [`Self::collision_height`]。
+    ///
+    /// 这是全工程唯一的碰撞口径真源（拖动、避让、启动重叠消解、占位框提示共用）。
+    pub fn collision_rect(&self, layout_h: f32) -> Rect {
+        Rect::new(
+            self.bounds.x,
+            self.bounds.y,
+            self.bounds.w,
+            self.collision_height(layout_h),
+        )
+    }
+}
+
+/// 图标元数据。核心层只关心标识与展示信息。
+///
+/// 新增字段均带 `#[serde(default)]`，保证旧版 `desk.json` 能加载。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Icon {
+    pub id: ItemId,
+    pub display_name: String,
+    pub kind: ItemKind,
+    /// 文件系统路径；虚拟项为 None。持久化后重启可恢复图标/打开能力。
+    #[serde(default)]
+    pub path: Option<String>,
+    /// 文件类型标签（"文件夹"、"文本文档"…）；空 = 未知/虚拟项。
+    #[serde(default)]
+    pub type_label: String,
+    /// 最近修改时间（unix 秒）；无法读取为 None。
+    #[serde(default)]
+    pub modified_secs: Option<i64>,
+    /// 文件大小（字节）；文件夹/未知为 None。
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    /// 是否为拖入/粘贴新增的项（非桌面枚举而来）。移除时直接删除，不回桌面。
+    #[serde(default)]
+    pub added: bool,
+}
+
+impl Icon {
+    /// 基础构造（详情字段留空，由 `details::enrich` 按路径补齐）。
+    pub fn new(id: ItemId, display_name: String, kind: ItemKind) -> Self {
+        Self {
+            id,
+            display_name,
+            kind,
+            path: None,
+            type_label: String::new(),
+            modified_secs: None,
+            size_bytes: None,
+            added: false,
+        }
+    }
+}
+
+/// 图标当前的归属位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconLocation {
+    /// 未分组图标区。
+    Free,
+    /// 位于指定栅栏内。
+    Fence(u64),
+}
+
+/// 待办事项条目（控制台第一个插件的数据）。二级结构：名称 + 详细信息。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TodoItem {
+    /// 稳定 id（行动画/删除定位用；旧数据缺失时回退 0）。
+    #[serde(default)]
+    pub id: u64,
+    /// 事项名称（一级标题）。旧配置字段名 `text`，反序列化时兼容。
+    #[serde(alias = "text")]
+    pub name: String,
+    /// 详细信息（二级副标题）；可为空（只显示名称）。
+    #[serde(default)]
+    pub detail: String,
+    /// 是否已完成。
+    #[serde(default)]
+    pub done: bool,
+}
+
+impl TodoItem {
+    pub fn new(id: u64, name: String, detail: String) -> Self {
+        Self {
+            id,
+            name,
+            detail,
+            done: false,
+        }
+    }
+}
+
+/// 桌面全局状态，唯一的持久化根。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Desk {
+    /// 配置版本，用于结构迁移。
+    pub version: u32,
+    pub settings: crate::config::AppSettings,
+    pub fences: Vec<Fence>,
+    /// 未分组图标区：不属于任何栅栏的图标，顺序即布局顺序。
+    pub free_icons: Vec<ItemId>,
+    pub icons: HashMap<ItemId, Icon>,
+    /// 待办插件数据（控制台第一个插件）。
+    #[serde(default)]
+    pub todos: Vec<TodoItem>,
+    /// 下一个待办 id（`TodoItem.id` 分配；自增保证唯一）。
+    #[serde(default = "default_next_todo_id")]
+    pub next_todo_id: u64,
+    /// 控制台面板是否显示（右上角插件面板）。
+    /// 旧配置缺失该字段时默认打开（用户要求恢复控制台）；关闭后持久化 false。
+    #[serde(default = "default_console_open")]
+    pub console_open: bool,
+    /// 控制台面板左上角（物理像素）。None = 未拖动过，按右上角自动摆放。
+    #[serde(default)]
+    pub console_pos: Option<Vec2>,
+    /// 控制台面板宽高（物理像素）。None = 默认尺寸（宽固定，高随待办条数自适应）。
+    /// 用户拖边缘/角缩放后落为具体值；之后高度固定、超出滚动。
+    #[serde(default)]
+    pub console_size: Option<(f32, f32)>,
+    /// 插件注册表：内置插件 + 外部清单插件的统一启用状态与数据。
+    /// 旧配置缺失时默认含「待办事项」（保持既有行为）。
+    #[serde(default = "default_plugins")]
+    pub plugins: Vec<PluginEntry>,
+    /// 控制中心面板是否处于高级模式（双栏展开）。
+    #[serde(default)]
+    pub console_advanced: bool,
+    /// 桌面模式：false = 栅栏接管（隐藏真实图标）；true = 原始桌面（恢复真实图标、
+    /// 栅栏淡出隐藏）。控制中心「切换桌面」按钮切换。
+    #[serde(default)]
+    pub desktop_mode: bool,
+}
+
+/// 插件种类：内置实现 / 外部清单（当前只有内置种类有界面实现）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginKind {
+    Todo,
+    Notes,
+    External,
+}
+
+impl PluginKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            PluginKind::Todo => "待办事项",
+            PluginKind::Notes => "便签",
+            PluginKind::External => "外部插件",
+        }
+    }
+}
+
+/// 插件注册项：内置插件与外部清单插件的统一持久化状态。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginEntry {
+    pub id: String,
+    pub name: String,
+    pub kind: PluginKind,
+    pub enabled: bool,
+    pub version: String,
+    pub desc: String,
+    /// 便签插件内容（多行文本，持久化）。
+    pub note_text: String,
+}
+
+impl PluginEntry {
+    pub fn builtin_todo() -> Self {
+        Self {
+            id: "todo".into(),
+            name: "待办事项".into(),
+            kind: PluginKind::Todo,
+            enabled: true,
+            version: "1.0".into(),
+            desc: "两级待办清单（名称 + 详情）".into(),
+            note_text: String::new(),
+        }
+    }
+
+    pub fn builtin_notes() -> Self {
+        Self {
+            id: "notes".into(),
+            name: "便签".into(),
+            kind: PluginKind::Notes,
+            enabled: false,
+            version: "1.0".into(),
+            desc: "随手记多行文本，自动保存".into(),
+            note_text: String::new(),
+        }
+    }
+}
+
+impl Default for PluginEntry {
+    fn default() -> Self {
+        Self::builtin_todo()
+    }
+}
+
+/// `plugins` 未持久化时（旧配置）的默认注册表：待办事项启用 + 便签未启用。
+fn default_plugins() -> Vec<PluginEntry> {
+    vec![PluginEntry::builtin_todo(), PluginEntry::builtin_notes()]
+}
+
+/// `console_open` 未持久化时（旧配置）默认打开控制台。
+fn default_console_open() -> bool {
+    true
+}
+
+/// `next_todo_id` 未持久化时（旧配置）从 1 起（0 保留给无 id 的旧数据）。
+fn default_next_todo_id() -> u64 {
+    1
+}
+
+impl Desk {
+    pub fn new(settings: crate::config::AppSettings) -> Self {
+        Self {
+            version: 1,
+            settings,
+            fences: Vec::new(),
+            free_icons: Vec::new(),
+            icons: HashMap::new(),
+            todos: Vec::new(),
+            // 首个版本默认打开控制台（用户要求恢复），关闭后持久化 false。
+            next_todo_id: 1,
+            console_open: true,
+            console_pos: None,
+            console_size: None,
+            plugins: default_plugins(),
+            console_advanced: false,
+            desktop_mode: false,
+        }
+    }
+
+    pub fn fence(&self, id: u64) -> Option<&Fence> {
+        self.fences.iter().find(|f| f.id == id)
+    }
+
+    pub fn fence_mut(&mut self, id: u64) -> Option<&mut Fence> {
+        self.fences.iter_mut().find(|f| f.id == id)
+    }
+
+    /// 下一个可用的栅栏 id（简单自增，稳定即可）。
+    pub fn next_fence_id(&self) -> u64 {
+        self.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1
+    }
+
+    /// 查询图标的归属位置。
+    pub fn icon_location(&self, id: &ItemId) -> Option<IconLocation> {
+        for f in &self.fences {
+            if f.icon_ids.contains(id) {
+                return Some(IconLocation::Fence(f.id));
+            }
+        }
+        if self.free_icons.contains(id) {
+            Some(IconLocation::Free)
+        } else {
+            None
+        }
+    }
+
+    /// 把一个图标从当前归属移到目标位置（None 表示未分组区）。
+    ///
+    /// 语义 = **先摘除、再追加到目标末尾**，因此「目标位置已包含它」也会把它挪到末尾
+    /// （原实现的注释写「幂等」，但代码与这里等价，注释已按实际行为改正）。
+    /// 图标不存在时不做任何事并返回 None。
+    pub fn move_icon(&mut self, id: &ItemId, to: Option<u64>) -> Option<IconLocation> {
+        self.move_icon_at(id, to, None)
+    }
+
+    /// 把一个图标移到目标位置并指定插入下标（`None` = 追加到末尾）。
+    ///
+    /// 与 `move_icon` 的唯一差别是落点可控——同栅栏内换位、跨栅栏插到指定位置
+    /// （拖放落点用）都走这里。
+    ///
+    /// **下标口径**：`insert_at` 的基准是**摘除该图标之后**的目标成员列表，
+    /// 越界自动夹到末尾。调用方按「排除被拖项后算出的插入位」传值即可，
+    /// 同栅栏换位与跨栅栏迁移共用同一套下标语义（否则同栅栏换位会整体差一位）。
+    /// 返回该图标原来的归属；图标不存在时返回 None 且不做任何改动。
+    pub fn move_icon_at(
+        &mut self,
+        id: &ItemId,
+        to: Option<u64>,
+        insert_at: Option<usize>,
+    ) -> Option<IconLocation> {
+        let from = self.icon_location(id)?;
+        // 从旧位置移除
+        if let Some(fid) = from.fence_id() {
+            if let Some(f) = self.fence_mut(fid) {
+                f.icon_ids.retain(|x| x != id);
+            }
+        }
+        self.free_icons.retain(|x| x != id);
+        // 加入新位置
+        match to {
+            None => {
+                if !self.free_icons.contains(id) {
+                    self.free_icons.push(id.clone());
+                }
+            }
+            Some(fid) => {
+                if let Some(f) = self.fence_mut(fid) {
+                    if !f.icon_ids.contains(id) {
+                        let at = insert_at.unwrap_or(f.icon_ids.len()).min(f.icon_ids.len());
+                        f.icon_ids.insert(at, id.clone());
+                    }
+                } else {
+                    // 目标栅栏不存在：退回未分组区
+                    if !self.free_icons.contains(id) {
+                        self.free_icons.push(id.clone());
+                    }
+                }
+            }
+        }
+        Some(from)
+    }
+
+    /// 校验栅栏成员引用的完整性（存在但无元数据的图标会被剔除）。
+    /// 用于加载配置后的防御性清理。
+    pub fn validate(&mut self) {
+        for f in &mut self.fences {
+            f.icon_ids.retain(|id| self.icons.contains_key(id));
+        }
+        self.free_icons.retain(|id| self.icons.contains_key(id));
+    }
+
+    /// 根据各栅栏配置的分类规则自动整理图标。
+    ///
+    /// `source_fence_id`:
+    /// - `Some(fid)`: 从指定栅栏（如默认桌面栅栏）及未分组区（`free_icons`）提取未归类图标；
+    /// - `None`: 仅从未分组区（`free_icons`）提取未归类图标。
+    ///
+    /// 返回移动的列表 `(ItemId, 目标 FenceId)`。
+    pub fn organize_icons_by_rules(&mut self, source_fence_id: Option<u64>) -> Vec<(ItemId, u64)> {
+        let active_rules: Vec<(u64, FenceRule)> = self
+            .fences
+            .iter()
+            .filter_map(|f| {
+                f.rule
+                    .as_ref()
+                    .filter(|r| r.is_effective())
+                    .map(|r| (f.id, r.clone()))
+            })
+            .collect();
+
+        if active_rules.is_empty() {
+            return Vec::new();
+        }
+
+        let mut candidates: Vec<ItemId> = self.free_icons.clone();
+        if let Some(src_id) = source_fence_id {
+            if let Some(src_fence) = self.fence(src_id) {
+                for id in &src_fence.icon_ids {
+                    let keep = src_fence
+                        .rule
+                        .as_ref()
+                        .map(|r| {
+                            self.icons
+                                .get(id)
+                                .map(|ic| r.matches_icon(ic))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if !keep && !candidates.contains(id) {
+                        candidates.push(id.clone());
+                    }
+                }
+            }
+        }
+
+        let mut moved = Vec::new();
+        for item_id in candidates {
+            // 虚拟壳项（回收站等）不得被任何分类规则/预设搬进分类栅栏：它们不属于
+            // 「文件分类」这一语义，且用户栅栏的 name_patterns 可以直接命中显示名。
+            if crate::shell_items::is_virtual_id(&item_id) {
+                continue;
+            }
+            let Some(icon) = self.icons.get(&item_id) else {
+                continue;
+            };
+            let current_loc = self.icon_location(&item_id);
+            for (target_fid, rule) in &active_rules {
+                if current_loc == Some(IconLocation::Fence(*target_fid)) {
+                    break;
+                }
+                if rule.matches_icon(icon) {
+                    self.move_icon(&item_id, Some(*target_fid));
+                    moved.push((item_id.clone(), *target_fid));
+                    break;
+                }
+            }
+        }
+
+        moved
+    }
+
+    /// 全自动智能分类整理：扫描待整理图标，按需自动创建缺少的分类栅栏，并将图标分拣归位。
+    ///
+    /// - `source_fence_id`:
+    ///   - `Some(fid)`: 待整理候选包含指定栅栏（如默认桌面栅栏）中未匹配其自身规则的图标，以及未分组区（`free_icons`）；
+    ///   - `None`: 仅从未分组区（`free_icons`）提取未归类图标。
+    /// - `screen_wa`: 屏幕工作区范围（物理像素，用于新栅栏自动避让排布）。若为空或零尺寸，使用安全默认矩形。
+    /// - `scale`: DPI 缩放系数（用于新栅栏初始宽高与间隙计算）。
+    pub fn auto_organize_all(
+        &mut self,
+        source_fence_id: Option<u64>,
+        screen_wa: Rect,
+        scale: f32,
+    ) -> AutoOrganizeReport {
+        let eff_scale = if scale <= 0.0 { 1.0 } else { scale };
+        let wa = if screen_wa.w > 100.0 && screen_wa.h > 100.0 {
+            screen_wa
+        } else {
+            Rect::new(0.0, 0.0, 1920.0 * eff_scale, 1080.0 * eff_scale)
+        };
+
+        // 1. 收集待整理候选图标
+        let mut candidates: Vec<ItemId> = self
+            .free_icons
+            .iter()
+            .filter(|id| !crate::shell_items::is_virtual_id(id))
+            .cloned()
+            .collect();
+        if let Some(src_id) = source_fence_id {
+            if let Some(src_fence) = self.fence(src_id) {
+                for id in &src_fence.icon_ids {
+                    // 虚拟壳项（回收站等）整体排除：它们是候选（不含自身不匹配的成员都进
+                    // 候选），但 `classify_icon` 对它们返回 None 只是巧合——显示名带点的
+                    // 本地化名会切出假扩展名，用户栅栏的 `name_patterns` 更可以直接命中
+                    // 显示名（规则匹配不看 kind）。故必须显式排除（纯规则口径不可省）。
+                    if crate::shell_items::is_virtual_id(id) {
+                        continue;
+                    }
+                    let keep = src_fence
+                        .rule
+                        .as_ref()
+                        .map(|r| {
+                            self.icons
+                                .get(id)
+                                .map(|ic| r.matches_icon(ic))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if !keep && !candidates.contains(id) {
+                        candidates.push(id.clone());
+                    }
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return AutoOrganizeReport::default();
+        }
+
+        // 2. 检查是否有已存在但 rule 为 None 且标题与 preset 匹配的栅栏，为其赋予该 preset 规则以复用
+        for f in &mut self.fences {
+            if f.rule.is_none() {
+                if let Some(title) = f.title.as_deref() {
+                    for preset in &CategoryPreset::ALL {
+                        if title == preset.default_fence_title() {
+                            f.rule = Some(FenceRule {
+                                enabled: true,
+                                preset: Some(*preset),
+                                ..Default::default()
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 分析各候选图标，检查哪些已有栅栏可接纳，哪些类别需要按需新建栅栏
+        let mut needed_presets: Vec<CategoryPreset> = Vec::new();
+        for item_id in &candidates {
+            let Some(icon) = self.icons.get(item_id) else {
+                continue;
+            };
+
+            // 检查当前是否已有已配置有效规则的栅栏能够匹配此图标
+            let already_covered = self.fences.iter().any(|f| {
+                f.rule
+                    .as_ref()
+                    .map(|r| r.matches_icon(icon))
+                    .unwrap_or(false)
+            });
+
+            if !already_covered {
+                if let Some(preset) = CategoryPreset::classify_icon(icon) {
+                    let has_reusable_fence = self.fences.iter().any(|f| {
+                        f.rule
+                            .as_ref()
+                            .map(|r| r.enabled && r.preset == Some(preset))
+                            .unwrap_or(false)
+                    });
+
+                    if !has_reusable_fence && !needed_presets.contains(&preset) {
+                        needed_presets.push(preset);
+                    }
+                }
+            }
+        }
+
+        // 3. 为缺失的类别按需创建新分类栅栏（永不重叠，settle_move 智能排布）
+        let mut created_fences = 0;
+        let fence_w = (320.0 * eff_scale).round();
+        let fence_h = (220.0 * eff_scale).round();
+        let gap = crate::magnet::FENCE_GAP * eff_scale;
+
+        // 收集所有现有栅栏的碰撞矩形
+        let mut occupied_rects: Vec<Rect> = self
+            .fences
+            .iter()
+            .map(|f| {
+                let h = if f.bounds.h > 0.0 {
+                    f.bounds.h
+                } else {
+                    fence_h
+                };
+                Rect::new(f.bounds.x, f.bounds.y, f.bounds.w, h)
+            })
+            .collect();
+
+        // 保证创建顺序按 CategoryPreset::ALL 的标准顺序
+        let mut ordered_new_presets: Vec<CategoryPreset> = Vec::new();
+        for p in &CategoryPreset::ALL {
+            if needed_presets.contains(p) {
+                ordered_new_presets.push(*p);
+            }
+        }
+
+        for (idx, preset) in ordered_new_presets.iter().enumerate() {
+            let fid = self.next_fence_id();
+            let start_x = wa.x + 40.0 * eff_scale + (idx as f32 % 3.0) * (fence_w + gap);
+            let start_y = wa.y + 60.0 * eff_scale + ((idx as f32 / 3.0).floor()) * (fence_h + gap);
+            let start_rect = Rect::new(start_x, start_y, fence_w, fence_h);
+
+            let placed = crate::magnet::settle_move(&start_rect, &occupied_rects, &wa, gap);
+            let final_bounds = Rect::new(placed.x.round(), placed.y.round(), fence_w, fence_h);
+
+            // 加入占用，供后续新建栅栏避让
+            occupied_rects.push(final_bounds);
+
+            self.fences.push(Fence {
+                id: fid,
+                title: Some(preset.default_fence_title().to_string()),
+                monitor_id: 0,
+                bounds: final_bounds,
+                state: FenceState::Expanded,
+                icon_ids: Vec::new(),
+                appearance: FenceAppearance::default(),
+                scroll: 0.0,
+                storage_path: None,
+                sidebar_collapsed: false,
+                rule: Some(FenceRule {
+                    enabled: true,
+                    preset: Some(*preset),
+                    ..Default::default()
+                }),
+                collapsed: false,
+            });
+            created_fences += 1;
+        }
+
+        // 4. 执行图标分拣归位
+        let active_rules: Vec<(u64, FenceRule)> = self
+            .fences
+            .iter()
+            .filter_map(|f| {
+                f.rule
+                    .as_ref()
+                    .filter(|r| r.is_effective())
+                    .map(|r| (f.id, r.clone()))
+            })
+            .collect();
+
+        let mut moved_icons = 0;
+        for item_id in candidates {
+            let Some(icon) = self.icons.get(&item_id) else {
+                continue;
+            };
+            let current_loc = self.icon_location(&item_id);
+            for (target_fid, rule) in &active_rules {
+                if current_loc == Some(IconLocation::Fence(*target_fid)) {
+                    break;
+                }
+                if rule.matches_icon(icon) {
+                    self.move_icon(&item_id, Some(*target_fid));
+                    moved_icons += 1;
+                    break;
+                }
+            }
+        }
+
+        AutoOrganizeReport {
+            created_fences,
+            moved_icons,
+        }
+    }
+}
+
+/// 全自动分类整理执行报告。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AutoOrganizeReport {
+    /// 新创建的栅栏数量。
+    pub created_fences: usize,
+    /// 成功分拣归位的图标数量。
+    pub moved_icons: usize,
+}
+
+impl IconLocation {
+    /// 栅栏 id；未分组区返回 None。
+    pub fn fence_id(&self) -> Option<u64> {
+        match self {
+            IconLocation::Free => None,
+            IconLocation::Fence(id) => Some(*id),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn desk() -> Desk {
+        Desk::new(crate::config::AppSettings::default())
+    }
+
+    fn icon(id: &str) -> Icon {
+        Icon::new(id.to_string(), id.to_string(), ItemKind::Unknown)
+    }
+
+    #[test]
+    fn move_icon_between_locations() {
+        let mut d = desk();
+        d.icons.insert("a".into(), icon("a"));
+        d.icons.insert("b".into(), icon("b"));
+        d.free_icons = vec!["a".into(), "b".into()];
+
+        let f1 = d.next_fence_id();
+        d.fences.push(Fence {
+            id: f1,
+            title: Some("工作".into()),
+            monitor_id: 0,
+            bounds: Rect::new(0.0, 0.0, 300.0, 200.0),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed: false,
+        });
+
+        // 移到栅栏
+        let from = d.move_icon(&"a".into(), Some(f1));
+        assert_eq!(from, Some(IconLocation::Free));
+        assert_eq!(d.icon_location(&"a".into()), Some(IconLocation::Fence(f1)));
+
+        // 移回未分组区
+        let from = d.move_icon(&"a".into(), None);
+        assert_eq!(from, Some(IconLocation::Fence(f1)));
+        assert_eq!(d.icon_location(&"a".into()), Some(IconLocation::Free));
+    }
+
+    #[test]
+    fn move_icon_to_missing_fence_falls_back_to_free() {
+        let mut d = desk();
+        d.icons.insert("a".into(), icon("a"));
+        d.free_icons = vec!["a".into()];
+        let from = d.move_icon(&"a".into(), Some(999));
+        assert_eq!(from, Some(IconLocation::Free));
+        assert_eq!(d.icon_location(&"a".into()), Some(IconLocation::Free));
+    }
+
+    /// 测试用栅栏：只关心 id 与成员顺序。
+    fn fence(id: u64, ids: &[&str]) -> Fence {
+        Fence {
+            id,
+            title: None,
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: ids.iter().map(|s| (*s).to_string()).collect(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed: false,
+        }
+    }
+
+    /// 三块栅栏 + 五个图标的共用底稿。
+    fn reorder_desk() -> Desk {
+        let mut d = desk();
+        for id in ["a", "b", "c", "d", "e"] {
+            d.icons.insert(id.into(), icon(id));
+        }
+        d.fences.push(fence(1, &["a", "b", "c"]));
+        d.fences.push(fence(2, &["d", "e"]));
+        d
+    }
+
+    fn ids(d: &Desk, fid: u64) -> Vec<String> {
+        d.fence(fid).map(|f| f.icon_ids.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn move_icon_at_reorders_within_same_fence() {
+        let mut d = reorder_desk();
+        // 把 a 换到 b、c 之后
+        let from = d.move_icon_at(&"a".into(), Some(1), Some(2));
+        assert_eq!(from, Some(IconLocation::Fence(1)));
+        assert_eq!(ids(&d, 1), vec!["b", "c", "a"]);
+        // 再换回最前
+        d.move_icon_at(&"a".into(), Some(1), Some(0));
+        assert_eq!(ids(&d, 1), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn move_icon_at_inserts_at_index_across_fences() {
+        let mut d = reorder_desk();
+        let from = d.move_icon_at(&"a".into(), Some(2), Some(1));
+        assert_eq!(from, Some(IconLocation::Fence(1)));
+        assert_eq!(ids(&d, 1), vec!["b", "c"]);
+        assert_eq!(ids(&d, 2), vec!["d", "a", "e"]);
+    }
+
+    #[test]
+    fn move_icon_at_clamps_out_of_range_index() {
+        let mut d = reorder_desk();
+        d.move_icon_at(&"a".into(), Some(2), Some(99));
+        assert_eq!(ids(&d, 2), vec!["d", "e", "a"]);
+        // 同栅栏换位时越界下标 = 追加到末尾（不是 panic、不是首位）
+        let mut d2 = reorder_desk();
+        d2.move_icon_at(&"a".into(), Some(1), Some(99));
+        assert_eq!(ids(&d2, 1), vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn move_icon_at_unknown_id_is_noop() {
+        let mut d = reorder_desk();
+        assert_eq!(d.move_icon_at(&"ghost".into(), Some(2), Some(0)), None);
+        assert_eq!(ids(&d, 1), vec!["a", "b", "c"]);
+        assert_eq!(ids(&d, 2), vec!["d", "e"]);
+    }
+
+    /// 同栅栏换位必须按「先摘除、再按该下标插入」的基准落位（口径最容易差一位的地方）：
+    /// 摘除 e 后是 [a,b,c,d]，插到下标 3 = d 之前 → [a,b,c,e,d]。
+    #[test]
+    fn move_icon_at_same_fence_is_not_off_by_one() {
+        let mut d = desk();
+        for id in ["a", "b", "c", "d", "e"] {
+            d.icons.insert(id.into(), icon(id));
+        }
+        d.fences.push(fence(1, &["a", "b", "c", "d", "e"]));
+
+        d.move_icon_at(&"e".into(), Some(1), Some(3));
+        assert_eq!(ids(&d, 1), vec!["a", "b", "c", "e", "d"]);
+
+        // 挪到末尾：摘除 a 后是 [b,c,e,d]，插到下标 4（= len）→ 追加
+        d.move_icon_at(&"a".into(), Some(1), Some(4));
+        assert_eq!(ids(&d, 1), vec!["b", "c", "e", "d", "a"]);
+    }
+
+    #[test]
+    fn validate_drops_dangling_members() {
+        let mut d = desk();
+        d.icons.insert("a".into(), icon("a"));
+        d.fences.push(Fence {
+            id: 1,
+            title: None,
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: vec!["a".into(), "ghost".into()],
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed: false,
+        });
+        d.free_icons = vec!["ghost2".into()];
+        d.validate();
+        assert_eq!(d.fences[0].icon_ids, vec!["a".to_string()]);
+        assert!(d.free_icons.is_empty());
+    }
+
+    #[test]
+    fn rule_preset_matching_and_organize() {
+        let mut d = desk();
+        let mut ic_doc = icon("doc1");
+        ic_doc.path = Some("C:\\Users\\Desktop\\report.docx".into());
+        let mut ic_pic = icon("pic1");
+        ic_pic.path = Some("C:\\Users\\Desktop\\avatar.png".into());
+        let mut ic_app = icon("app1");
+        ic_app.path = Some("C:\\Users\\Desktop\\Tool.lnk".into());
+        let mut ic_folder = icon("fold1");
+        ic_folder.kind = ItemKind::Folder;
+
+        d.icons.insert("doc1".into(), ic_doc);
+        d.icons.insert("pic1".into(), ic_pic);
+        d.icons.insert("app1".into(), ic_app);
+        d.icons.insert("fold1".into(), ic_folder);
+        d.free_icons = vec!["doc1".into(), "pic1".into(), "app1".into(), "fold1".into()];
+
+        // 栅栏 1：文档
+        d.fences.push(Fence {
+            id: 1,
+            title: Some("文档".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: Some(FenceRule {
+                enabled: true,
+                preset: Some(CategoryPreset::Documents),
+                ..Default::default()
+            }),
+            collapsed: false,
+        });
+
+        // 栅栏 2：媒体
+        d.fences.push(Fence {
+            id: 2,
+            title: Some("媒体".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: Some(FenceRule {
+                enabled: true,
+                preset: Some(CategoryPreset::Media),
+                ..Default::default()
+            }),
+            collapsed: false,
+        });
+
+        // 执行整理
+        let moved = d.organize_icons_by_rules(None);
+        assert_eq!(moved.len(), 2);
+        assert_eq!(
+            d.icon_location(&"doc1".into()),
+            Some(IconLocation::Fence(1))
+        );
+        assert_eq!(
+            d.icon_location(&"pic1".into()),
+            Some(IconLocation::Fence(2))
+        );
+        assert_eq!(d.icon_location(&"app1".into()), Some(IconLocation::Free));
+        assert_eq!(d.icon_location(&"fold1".into()), Some(IconLocation::Free));
+    }
+
+    #[test]
+    fn classify_icon_categories() {
+        let mut app_icon = icon("app");
+        app_icon.path = Some("C:\\Tools\\IDE.exe".into());
+        assert_eq!(
+            CategoryPreset::classify_icon(&app_icon),
+            Some(CategoryPreset::Apps)
+        );
+
+        let mut link_icon = icon("link");
+        link_icon.kind = ItemKind::Link;
+        assert_eq!(
+            CategoryPreset::classify_icon(&link_icon),
+            Some(CategoryPreset::Apps)
+        );
+
+        let mut doc_icon = icon("doc");
+        doc_icon.path = Some("C:\\Files\\notes.md".into());
+        assert_eq!(
+            CategoryPreset::classify_icon(&doc_icon),
+            Some(CategoryPreset::Documents)
+        );
+
+        let mut media_icon = icon("pic");
+        media_icon.path = Some("C:\\Photos\\test.png".into());
+        assert_eq!(
+            CategoryPreset::classify_icon(&media_icon),
+            Some(CategoryPreset::Media)
+        );
+
+        let mut zip_icon = icon("zip");
+        zip_icon.path = Some("C:\\Downloads\\pack.7z".into());
+        assert_eq!(
+            CategoryPreset::classify_icon(&zip_icon),
+            Some(CategoryPreset::Archives)
+        );
+
+        let mut folder_icon = icon("folder");
+        folder_icon.kind = ItemKind::Folder;
+        assert_eq!(
+            CategoryPreset::classify_icon(&folder_icon),
+            Some(CategoryPreset::Folders)
+        );
+
+        let mut unknown_icon = icon("unknown");
+        unknown_icon.path = Some("C:\\Other\\data.weird_ext".into());
+        assert_eq!(CategoryPreset::classify_icon(&unknown_icon), None);
+    }
+
+    #[test]
+    fn auto_organize_creates_fences_on_demand_and_no_overlaps() {
+        let mut d = desk();
+        let mut ic_app = icon("app1");
+        ic_app.path = Some("C:\\Users\\Desktop\\VSCode.lnk".into());
+        let mut ic_doc = icon("doc1");
+        ic_doc.path = Some("C:\\Users\\Desktop\\finance.xlsx".into());
+        let mut ic_pic = icon("pic1");
+        ic_pic.path = Some("C:\\Users\\Desktop\\wallpaper.jpg".into());
+        let mut ic_unknown = icon("unk1");
+        ic_unknown.path = Some("C:\\Users\\Desktop\\data.bin".into());
+
+        d.icons.insert("app1".into(), ic_app);
+        d.icons.insert("doc1".into(), ic_doc);
+        d.icons.insert("pic1".into(), ic_pic);
+        d.icons.insert("unk1".into(), ic_unknown);
+        d.free_icons = vec!["app1".into(), "doc1".into(), "pic1".into(), "unk1".into()];
+
+        let wa = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let report = d.auto_organize_all(None, wa, 1.0);
+
+        // 仅创建了需要的 3 个栅栏（常用应用、办公文档、图片媒体），不应创建压缩文件或文件目录
+        assert_eq!(report.created_fences, 3);
+        assert_eq!(report.moved_icons, 3);
+        assert_eq!(d.fences.len(), 3);
+
+        let titles: Vec<&str> = d
+            .fences
+            .iter()
+            .map(|f| f.title.as_deref().unwrap_or(""))
+            .collect();
+        assert!(titles.contains(&"常用应用"));
+        assert!(titles.contains(&"办公文档"));
+        assert!(titles.contains(&"图片媒体"));
+        assert!(!titles.contains(&"压缩文件"));
+        assert!(!titles.contains(&"文件目录"));
+
+        // 特殊未知文件留在原处
+        assert_eq!(d.icon_location(&"unk1".into()), Some(IconLocation::Free));
+
+        // 栅栏之间互不重叠
+        for i in 0..d.fences.len() {
+            for j in (i + 1)..d.fences.len() {
+                let r1 = &d.fences[i].bounds;
+                let r2 = &d.fences[j].bounds;
+                let overlap_x = (r1.right().min(r2.right()) - r1.x.max(r2.x)).max(0.0);
+                let overlap_y = (r1.bottom().min(r2.bottom()) - r1.y.max(r2.y)).max(0.0);
+                assert!(
+                    overlap_x == 0.0 || overlap_y == 0.0,
+                    "Fence {i} and {j} should not overlap"
+                );
+            }
+        }
+
+        // 再次整理应幂等
+        let report2 = d.auto_organize_all(None, wa, 1.0);
+        assert_eq!(report2.created_fences, 0);
+        assert_eq!(report2.moved_icons, 0);
+    }
+
+    #[test]
+    fn auto_organize_reuses_existing_fence() {
+        let mut d = desk();
+        let mut ic_doc = icon("doc1");
+        ic_doc.path = Some("C:\\Users\\Desktop\\spec.pdf".into());
+        let mut ic_zip = icon("zip1");
+        ic_zip.path = Some("C:\\Users\\Desktop\\backup.zip".into());
+
+        d.icons.insert("doc1".into(), ic_doc);
+        d.icons.insert("zip1".into(), ic_zip);
+        d.free_icons = vec!["doc1".into(), "zip1".into()];
+
+        // 已存在一个配置了文档规则的栅栏
+        let doc_fence_id = d.next_fence_id();
+        d.fences.push(Fence {
+            id: doc_fence_id,
+            title: Some("我的文档".into()),
+            monitor_id: 0,
+            bounds: Rect::new(50.0, 50.0, 300.0, 200.0),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: Some(FenceRule {
+                enabled: true,
+                preset: Some(CategoryPreset::Documents),
+                ..Default::default()
+            }),
+            collapsed: false,
+        });
+
+        let wa = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let report = d.auto_organize_all(None, wa, 1.0);
+
+        // 应该只新建 1 个压缩文件栅栏，并复用已有的文档栅栏
+        assert_eq!(report.created_fences, 1);
+        assert_eq!(report.moved_icons, 2);
+        assert_eq!(
+            d.icon_location(&"doc1".into()),
+            Some(IconLocation::Fence(doc_fence_id))
+        );
+        let zip_fence = d
+            .fences
+            .iter()
+            .find(|f| f.title.as_deref() == Some("压缩文件"))
+            .expect("应创建压缩文件栅栏");
+        assert_eq!(
+            d.icon_location(&"zip1".into()),
+            Some(IconLocation::Fence(zip_fence.id))
+        );
+    }
+
+    #[test]
+    fn rect_contains_and_inset() {
+        let r = Rect::new(10.0, 10.0, 100.0, 50.0);
+        assert!(r.contains(Vec2 { x: 10.0, y: 10.0 }));
+        assert!(!r.contains(Vec2 { x: 111.0, y: 10.0 }));
+        let inner = r.inset(5.0);
+        assert_eq!(inner, Rect::new(15.0, 15.0, 90.0, 40.0));
+    }
+
+    #[test]
+    fn fence_layout_cycles() {
+        assert_eq!(FenceLayout::Grid.next(), FenceLayout::List);
+        assert_eq!(FenceLayout::List.next(), FenceLayout::Sidebar);
+        assert_eq!(FenceLayout::Sidebar.next(), FenceLayout::Grid);
+    }
+
+    #[test]
+    fn winbosk_appearance_serde_backward_compatible() {
+        // 旧版 desk.json 的栅栏外观（无 style / border_width / layout）应能加载并取默认值
+        let old = r#"{"bg_color":[0.08,0.08,0.12,0.55],"corner_radius":12.0,"acrylic":true,"title_bar_height":32.0,"padding":12.0,"icon_size":48.0,"gap":10.0}"#;
+        let a: FenceAppearance = serde_json::from_str(old).expect("旧配置应可反序列化");
+        assert_eq!(a.bg_style, FenceStyle::Glass);
+        assert_eq!(a.border_width, 1.75);
+        assert_eq!(a.layout, FenceLayout::Grid);
+        assert_eq!(a.opacity, 0.55);
+        assert_eq!(a.tint, None);
+    }
+
+    #[test]
+    fn desk_console_fields_serde_backward_compatible() {
+        // 旧版 desk.json 无 todos / console_open / console_pos：应取默认（打开控制台）
+        let old = r#"{"version":1,"settings":{"show_free_area":true,"free_area_height":90.0,"hotkeys":{},"autostart":false},"fences":[],"free_icons":[],"icons":{}}"#;
+        let d: Desk = serde_json::from_str(old).expect("旧配置应可反序列化");
+        assert!(d.todos.is_empty());
+        assert_eq!(d.next_todo_id, 1);
+        assert!(d.console_open);
+        assert_eq!(d.console_pos, None);
+        assert_eq!(d.console_size, None);
+        // 旧配置无插件/桌面模式字段：默认注册表（待办启用）+ 栅栏模式
+        assert_eq!(d.plugins.len(), 2);
+        assert!(d.plugins.iter().any(|p| p.id == "todo" && p.enabled));
+        assert!(!d.console_advanced);
+        assert!(!d.desktop_mode);
+    }
+
+    #[test]
+    fn plugin_entry_roundtrip() {
+        let mut p = PluginEntry::builtin_notes();
+        p.enabled = true;
+        p.note_text = "买牛奶\n拿快递".into();
+        let json = serde_json::to_string(&p).unwrap();
+        let back: PluginEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "notes");
+        assert!(back.enabled);
+        assert_eq!(back.note_text, "买牛奶\n拿快递");
+    }
+
+    #[test]
+    fn plugin_kind_labels() {
+        assert_eq!(PluginKind::Todo.label(), "待办事项");
+        assert_eq!(PluginKind::Notes.label(), "便签");
+        assert_eq!(PluginKind::External.label(), "外部插件");
+    }
+
+    #[test]
+    fn todo_item_roundtrip() {
+        let t = TodoItem::new(7, "写周报".into(), "周五前提交".into());
+        let json = serde_json::to_string(&t).unwrap();
+        let back: TodoItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, 7);
+        assert_eq!(back.name, "写周报");
+        assert_eq!(back.detail, "周五前提交");
+        assert!(!back.done);
+    }
+
+    #[test]
+    fn todo_item_old_text_field_backward_compatible() {
+        // 旧配置只有 `text`（无 detail）：应映射到 name，detail 取默认空串
+        let old = r#"{"id":3,"text":"旧事项","done":true}"#;
+        let t: TodoItem = serde_json::from_str(old).expect("旧待办应可反序列化");
+        assert_eq!(t.name, "旧事项");
+        assert_eq!(t.detail, "");
+        assert!(t.done);
+    }
+
+    #[test]
+    fn fence_collapsed_serde_backward_compatible() {
+        // 旧版 JSON（不含 collapsed 字段）
+        let old_json = r#"{
+            "id": 1,
+            "title": "测试栅栏",
+            "monitor_id": 0,
+            "bounds": {"x": 10.0, "y": 20.0, "w": 300.0, "h": 200.0},
+            "state": "Expanded",
+            "icon_ids": [],
+            "appearance": {}
+        }"#;
+        let fence: Fence =
+            serde_json::from_str(old_json).expect("旧版未包含 collapsed 应可成功反序列化");
+        assert!(!fence.collapsed, "旧版缺少 collapsed 时应默认为 false");
+
+        // 新版 JSON（显式包含 collapsed: true）
+        let new_json = r#"{
+            "id": 2,
+            "title": "折叠栅栏",
+            "monitor_id": 0,
+            "bounds": {"x": 10.0, "y": 20.0, "w": 300.0, "h": 200.0},
+            "state": "Expanded",
+            "icon_ids": [],
+            "appearance": {},
+            "collapsed": true
+        }"#;
+        let fence2: Fence =
+            serde_json::from_str(new_json).expect("包含 collapsed: true 应可成功反序列化");
+        assert!(fence2.collapsed);
+    }
+
+    fn fence_with_h(h: f32, collapsed: bool) -> Fence {
+        Fence {
+            id: 1,
+            title: Some("t".into()),
+            monitor_id: 0,
+            bounds: Rect::new(10.0, 20.0, 300.0, h),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed,
+        }
+    }
+
+    #[test]
+    fn collision_rect_prefers_bounds_then_layout_height() {
+        // 固定高度（用户手动缩放过）：用 bounds.h
+        let fixed = fence_with_h(200.0, false);
+        assert_eq!(fixed.collision_height(999.0), 200.0);
+        // 自动高度（bounds.h <= 0）：用最近一次布局回写的真实高度
+        let auto = fence_with_h(0.0, false);
+        assert_eq!(auto.collision_height(180.0), 180.0);
+        assert_eq!(
+            auto.collision_rect(180.0),
+            Rect::new(10.0, 20.0, 300.0, 180.0)
+        );
+    }
+
+    #[test]
+    fn collision_rect_is_unaffected_by_collapse() {
+        // 收起只改视觉高度：碰撞口径必须保持原矩形，否则展开时会与邻居重叠
+        //（展开不做重新避让）。
+        let expanded = fence_with_h(200.0, false);
+        let collapsed = fence_with_h(200.0, true);
+        assert_eq!(
+            expanded.collision_rect(200.0),
+            collapsed.collision_rect(200.0)
+        );
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("*.txt", "hello.txt"));
+        assert!(glob_match("*.TXT", "HELLO.txt"));
+        assert!(glob_match("test_*", "test_abc"));
+        assert!(glob_match("test_?.*", "test_1.png"));
+        assert!(!glob_match("test_?.*", "test_12.png"));
+        assert!(glob_match("*draft*", "my_draft_v2.docx"));
+        // 纯文本按子串包含
+        assert!(glob_match("draft", "my_draft_v2.docx"));
+        assert!(!glob_match("meeting", "my_draft_v2.docx"));
+        // 边界
+        assert!(!glob_match("", "hello.txt"));
+        assert!(!glob_match("   ", "hello.txt"));
+        assert!(glob_match("*", "anything.xyz"));
+    }
+
+    #[test]
+    fn test_fence_rule_custom_extensions_and_exclusions() {
+        let rule = FenceRule {
+            enabled: true,
+            is_custom: false,
+            preset: Some(CategoryPreset::Media), // 内置媒体（如 png）
+            custom_extensions: vec!["custom".into(), "log".into()],
+            exclude_extensions: vec!["psd".into(), "raw".into()],
+            name_patterns: vec!["*important*".into()],
+            exclude_patterns: vec!["*.tmp".into(), "temp_*".into()],
+            auto_capture: true,
+        };
+
+        // 1. 正常命中的预设媒体
+        let mut icon_png = Icon::new("1".into(), "photo.png".into(), ItemKind::Doc);
+        icon_png.path = Some("C:\\photo.png".into());
+        assert!(rule.matches_icon(&icon_png));
+
+        // 2. 被排除的扩展名黑名单（即使属于媒体预设也被排除）
+        let mut icon_psd = Icon::new("2".into(), "design.psd".into(), ItemKind::Doc);
+        icon_psd.path = Some("C:\\design.psd".into());
+        assert!(!rule.matches_icon(&icon_psd));
+
+        // 3. 自定义白名单后缀
+        let mut icon_custom = Icon::new("3".into(), "data.custom".into(), ItemKind::Doc);
+        icon_custom.path = Some("C:\\data.custom".into());
+        assert!(rule.matches_icon(&icon_custom));
+
+        // 4. 文件名通配符白名单（即使不是媒体预设后缀也命中）
+        let mut icon_pattern = Icon::new("4".into(), "important_report.xyz".into(), ItemKind::Doc);
+        icon_pattern.path = Some("C:\\important_report.xyz".into());
+        assert!(rule.matches_icon(&icon_pattern));
+
+        // 5. 排除模式黑名单（命中 exclude_patterns 即使匹配了通配符也必须被拒绝）
+        let mut icon_tmp = Icon::new("5".into(), "important_backup.tmp".into(), ItemKind::Doc);
+        icon_tmp.path = Some("C:\\important_backup.tmp".into());
+        assert!(!rule.matches_icon(&icon_tmp));
+    }
+
+    // ---- 虚拟壳项（回收站等）不得被归类搬走（plan 10.1 Step 4） ----
+
+    /// 建一个「桌面」栅栏（无自身规则）+ 一个用户分类栅栏。
+    fn desk_with_desktop_fence() -> (Desk, u64, u64) {
+        let mut d = desk();
+        let desktop_fid = d.next_fence_id();
+        d.fences.push(Fence {
+            id: desktop_fid,
+            title: Some("桌面".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed: false,
+        });
+        (d, desktop_fid, 0)
+    }
+
+    /// 回收站图标元数据（虚拟壳项：无路径、kind=Unknown）。
+    fn recycle_bin() -> Icon {
+        let mut ic = Icon::new(
+            crate::shell_items::VIRTUAL_ID_PREFIX.to_string() + "回收站-645ff040",
+            "回收站".into(),
+            ItemKind::Unknown,
+        );
+        ic.path = None;
+        ic
+    }
+
+    #[test]
+    fn organize_by_rules_keeps_virtual_items_in_place() {
+        let (mut d, desktop_fid, _) = desk_with_desktop_fence();
+        let doc_fid = d.next_fence_id();
+        d.fences.push(Fence {
+            id: doc_fid,
+            title: Some("文档".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: Some(FenceRule {
+                enabled: true,
+                preset: Some(CategoryPreset::Documents),
+                ..Default::default()
+            }),
+            collapsed: false,
+        });
+
+        // 回收站是「桌面」栅栏成员（真实候选：自身规则缺失 ⇒ 全部成员进候选）
+        let bin_id = recycle_bin().id.clone();
+        d.icons.insert(bin_id.clone(), recycle_bin());
+        d.fences[0].icon_ids.push(bin_id.clone());
+        // 同时放一个真文件，证明整理本身仍工作
+        let mut ic_doc = icon("doc1");
+        ic_doc.path = Some("C:\\Users\\Desktop\\report.docx".into());
+        d.icons.insert("doc1".into(), ic_doc);
+        d.fences[0].icon_ids.push("doc1".into());
+
+        let moved = d.organize_icons_by_rules(Some(desktop_fid));
+        assert_eq!(moved, vec![("doc1".to_string(), doc_fid)]);
+        assert_eq!(
+            d.icon_location(&bin_id),
+            Some(IconLocation::Fence(desktop_fid)),
+            "回收站必须留在桌面栅栏"
+        );
+    }
+
+    /// 硬回归：用户栅栏 `name_patterns=["回收站"]` 直接命中显示名（规则匹配不看 kind）。
+    #[test]
+    fn name_pattern_cannot_capture_virtual_item() {
+        let (mut d, desktop_fid, _) = desk_with_desktop_fence();
+        let bin_fid = d.next_fence_id();
+        d.fences.push(Fence {
+            id: bin_fid,
+            title: Some("系统项".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: Some(FenceRule {
+                enabled: true,
+                preset: None,
+                name_patterns: vec!["回收站".into()],
+                ..Default::default()
+            }),
+            collapsed: false,
+        });
+
+        let bin = recycle_bin();
+        let bin_id = bin.id.clone();
+        d.icons.insert(bin_id.clone(), bin.clone());
+        // 规则**确实**能匹配上（否则这条测试是空转）
+        assert!(d.fences[1].rule.as_ref().unwrap().matches_icon(&bin));
+        d.fences[0].icon_ids.push(bin_id.clone());
+
+        let moved = d.organize_icons_by_rules(Some(desktop_fid));
+        assert!(moved.is_empty(), "虚拟壳项不得被 name_patterns 命中搬走");
+        assert_eq!(
+            d.icon_location(&bin_id),
+            Some(IconLocation::Fence(desktop_fid))
+        );
+    }
+
+    #[test]
+    fn auto_organize_keeps_virtual_items_in_place() {
+        let (mut d, desktop_fid, _) = desk_with_desktop_fence();
+        let bin = recycle_bin();
+        let bin_id = bin.id.clone();
+        d.icons.insert(bin_id.clone(), bin);
+        d.fences[0].icon_ids.push(bin_id.clone());
+        // 一个可被预设分类的文件，证明整理仍在跑
+        let mut ic_pic = icon("pic1");
+        ic_pic.path = Some("C:\\Users\\Desktop\\wallpaper.jpg".into());
+        d.icons.insert("pic1".into(), ic_pic);
+        d.fences[0].icon_ids.push("pic1".into());
+
+        let wa = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let report = d.auto_organize_all(Some(desktop_fid), wa, 1.0);
+        assert_eq!(report.moved_icons, 1, "只搬真文件，回收站不动");
+        assert_eq!(d.icon_location(&"pic1".into()).unwrap().fence_id(), {
+            let f = d.fences.iter().find(|f| f.id != desktop_fid).unwrap();
+            Some(f.id)
+        });
+        assert_eq!(
+            d.icon_location(&bin_id),
+            Some(IconLocation::Fence(desktop_fid)),
+            "自动整理也不得把回收站搬走"
+        );
+    }
+
+    /// `free_icons` 里的虚拟壳项同样不得被搬（未分组区也是候选来源）。
+    #[test]
+    fn free_virtual_item_is_not_a_candidate() {
+        let (mut d, _, _) = desk_with_desktop_fence();
+        let pic_fid = d.next_fence_id();
+        d.fences.push(Fence {
+            id: pic_fid,
+            title: Some("图片媒体".into()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: Some(FenceRule {
+                enabled: true,
+                preset: Some(CategoryPreset::Media),
+                ..Default::default()
+            }),
+            collapsed: false,
+        });
+        let bin = recycle_bin();
+        let bin_id = bin.id.clone();
+        d.icons.insert(bin_id.clone(), bin);
+        d.free_icons.push(bin_id.clone());
+
+        let moved = d.organize_icons_by_rules(None);
+        assert!(moved.is_empty());
+        assert_eq!(d.icon_location(&bin_id), Some(IconLocation::Free));
+        let report = d.auto_organize_all(None, Rect::new(0.0, 0.0, 1920.0, 1080.0), 1.0);
+        assert_eq!(report.moved_icons, 0);
+        assert_eq!(d.fences.len(), 2, "回收站不得触发新建分类栅栏");
+    }
+
+    #[test]
+    fn fence_rule_preset_vs_custom_and_inheritance() {
+        let mut rule = FenceRule::default();
+        rule.preset = Some(CategoryPreset::Apps);
+        assert!(!rule.is_custom_mode());
+        assert!(rule.is_effective());
+
+        let exe_icon = Icon {
+            id: "app1".into(),
+            display_name: "test.exe".into(),
+            kind: ItemKind::App,
+            path: Some("C:\\test.exe".into()),
+            type_label: String::new(),
+            modified_secs: None,
+            size_bytes: None,
+            added: false,
+        };
+        let txt_icon = Icon {
+            id: "doc1".into(),
+            display_name: "test.txt".into(),
+            kind: ItemKind::Doc,
+            path: Some("C:\\test.txt".into()),
+            type_label: String::new(),
+            modified_secs: None,
+            size_bytes: None,
+            added: false,
+        };
+
+        // 预设模式下：exe 匹配，txt 不匹配
+        assert!(rule.matches_icon(&exe_icon));
+        assert!(!rule.matches_icon(&txt_icon));
+
+        // 继承应用预设到自定义模式
+        rule.inherit_from_preset(Some(CategoryPreset::Apps));
+        assert!(rule.is_custom_mode());
+        assert!(rule.is_effective());
+        assert!(rule.custom_extensions.contains(&"exe".to_string()));
+        assert!(rule.custom_extensions.contains(&"bat".to_string()));
+        assert!(rule.matches_icon(&exe_icon));
+        assert!(!rule.matches_icon(&txt_icon));
+
+        // 自定义模式下添加 txt 并删除 exe
+        rule.custom_extensions.retain(|e| e != "exe");
+        rule.custom_extensions.push("txt".to_string());
+        assert!(!rule.matches_icon(&exe_icon));
+        assert!(rule.matches_icon(&txt_icon));
+    }
+}

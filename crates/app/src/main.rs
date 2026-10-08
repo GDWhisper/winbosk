@@ -1,0 +1,3368 @@
+//! WinBosk —— 桌面栅栏整理器入口。
+//!
+// 发布版不弹终端窗口（双击直接运行，关掉启动它的 cmd 不影响本进程）；
+// 调试版保留控制台便于看日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//!
+//! 启动流程：
+//! 1. 进程 DPI 感知 + COM 初始化 + 日志；
+//! 2. 壳层接管：探测层级，隐藏真实图标（只隐藏 `SysListView32`，不碰其他窗口树，WE 共存）；
+//! 3. GPU 上下文 + overlay 窗口 + 合成器；
+//! 4. 枚举真实桌面图标，提取全部图标位图；首次运行创建演示栅栏布局；
+//! 5. 按主题网格排布多栅栏并呈现；设置命中模型（`SetWindowRgn` 把窗口区域裁剪为
+//!    栅栏并集，区域外点击穿透到桌面——修复全屏死区）；
+//! 6. 进入消息循环：标题栏拖动栅栏、右下角缩放（高度自适应内容）、双击图标打开，
+//!    变更实时重绘并持久化；Ctrl+C / Ctrl+Shift+F10 恢复真实图标并干净退出。
+
+mod anim;
+mod context_menu;
+mod editing;
+mod file_ops;
+mod hotkeys;
+mod logging;
+mod memory;
+mod scene;
+mod shell_menu;
+mod watchdog;
+
+/// 控制中心当前页面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsolePage {
+    #[default]
+    Fences,
+    Settings,
+}
+
+pub(crate) use std::cell::RefCell;
+pub(crate) use std::collections::HashMap;
+pub(crate) use std::path::{Path, PathBuf};
+pub(crate) use std::rc::Rc;
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+pub(crate) use std::sync::OnceLock;
+pub(crate) use std::time::Instant;
+
+pub(crate) use windows::core::{BOOL, PCWSTR, PWSTR};
+pub(crate) use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HGLOBAL, HWND, LPARAM, POINT, RECT,
+    WAIT_OBJECT_0, WPARAM,
+};
+pub(crate) use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+pub(crate) use windows::Win32::System::Console::SetConsoleCtrlHandler;
+pub(crate) use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+};
+pub(crate) use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
+pub(crate) use windows::Win32::System::Ole::OleInitialize;
+pub(crate) use windows::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, GetCurrentProcess, SetEvent, TerminateProcess, WaitForSingleObject,
+    INFINITE,
+};
+pub(crate) use windows::Win32::UI::Controls::{
+    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDCBF_CANCEL_BUTTON,
+    TDF_USE_COMMAND_LINKS,
+};
+pub(crate) use windows::Win32::UI::HiDpi::{
+    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+pub(crate) use windows::Win32::UI::Input::Ime::{
+    ImmGetContext, ImmReleaseContext, ImmSetCompositionWindow, CFS_POINT, COMPOSITIONFORM,
+};
+pub(crate) use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LBUTTON, VK_LEFT,
+    VK_RETURN, VK_RIGHT, VK_UP,
+};
+pub(crate) use windows::Win32::UI::Shell::{
+    DragQueryFileW, FileOpenDialog, IFileOpenDialog, IShellItem, FOS_FORCEFILESYSTEM,
+    FOS_PICKFOLDERS, HDROP, SIGDN_FILESYSPATH,
+};
+pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
+    MessageBoxW, PostMessageW, SetForegroundWindow, SetProcessDPIAware, ShowWindowAsync,
+    SystemParametersInfoW, TrackPopupMenu, HMENU, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_OK,
+    MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_SEPARATOR, MF_STRING, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY, TPM_RETURNCMD, WM_NULL,
+};
+
+pub(crate) use winbosk_core::config::ConfigStore;
+pub(crate) use winbosk_core::magnet::{
+    settle_move, settle_resize_with_push, FreeSides, ResizePushConfig, FENCE_GAP,
+};
+pub(crate) use winbosk_core::model::{
+    Desk, Fence, FenceAppearance, FenceLayout, FenceState, FenceStyle, Icon, Rect, SidebarPosition,
+    Vec2,
+};
+pub(crate) use winbosk_render::{
+    run_message_loop, Compositor, ConsoleHit, ConsoleZone, FenceHit, HitModel, IconHit,
+    ListColumns, OverlayEvent, OverlayWindow, RectF, RenderDevice, ResizeZone, Scene, SceneConsole,
+    SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow, SceneIcon, SceneRuleEditor, Theme,
+    GRID_CAPTION_H_MULT, GRIP_SIZE, WM_APP_QUIT, WM_WINBOSK_INJECT,
+};
+pub(crate) use winbosk_shell::icons::IconData;
+pub(crate) use winbosk_shell::items::DesktopItem;
+pub(crate) use winbosk_shell::takeover::DesktopHierarchy;
+pub(crate) use winbosk_shell::virtual_items::VirtualItemSnapshot;
+
+use crate::anim::*;
+use crate::context_menu::*;
+use crate::editing::*;
+use crate::file_ops::*;
+use crate::scene::*;
+
+/// 栅栏最小宽度（缩放下限，物理像素）。
+pub(crate) const MIN_FENCE_W: f32 = 200.0;
+
+/// 栅栏最小高度（缩放下限，物理像素）。
+pub(crate) const MIN_FENCE_H: f32 = 60.0;
+
+/// 图标提取边长（物理像素）。取高于常用渲染尺寸的值（高 DPI 下标准 72px、大图标 96px、Dock 悬停 108px），
+/// 保证 GPU 始终向下采样，避免小图插值放大发糊。
+pub(crate) const ICON_EXTRACT_SIZE: u32 = 128;
+
+// 右键菜单项 ID（分段避免冲突）。
+
+/// 栅栏边框宽度（DIP）：中粗，按用户要求固定（× scale 变物理像素）。
+pub(crate) const MEDIUM_BORDER_WIDTH: f32 = 2.0;
+
+// ---- 控制中心（桌面组件 + 栅栏管理）布局常量（DIP，× scale 变物理像素）----
+/// 控制台面板默认宽度（用户拖边缘缩放后由 `desk.console_size` 覆盖）。
+///
+/// 368 = 320 + 48：控制中心字号整体加大两号（label 12→16）后，「更改文件位置…」
+/// 「恢复默认」两个动作按钮随之变宽，若维持 320 则默认宽下放不下后果提示，
+/// 违反 plan 09「默认宽度下提示常显」的契约（两种模式分别缺口 18 / 32px）。
+/// 宽 48 后提示预算余量 30 / 16px（复算见 plan 09 §9.2）；最小宽 `CONSOLE_MIN_W`
+/// 不变，窄面板仍按契约降级。
+pub(crate) const CONSOLE_W: f32 = 368.0;
+/// 高级模式下的双栏工作台宽度（DIP）。
+pub(crate) const CONSOLE_ADVANCED_W: f32 = 736.0;
+/// 控制台面板最小宽/高（缩放钳制，避免缩到无法交互）。
+pub(crate) const CONSOLE_MIN_W: f32 = 260.0;
+pub(crate) const CONSOLE_MIN_H: f32 = 170.0;
+/// 控制台与屏幕右/上边距（未拖动时的默认摆放位置）。
+pub(crate) const CONSOLE_MARGIN: f32 = 24.0;
+/// 标题栏高度（拖动把手；关闭按钮位于其中）。
+pub(crate) const CONSOLE_TITLE_H: f32 = 40.0;
+/// 待办列表距面板左右的内边距。
+pub(crate) const CONSOLE_PAD: f32 = 12.0;
+/// 组件页：添加按钮高度。
+pub(crate) const CONSOLE_ADD_BTN_H: f32 = 34.0;
+/// 栅栏管理页：每行高度。
+pub(crate) const CONSOLE_FENCE_ROW_H: f32 = 36.0;
+/// 栅栏管理页：最多同时显示的行数（超出滚动）。
+pub(crate) const CONSOLE_FENCE_MAX_ROWS: usize = 5;
+/// 栅栏管理页：选中栅栏详情区高度。
+///
+/// 必须 ≥ `detail_visible_rows` 的最大值（`24 + 8 × 30 = 264`：布局/大小/风格/色调各 1 行、
+/// 文件位置 2 行、侧边栏位置 1 行、分类规则 1 行），否则详情底板会短于内容。
+pub(crate) const CONSOLE_FENCE_DETAIL_H: f32 = 278.0;
+/// 控制台展开面板最大高度（DIP；内容再多也滚动）。
+pub(crate) const CONSOLE_MAX_H: f32 = 720.0;
+/// 控制台展开补间时长（秒）：`PanelEase::BackOutSoft`，末端轻微过冲回弹。
+pub(crate) const CONSOLE_TWEEN_OPEN_S: f32 = 0.24;
+/// 控制台收起补间时长（秒）：`PanelEase::CubicOut`，单调收敛（收起禁止过冲）。
+pub(crate) const CONSOLE_TWEEN_CLOSE_S: f32 = 0.20;
+/// 淡入/淡出占用的展开进度区间：进度到达该值即完全不透明（见 `console_fade`）。
+///
+/// 与高度解耦，避免「展开进度 40% 时既只有 40% 高、又只有 40% 不透明」的双重衰减。
+pub(crate) const CONSOLE_FADE_SPAN: f32 = 0.40;
+/// 展开回弹的几何钳制上限：进度可 >1（过冲），高度按此上限截断，防止瞬时过高。
+pub(crate) const CONSOLE_OVERSHOOT_MAX: f32 = 1.08;
+
+/// 背景色调预设（标签, RGB 0..1）：菜单项顺序即此处顺序（+1 起）。
+pub(crate) const TINT_PRESETS: &[(&str, [f32; 3])] = &[
+    ("蓝", [0.32, 0.55, 0.95]),
+    ("青", [0.30, 0.80, 0.85]),
+    ("绿", [0.40, 0.75, 0.45]),
+    ("黄", [0.95, 0.85, 0.40]),
+    ("橙", [0.98, 0.62, 0.30]),
+    ("红", [0.92, 0.35, 0.35]),
+    ("紫", [0.66, 0.45, 0.90]),
+    ("白", [0.92, 0.93, 0.96]),
+    ("灰", [0.56, 0.58, 0.62]),
+];
+
+/// RAII：隐藏的真实图标在退出（含错误路径）时无条件恢复。
+/// 反冲突约束的兜底——任何退出路径都不能让桌面图标永久消失。
+struct IconGuard {
+    hierarchy: DesktopHierarchy,
+}
+
+impl IconGuard {
+    fn new(hierarchy: DesktopHierarchy) -> Self {
+        hierarchy.hide_icons();
+        Self { hierarchy }
+    }
+}
+
+impl Drop for IconGuard {
+    fn drop(&mut self) {
+        // 异步投递：退出路径绝不等待 explorer 处理（同步版在 explorer 繁忙时会把
+        // 本进程的退出钉死）；投递后即使本进程立即结束，explorer 仍会处理该请求。
+        self.hierarchy.restore_icons_async();
+    }
+}
+
+/// 收尾阶段名（唯一写入者是 [`ExitPhase`]，单写多读）：供收尾兜底线程与看门狗
+/// 读到「卡在哪一步」。空串 = 收尾尚未开始或从未进入收尾。
+static EXIT_PHASE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
+
+/// 记录当前收尾阶段（中毒时取回守卫继续写——收尾路径绝不 panic，阶段名是纯诊断量）。
+fn note_phase(name: &'static str) {
+    *EXIT_PHASE.lock().unwrap_or_else(|e| e.into_inner()) = name;
+}
+
+/// 当前收尾阶段名（仅作看门狗停摆日志的诊断字段，不参与任何判定口径）。
+pub(crate) fn current_phase() -> &'static str {
+    *EXIT_PHASE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 收尾阶段计时：`begin` 记名 + 落「进入」，作用域结束（Drop）落「离开 + 耗时」。
+/// 滞留时「最后一条进入/离开」即定位点。
+struct ExitPhase(&'static str, std::time::Instant);
+
+impl ExitPhase {
+    fn begin(name: &'static str) -> Self {
+        note_phase(name);
+        tracing::info!("退出收尾：进入 {name}");
+        Self(name, std::time::Instant::now())
+    }
+}
+
+impl Drop for ExitPhase {
+    fn drop(&mut self) {
+        let ms = self.1.elapsed().as_millis() as u64;
+        tracing::info!(ms, "退出收尾：离开 {}", self.0);
+    }
+}
+
+/// 收尾兜底信号（手动复位事件；收尾路径置位后才开始倒计时）。
+/// 0 = 尚未就绪（事件创建失败），此时兜底不可用。
+static EXIT_SIGNAL: AtomicU64 = AtomicU64::new(0);
+
+/// 待恢复的真实桌面图标列表句柄（原始值；0 = 无/未登记）。
+/// 与 `EXIT_SIGNAL` 成对：先 Release 存句柄，再置位事件；读侧 Acquire。
+static EXIT_LISTVIEW: AtomicU64 = AtomicU64::new(0);
+
+/// 图标恢复是否已投递（去重，见 [`post_icon_restore`]）。
+static EXIT_RESTORE_POSTED: AtomicBool = AtomicBool::new(false);
+
+/// 收尾限时兜底：T1 落 warn（点名最后进入的阶段）并兜底投递图标恢复，
+/// T2 强制结束进程——「僵尸进程占单实例互斥 → 双击重启无反应」由此根除。
+const EXIT_WARN_MS: u64 = 2_000;
+const EXIT_FORCE_MS: u64 = 5_000;
+
+/// 启动期创建收尾兜底：一个手动复位事件 + 两个一次性线程（info / kill），各自
+/// 阻塞等待事件，运行期全程 blocked、零周期唤醒。
+///
+/// **为什么必须启动期创建，而不是收尾时才 spawn**（2026-09-28 转储实测）：
+/// 退出收尾会偶发加载器锁死锁（现场数十个线程卡在 `LdrShutdownThread`），
+/// **此刻新建的线程会卡死在 `LdrInitializeThunk` 永不启动**——收尾时才创建的
+/// 兜底线程形同虚设（现场 `winbosk-exit-deadline` 正卡在这一步：T1/T2 全失效，
+/// 进程僵尸占互斥、桌面图标留在隐藏态）。启动期创建的线程只等待内核事件，
+/// 死锁期间「被唤醒 + 继续执行」都不依赖加载器锁。
+fn prepare_exit_deadline() {
+    // 手动复位事件：置位后保持信号态——语义 =「收尾已开始」，两条线程都等它。
+    let Ok(event) = (unsafe { CreateEventW(None, true, false, PCWSTR::null()) }) else {
+        tracing::warn!("退出兜底事件创建失败：收尾滞留将无强制结束");
+        return;
+    };
+    // `HANDLE` 内部是裸指针、非 `Send`：跨线程只传原始数值，在闭包内重建。
+    let raw = event.0 as u64;
+    EXIT_SIGNAL.store(raw, Ordering::Relaxed);
+    let info = std::thread::Builder::new()
+        .name("winbosk-exit-info".into())
+        .spawn(move || {
+            if !wait_exit_signal(raw) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(EXIT_WARN_MS));
+            // 投递图标恢复先于日志：warn 的格式化分配/写盘可能被堆锁卡住，而投递
+            // 几乎无依赖（幂等；kill 线程强杀前还会再投一次）。
+            post_icon_restore();
+            let phase = current_phase();
+            tracing::warn!(
+                phase,
+                "退出收尾超时：≥{}s 未完成，疑似卡在「{}」（已兜底投递图标恢复；{}s 后强制结束进程）",
+                EXIT_WARN_MS / 1000,
+                if phase.is_empty() { "具名阶段之外（前段或尾部）" } else { phase },
+                (EXIT_FORCE_MS - EXIT_WARN_MS) / 1000
+            );
+        });
+    if info.is_err() {
+        tracing::warn!("退出兜底 info 线程创建失败：收尾滞留将缺 warn 与图标兜底");
+    }
+    let kill = std::thread::Builder::new()
+        .name("winbosk-exit-kill".into())
+        .spawn(move || {
+            if !wait_exit_signal(raw) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(EXIT_FORCE_MS));
+            // 强杀前再投一次图标恢复：info 线程若被卡在其日志步，用户可见的兜底
+            // 仍然成立（幂等）。
+            post_icon_restore();
+            // 必须 `TerminateProcess`，不许 `ExitProcess`：后者要拿**加载器锁**去跑各
+            // DLL 的 `DLL_PROCESS_DETACH`，卡点若恰是注入 DLL（本机有 RTSSHooks64.dll）
+            // 的 detach 会同样死锁；`TerminateProcess` 是内核级终止，不需要加载器锁。
+            // 本线程路径零分配、零加锁：加载器锁/堆锁死锁时它照样能执行。
+            let _ = unsafe { TerminateProcess(GetCurrentProcess(), 0) };
+        });
+    if kill.is_err() {
+        tracing::warn!("退出兜底 kill 线程创建失败：收尾滞留将无强制结束");
+    }
+}
+
+/// 等收尾信号（手动复位事件；阻塞至收尾路径置位）。
+///
+/// 返回 `false`（等待失败，句柄异常等）时调用方必须直接退出线程：**绝不能在未收到
+/// 收尾信号的情况下继续倒计时**——那会在正常运行期到点强杀进程（与看门狗「不能带着
+/// 坏句柄空转」同一处置）。
+fn wait_exit_signal(raw: u64) -> bool {
+    let rc = unsafe { WaitForSingleObject(HANDLE(raw as *mut core::ffi::c_void), INFINITE) };
+    rc == WAIT_OBJECT_0
+}
+
+/// 登记待恢复的真实桌面图标句柄（启动期一次；兜底线程只在置位事件后才读它，
+/// 提前登记无副作用）。
+fn set_exit_listview(list_view: Option<HWND>) {
+    if let Some(h) = list_view {
+        EXIT_LISTVIEW.store(h.0 as usize as u64, Ordering::Release);
+    }
+}
+
+/// 置位收尾信号——两条兜底线程自此刻起倒计时。手动复位事件保持信号态，可重复调用。
+/// 只在进程已决定退出时调用：正常路径 = `run_message_loop()` 返回后的**第一句**
+/// （其后每一步——IME 解除关联、内存快照、日志、overlay Drop 的 GPU 释放——都可能在
+/// 加载器锁/堆锁死锁下卡住，早一步置位就多一分覆盖）；启动失败的 Err 路径由
+/// [`ExitArmGuard`] 的 Drop 兜底。
+fn arm_exit_deadline() {
+    let raw = EXIT_SIGNAL.load(Ordering::Relaxed);
+    if raw != 0 {
+        let _ = unsafe { SetEvent(HANDLE(raw as *mut core::ffi::c_void)) };
+    }
+}
+
+/// 启动失败/提前返回的收尾哨兵：Drop 即置位兜底事件。
+///
+/// 声明在 `overlay` **之后** ⇒ 逆序析构时先于 overlay/device 释放——启动期任何 `?`
+/// 失败都会在 GPU/COM 释放**之前**武装 T1/T2，把「启动失败 → 收尾滞留」也纳入覆盖
+/// （正常路径由显式 `arm_exit_deadline()` 更早覆盖；此处重复置位无副作用）。
+struct ExitArmGuard;
+
+impl Drop for ExitArmGuard {
+    fn drop(&mut self) {
+        arm_exit_deadline();
+    }
+}
+
+/// 兜底投递图标恢复（幂等，且**先 claim 再投递**）。
+///
+/// claim 去重让 kill 线程保持零依赖：info 线程若卡在投递调用自身（win32k/加载器锁），
+/// kill 线程只做一次原子交换便跳过投递、直奔 `TerminateProcess`——T2 的硬保证不被拖累。
+fn post_icon_restore() {
+    if EXIT_RESTORE_POSTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let raw = EXIT_LISTVIEW.load(Ordering::Acquire) as usize;
+    if raw != 0 {
+        let lv = HWND(raw as *mut core::ffi::c_void);
+        if !lv.is_invalid() {
+            let _ = unsafe { ShowWindowAsync(lv, SW_SHOW) };
+        }
+    }
+}
+
+/// Ctrl+C 通知主循环退出的 overlay 窗口句柄（仅信号，不做窗口访问）。
+static OVERLAY_HWND: OnceLock<usize> = OnceLock::new();
+
+/// 拖动栅栏期间的「占位框」提示状态（瞬态，不持久化）。
+///
+/// 收起只改变视觉高度，碰撞/夹屏仍按展开时的原矩形计算——占位框把这一不可见约束
+/// 画出来。`requested` 存的是**未经 settle 的请求矩形**：用它判定"哪些收起栅栏
+/// 拒绝了这次位置"，才能准确回答"是谁挡住了我"。
+pub(crate) struct DragHint {
+    /// 被拖动的栅栏下标（`desk.fences`）。
+    pub(crate) fence: usize,
+    /// 本帧请求的矩形（鼠标原始目标，settle 之前）。
+    pub(crate) requested: Rect,
+}
+
+/// 图标拖动期间的状态（瞬态，不持久化）。
+///
+/// 渲染层只负责上报「光标在哪、落点是谁」，**拖走的整个过程不动模型**：成员归属
+/// 只在松手时改一次（`apply_icon_drop`）。若拖动中每帧改 `icon_ids`，落点下标与
+/// 成员列表会互相漂移（同一下标在相邻两帧指向不同图标），松手时必然错位。
+#[derive(Debug, Clone)]
+pub(crate) struct IconDragState {
+    /// 被拖图标所在的源栅栏下标（按下时确定，拖动期间不变）。
+    pub(crate) from_fence: usize,
+    /// 被拖图标的 **item id**——按下时由下标解析一次，之后整个拖动只认它。
+    ///
+    /// **不能用下标当身份**：拖动可能持续数秒，期间后台 4s 库同步
+    /// （`reconcile_fences`）会增删成员，下标随时可能指向另一个图标，
+    /// 松手时就会把无辜的图标搬走。id 是稳定身份，`apply_icon_drop` 靠它反查当前位置。
+    pub(crate) id: String,
+    /// 本帧落点栅栏；None = 光标不在任何栅栏内 → 松手回弹。
+    pub(crate) to_fence: Option<usize>,
+    /// 本帧落点栅栏内的插入下标（基准 = 排除被拖项后的成员列表）。
+    pub(crate) to_index: usize,
+    /// 本帧光标位置（虚拟屏幕物理像素，幽灵以它为中心）。
+    pub(crate) cursor: (f32, f32),
+}
+
+/// 调整栅栏尺寸期间的状态（瞬态，不持久化）。
+///
+/// 记录拖拽开始时各栅栏的初始状态，确保在单次拖拽中来回拉伸平滑可逆且不发生漂移。
+pub(crate) struct ResizeSession {
+    pub(crate) fence: usize,
+    /// 拖拽开始时各栅栏用于碰撞计算的矩形（真实高度入算）
+    pub(crate) initial_collision_rects: Vec<Rect>,
+    /// 拖拽开始时各栅栏的模型 bounds
+    pub(crate) initial_bounds: Vec<Rect>,
+}
+
+/// App 运行时：领域模型 + 渲染 + 持久化的组合根。
+///
+/// 由 `OverlayEvent` 回调持有（`Rc<RefCell>`），事件在主线程 wnd_proc 中同步处理，
+/// 无跨线程竞争。
+pub(crate) struct Runtime {
+    pub(crate) desk: Desk,
+    pub(crate) items: Vec<DesktopItem>,
+    /// item id → items 下标（双击打开时反查）。
+    pub(crate) item_index: HashMap<String, usize>,
+    /// item id → 已上传的位图 id。
+    pub(crate) bitmap_ids: HashMap<String, u64>,
+    pub(crate) compositor: Compositor,
+    pub(crate) theme: Theme,
+    pub(crate) vw: f32,
+    pub(crate) vh: f32,
+    /// overlay 窗口在屏幕上的位置 = 虚拟屏原点（客户端 (0,0) = 虚拟 (0,0)）。
+    /// 多屏时副屏在左/上可为负；主显示器工作区（`SPI_GETWORKAREA` 为屏幕坐标）
+    /// 转虚拟坐标需减去它。显示拓扑变化时随 `DisplayChange` 更新。
+    pub(crate) origin: (f32, f32),
+    pub(crate) store: ConfigStore,
+    /// 当前悬停的图标（栅栏下标, 图标下标）；None = 无悬停。
+    pub(crate) hover: Option<(usize, usize)>,
+    /// 最近一次光标位置（虚拟屏幕物理坐标）；侧边栏 Dock 放大据此连续计算。
+    pub(crate) cursor: Option<(f32, f32)>,
+    /// 当前选中的图标集合（框选 / Ctrl 单击多选，如资源管理器）。空 = 无选中。
+    pub(crate) selected: Vec<(usize, usize)>,
+    /// 框选橡皮筋矩形（所属栅栏下标 + 物理像素矩形）；None = 未在框选。
+    pub(crate) select_band: Option<(usize, RectF)>,
+    /// overlay 窗口句柄（右键菜单 owner / 就地编辑框父窗口）。
+    pub(crate) hwnd: HWND,
+    /// 当前激活的 D2D 内联文本编辑（None = 无编辑；键盘/IME 事件直达）。
+    pub(crate) edit: Option<InlineEdit>,
+    /// 上次 WM_CHAR 的高位代理（emoji 等增补平面字符由两个 WM_CHAR 组成）。
+    pub(crate) edit_high: Option<u16>,
+    /// 控制台面板动画状态（`AnimTick` 推进；idle 时停止定时器保持 0% CPU）。
+    pub(crate) console_anim: ConsoleAnim,
+    /// 桌面切换时栅栏整体淡出/淡入补间（None = 无动画，按 `desk.desktop_mode` 取最终值）。
+    pub(crate) desktop_fade: Option<PanelTween>,
+    /// 栅栏管理页当前选中的栅栏下标。
+    pub(crate) selected_fence: usize,
+    /// 当前悬停的控制台控件（绘制高亮反馈用）。
+    pub(crate) console_hover: Option<ConsoleZone>,
+    /// 栅栏管理页列表滚动偏移（物理像素）。
+    pub(crate) fence_scroll: f32,
+    /// 各栅栏最近一次实际渲染高度（物理像素，`build_scene` 每帧回写）。
+    /// 自动高度栅栏 `bounds.h == 0`，碰撞检测/夹屏需要真实高度入算；下标与 `fences` 对齐。
+    pub(crate) last_layout_h: Vec<f32>,
+    /// 栅栏拖动/缩放补间（多个栅栏可同时动；结束自动移除）。
+    pub(crate) fence_tweens: Vec<FenceTween>,
+    /// 图标悬停放大补间（一次只有一个悬停图标）。
+    pub(crate) icon_hover: Option<IconHoverAnim>,
+    /// 桌面层级（保留句柄副本；「切换桌面」时反复隐藏/恢复真实图标）。
+    pub(crate) hierarchy: DesktopHierarchy,
+    /// overlay 窗口原始指针（动画定时器的启停需要访问它；与进程存活期一致）。
+    pub(crate) overlay_ptr: *mut OverlayWindow,
+    /// 内部库文件夹（软件目录下）：粘贴/拖入的文件先物理复制进来，栅栏索引库内副本。
+    pub(crate) library: PathBuf,
+    /// 真实桌面目录（启动时解析一次）。控制中心每帧都要用它判定「桌面镜像栅栏不可
+    /// 恢复默认」，不能每帧走一次 COM `SHGetKnownFolderPath`。
+    pub(crate) desktop_dir: Option<String>,
+    /// 本次事件中新添加图标的位图（`handle_event` 末尾随场景一起上传）。
+    pub(crate) pending_uploads: Vec<(u64, IconData)>,
+    /// 最近一次用户交互时间（空闲时修剪工作集用；后台 `SyncLibrary` 不计）。
+    pub(crate) last_activity: std::time::Instant,
+    /// 最近一次工作集修剪时间（限频：空闲时最多每 60s 一次）。
+    pub(crate) last_trim: std::time::Instant,
+    /// 图标拖动状态（None = 没有正在进行的图标拖动）。**由白名单式清理维护**，
+    /// 与 `drag_hint` 同一条纪律：只有 `IconDragMove` 置位，任何非拖动事件或左键弹起
+    /// 都会清空——幽灵矩形会并入窗口区域，滞留就等于那块区域永远吞掉桌面点击。
+    pub(crate) icon_drag: Option<IconDragState>,
+    /// 拖动栅栏期间的占位框提示（None = 当前没有拖动）。**由白名单式清理维护**：
+    /// 只有 `FenceMove` 置位，任何非拖动事件都会清空——拖动异常终止（capture 被
+    /// 系统抢占、模态弹窗打断）时，占位框必须立刻消失，否则它会因并入窗口区域
+    /// 而持续吞掉那块区域的桌面点击。
+    pub(crate) drag_hint: Option<DragHint>,
+    /// 栅栏调整尺寸拖拽会话（拖拽中保持基准，拖拽结束清空）。
+    pub(crate) resize_session: Option<ResizeSession>,
+    /// 栅栏平滑滚动阻尼补间。
+    pub(crate) scroll_tweens: Vec<ScrollTween>,
+    /// 控制中心当前页面（栅栏管理 / 全局设置）。
+    pub(crate) console_page: ConsolePage,
+    /// 当前正在录制快捷键的动作（None = 未处于录制状态）。
+    pub(crate) recording_hotkey: Option<winbosk_core::hotkey::HotkeyAction>,
+    /// 热键冲突提示表（动作 → 冲突/占用原因描述）。
+    pub(crate) hotkey_conflicts: HashMap<winbosk_core::hotkey::HotkeyAction, String>,
+    /// 「栅栏前置」开关的会话状态（全局热键切换）。
+    ///
+    /// **只存在于本会话、不持久化**：与 `desk.console_open` 不同，它是「临时把表面提到
+    /// 普通窗口之上看一眼」的会话位，重启后一律回到桌面带（与控制的提权不持久化同理）。
+    /// 是否为真的唯一出口是 `set_fences_front`，Z 序推送统一走 `sync_front_band`。
+    pub(crate) fences_front: bool,
+}
+
+impl Runtime {
+    pub(crate) fn overlay(&self) -> &OverlayWindow {
+        unsafe { &*self.overlay_ptr }
+    }
+}
+
+// 事件处理器再入守卫：`handle_event` 打开模态菜单/属性页（`TrackPopupMenu`、Shell 动词
+// 的对话框）期间，嵌套消息循环会派发定时器、悬停、注入等其它事件再入回调。外层仍持有
+// `Runtime` 可变借用，再入必然 RefCell 借用冲突崩溃；守卫置位后，再入回调直接丢弃事件。
+// `ReentryGuard` 在回调结束时（含 panic）自动复位，避免标志位残留卡死后续事件。
+thread_local! {
+    static HANDLING: RefCell<bool> = const { RefCell::new(false) };
+}
+
+struct ReentryGuard;
+
+impl Drop for ReentryGuard {
+    fn drop(&mut self) {
+        HANDLING.with(|h| *h.borrow_mut() = false);
+    }
+}
+
+fn main() {
+    // 全部使用物理像素，必须声明进程 DPI 感知。
+    // 首选 Per-Monitor v2：窗口按真实物理像素渲染，DWM 不再对整窗位图缩放
+    // （消除高缩放下「整窗发糊 + 拖拽/动画重采样与合成竞争 → 闪烁」），
+    // 并支持 WM_DPICHANGED 实时重排。旧系统不支持时回退系统感知。
+    unsafe {
+        let pmv2 = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        if pmv2.is_err() {
+            // Win8.1/部分环境不支持 PerMonitorV2：降级为系统感知（GetDpiForSystem 仍可用）。
+            let _ = SetProcessDPIAware();
+        }
+    }
+    // COM：图标枚举/提取需要（APARTMENTTHREADED）
+    let _com = winbosk_shell::com::init();
+    // OLE 剪贴板：Shell 右键菜单的复制/剪切/粘贴依赖 OleInitialize
+    // （IContextMenu::InvokeCommand 内部调用 OleSetClipboard，未初始化 OLE 时静默失败）
+    let _ole = unsafe { OleInitialize(None) };
+
+    // 数据目录：exe 同级的 data 文件夹（与安装器约定一致——安装器在 <安装目录>/data 创建
+    // 空目录，卸载时随安装目录一并删除；不再用 %APPDATA%，否则卸载不保留数据也清不掉）。
+    let data_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("data");
+    let _guard = match logging::init(&data_dir.join("logs")) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("日志初始化失败: {e}");
+            return;
+        }
+    };
+
+    // 单实例锁：防止重复启动导致多个全屏 overlay 叠层拦截输入（历史故障根因）。
+    // 互斥名不带命名空间前缀 = 当前登录会话命名空间，无需管理员特权。
+    // 句柄 `_mutex` 保持到 main 退出（进程生命周期），期间重复启动会立即在此退出。
+    // 检查刻意晚于日志初始化：被拒的第二实例要在文件日志里留痕（release 无控制台，
+    // 「双击无反应」只能靠文件级线索定位，见 docs/plans/12 G4）。
+    let name: Vec<u16> = "WinBosk.Desktop.Fences"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let _mutex = match unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) } {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("单实例互斥创建失败: {e}");
+            return;
+        }
+    };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        // best-effort 提示：仅做只读窗口检索、不发任何消息，不作判据（僵尸若卡在
+        // DestroyWindow 之前 overlay 仍在，会误报 alive；定案证据以收尾阶段埋点为准）。
+        let overlay_alive = winbosk_shell::takeover::overlay_window_alive();
+        tracing::warn!(overlay_alive, "WinBosk 已在运行，本次启动退出（单实例）");
+        if !overlay_alive {
+            tracing::warn!(
+                "未检测到 WinBosk overlay 窗口：可能是上次退出遗留的进程，请在任务管理器结束 winbosk.exe 后重试"
+            );
+        }
+        return;
+    }
+
+    // 从旧位置（%APPDATA%\WinBosk）迁移：旧版数据不在 exe 同级时搬过来，一次完成。
+    // 刻意留在单实例检查**之后**：迁移有真实副作用（搬动文件），被拒的第二实例
+    // 不得搬走正在运行实例的数据（旧版用 %APPDATA%，与本版混跑时正是这种局面）。
+    if !data_dir.join("desk.json").exists() {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let old_dir = PathBuf::from(appdata).join("WinBosk");
+            if old_dir.join("desk.json").exists() {
+                let _ = std::fs::create_dir_all(&data_dir);
+                // 逐文件迁移（跨卷 rename 会失败，fallback 到 copy）
+                for entry in std::fs::read_dir(&old_dir).into_iter().flatten().flatten() {
+                    let src = entry.path();
+                    let dst = data_dir.join(entry.file_name());
+                    if std::fs::rename(&src, &dst).is_err() {
+                        let _ = std::fs::copy(&src, &dst);
+                        let _ = std::fs::remove_file(&src);
+                    }
+                }
+                tracing::info!(
+                    "已从 {} 迁移数据到 {}",
+                    old_dir.display(),
+                    data_dir.display()
+                );
+            }
+        }
+    }
+
+    if let Err(e) = run(&data_dir) {
+        tracing::error!("启动失败: {e:?}");
+    }
+
+    // 显式析构日志 WorkerGuard，确保退出前所有日志已刷盘
+    drop(_guard);
+    // 显式释放单实例互斥锁句柄
+    // 彻底跳过 Windows CRT ExitProcess / DLL_PROCESS_DETACH 加载器锁死锁，
+    // 由内核直接回收进程与句柄，瞬时释放可执行文件锁。
+    unsafe {
+        let _ = CloseHandle(_mutex);
+        let _ = TerminateProcess(GetCurrentProcess(), 0);
+    }
+}
+
+fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
+    // M0 桌面状态：加载/校验/回写，确保配置目录就绪
+    let store = ConfigStore::new(data_dir.to_path_buf());
+    let mut desk = store.load()?;
+    desk.validate();
+    // 内部库文件夹（软件目录下）：粘贴/拖入的文件先物理复制进来，栅栏索引库内副本。
+    // 库内文件被外部删除时，栅栏对应项同步移除（定时器 `SyncLibrary` 与启动时各清一次）。
+    let library_dir = data_dir.join("library");
+    let _ = std::fs::create_dir_all(&library_dir);
+    // 真实桌面目录：只在此处解析一次（后续 `shell_desktop_path()` 仍用于迁移/镜像等
+    // 低频路径，控制中心绘制改读这份缓存，避免每帧一次 COM 调用）。
+    let desktop_dir = shell_desktop_path();
+    tracing::info!(
+        fences = desk.fences.len(),
+        icons = desk.icons.len(),
+        "桌面状态已加载"
+    );
+
+    // 开机自启：若配置已启用，确保注册表中的当前 exe 路径准确有效（适应 exe 搬家或版本更新自愈）
+    if desk.settings.autostart {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Err(e) = winbosk_shell::autostart::set_autostart("WinBosk", &exe, true) {
+                tracing::warn!("同步开机自启注册表项失败: {e}");
+            }
+        }
+    }
+
+    // 1) 壳层接管：探测层级并隐藏真实图标（反冲突约束：不重挂/不销毁他人窗口）。
+    //    守卫确保后续任何失败都会恢复图标。
+    let hierarchy = winbosk_shell::takeover::probe()
+        .ok_or_else(|| winbosk_core::CoreError::Shell("未找到桌面根窗口 Progman".into()))?;
+    let _guard = IconGuard::new(hierarchy);
+
+    // 2) GPU 上下文 + overlay + 合成器
+    let device = RenderDevice::new().map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
+    let overlay = OverlayWindow::create(hierarchy.overlay_parent())
+        .map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
+    // 收尾兜底就绪：登记待恢复句柄 + 哨兵。放在 overlay 之后 ⇒ 此后任何 `?` 失败
+    // 的析构都会先经过哨兵（T1/T2 覆盖「启动失败 → 收尾滞留」，见 `ExitArmGuard`）。
+    set_exit_listview(hierarchy.list_view);
+    let _exit_arm = ExitArmGuard;
+    let (vw, vh) = (overlay.width, overlay.height);
+    tracing::info!(vw, vh, "overlay 覆盖虚拟屏幕");
+
+    // 主题字号按 DPI 放大：渲染层把渲染目标固定为 96 DPI（1 DIP = 1 物理像素），
+    // 布局/字号全部走物理像素，200% 缩放下图标与文字才会以像素级分辨率渲染（清晰）。
+    // 图标位图也按物理尺寸提取（见 ICON_EXTRACT_SIZE），不再把小图放大导致发糊。
+    // 注意：所有 DIP 度量必须**一起**缩放（字号、图标、间距、内边距、列宽、控制台），
+    // 只放大文字不放大行距/间距正是「行列间重叠」的根因。
+    let mut theme = Theme::default();
+    // Per-Monitor v2 下用 overlay 所在显示器的 DPI（系统感知回退则同 GetDpiForSystem）。
+    // overlay 已在上一步创建，hwnd 可用。
+    let dpi = unsafe { GetDpiForWindow(overlay.hwnd) };
+    let dpi_scale = dpi as f32 / 96.0;
+    apply_theme_scale(&mut theme, dpi_scale);
+    tracing::info!(dpi, scale = dpi_scale, "主题按 DPI 缩放");
+    // 侧边栏栅栏启动归一化：旧数据可能存了超屏/离屏 bounds（图标多时曾按内容全高
+    // 计算导致 top 为负），重新停靠到屏幕内。折叠按钮已移除，历史折叠状态强制展开。
+    let mut dock_reanchor = 0;
+    for f in desk.fences.iter_mut() {
+        if f.appearance.layout == FenceLayout::Sidebar {
+            if f.sidebar_collapsed {
+                f.sidebar_collapsed = false;
+                dock_reanchor += 1;
+            }
+            let wa = work_area_rect(overlay.x as f32, overlay.y as f32, vw as f32, vh as f32);
+            let b = sidebar_dock_rect(theme.scale, f, &wa);
+            // 夹在工作区内（任务栏扣除后），下沿不越过任务栏
+            let b = clamp_sidebar_work_rect(b, wa, f.appearance.sidebar_pos);
+            if f.bounds != b {
+                f.bounds = b;
+                dock_reanchor += 1;
+            }
+        }
+    }
+    if dock_reanchor > 0 {
+        tracing::info!(dock_reanchor, "侧边栏栅栏边界已重新停靠到屏幕内");
+        let _ = store.save(&desk);
+    }
+    let compositor = Compositor::new(device, overlay.hwnd, theme.clone())
+        .map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
+
+    // 3) 枚举真实桌面图标（IShellFolder 枚举，不依赖 DefView）
+    let mut items = winbosk_shell::items::enumerate_desktop_items()
+        .map_err(|e| winbosk_core::CoreError::Shell(e.to_string()))?;
+    tracing::info!(count = items.len(), "桌面图标枚举完成");
+
+    // 4) 首次运行：无栅栏布局时按稳定顺序创建演示栅栏并持久化。
+    //    之后布局由用户拖动/缩放决定，栅栏是显式成员列表（无自动分类）。
+    seed_fences(&mut desk, &items, &theme);
+    store.save(&desk)?;
+
+    // 5) 图标元数据补齐 + 添加项恢复：
+    //    - 枚举项：登记 path/详情（added=false），缺失的补进 desk.icons；
+    //    - 上次拖入/粘贴的项（desk.icons 里带 path 但不在枚举中）：从路径重建
+    //      DesktopItem 追加进 items 池，重启后仍能显示图标、双击打开。
+    for it in &items {
+        let ic = desk.icons.entry(it.id.clone()).or_insert_with(|| {
+            let mut i = Icon::new(it.id.clone(), it.display_name.clone(), it.kind);
+            i.path = it.path.clone();
+            i
+        });
+        ic.path = it.path.clone();
+        ic.added = false;
+        if let Some(p) = it.path.as_deref() {
+            winbosk_core::details::enrich(ic, p);
+        }
+    }
+    let mut item_index: HashMap<String, usize> = items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| (it.id.clone(), i))
+        .collect();
+    let mut restored = 0usize;
+    for (id, ic) in &desk.icons {
+        if item_index.contains_key(id) {
+            continue;
+        }
+        if let Some(path) = ic.path.as_deref() {
+            if let Ok(dt) = winbosk_shell::items::item_from_path(path) {
+                item_index.insert(dt.id.clone(), items.len());
+                items.push(dt);
+                restored += 1;
+            }
+        }
+    }
+    if restored > 0 {
+        tracing::info!(restored, "恢复上次添加的图标");
+    }
+
+    // 图标索引 + 位图映射 + 首次上传数据（正式版放后台加载线程）
+    let mut bitmap_ids = HashMap::new();
+    let mut uploads = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        match winbosk_shell::icons::extract_icon(item, ICON_EXTRACT_SIZE) {
+            Ok(data) => {
+                bitmap_ids.insert(item.id.clone(), i as u64);
+                uploads.push((i as u64, data));
+            }
+            Err(e) => tracing::warn!(name = %item.display_name, "图标提取失败: {e}"),
+        }
+    }
+    tracing::info!(loaded = uploads.len(), "图标位图提取完成");
+
+    tracing::info!(icons = items.len(), "开始提取图标位图（初始化阶段）");
+    memory::report("图标提取前");
+
+    // 5) 初始场景 + 呈现 + 命中模型
+    // 读取控制台开关（供动画器初始面板进度）——先取值再构造 Runtime，避免字段求值移动冲突。
+    let console_open = desk.console_open;
+    let overlay_ptr = &overlay as *const OverlayWindow as *mut OverlayWindow;
+    // 上次退出时若处于「原始桌面」模式：恢复真实图标（IconGuard 刚隐藏过），
+    // 栅栏保持隐藏（fence_alpha 取 0，不播放动画）。
+    if desk.desktop_mode {
+        hierarchy.restore_icons();
+    }
+    // 真实高度缓冲：与栅栏一一对应，`build_scene` 每帧回写（移动 desk 前取长度）。
+    let last_layout_h = vec![0.0; desk.fences.len()];
+    let mut rt = Runtime {
+        desk,
+        items,
+        item_index,
+        bitmap_ids,
+        compositor,
+        theme: theme.clone(),
+        vw: vw as f32,
+        vh: vh as f32,
+        origin: (overlay.x as f32, overlay.y as f32),
+        store,
+        hover: None,
+        cursor: None,
+        selected: Vec::new(),
+        select_band: None,
+        hwnd: overlay.hwnd,
+        edit: None,
+        edit_high: None,
+        console_anim: ConsoleAnim::new(console_open),
+        desktop_fade: None,
+        selected_fence: 0,
+        console_hover: None,
+        fence_scroll: 0.0,
+        last_layout_h,
+        fence_tweens: Vec::new(),
+        icon_hover: None,
+        hierarchy,
+        overlay_ptr,
+        library: library_dir,
+        desktop_dir,
+        pending_uploads: Vec::new(),
+        last_activity: std::time::Instant::now(),
+        last_trim: std::time::Instant::now(),
+        icon_drag: None,
+        drag_hint: None,
+        resize_session: None,
+        scroll_tweens: Vec::new(),
+        console_page: ConsolePage::default(),
+        recording_hotkey: None,
+        hotkey_conflicts: HashMap::new(),
+        fences_front: false,
+    };
+    hotkeys::apply_all_hotkeys(&mut rt);
+    // 双向同步：启动时清一次——内部库被外部删除的文件、链接文件夹与栅栏的差集，
+    // 都同步进栅栏（链接文件夹的预置文件启动即出现）。
+    if reconcile_fences(&mut rt) {
+        // 链接文件夹同步后图标数变了，侧边栏 bounds 需要重新计算（reanchor 时是空的）
+        reanchor_fences(&mut rt);
+        let _ = rt.store.save(&rt.desk);
+    }
+    // 虚拟壳项（回收站）一次性同步：必须在首帧布局之前，否则虚拟项入场会让侧边栏
+    // 宽度突变、闪一下。绝不挂进 SyncLibrary(4s)/reconcile_fences（H1/H2）。
+    let vsnap = winbosk_shell::virtual_items::mirrorable_virtual_snapshot();
+    if !vsnap.is_empty() && sync_virtual_items(&mut rt, &vsnap) {
+        reanchor_fences(&mut rt);
+        let _ = rt.store.save(&rt.desk);
+    }
+    // 高度策略：`bounds.h == 0` 表示未手动缩放，按内容自适应（增删应用自动长高）。
+    // 不在此冻结高度——用户拖边缘/角缩放后才落为具体值。
+    let mut scene = build_scene(&mut rt, Instant::now());
+    // 启动重叠消解：真实高度已由上面首帧 layout 写入 `last_layout_h`（自动高度栅栏
+    // 的 0 高此时可换算成真实可见高度）。历史布局若存在重叠（朋友机「两个栅栏突然
+    // 重叠」即由此而来）→ 推离并持久化，随后重排一帧供首帧呈现使用。
+    if resolve_overlaps(&mut rt) {
+        tracing::info!("启动重叠消解：存在重叠栅栏，已推离并保存");
+        let _ = rt.store.save(&rt.desk);
+        scene = build_scene(&mut rt, Instant::now());
+    }
+    // 首帧上传：图标位图（新增项的位图在 build_scene 内推入 pending_uploads）
+    let mut upload_refs: Vec<(u64, &winbosk_shell::icons::IconData)> =
+        uploads.iter().map(|(id, d)| (*id, d)).collect();
+    upload_refs.extend(rt.pending_uploads.iter().map(|(id, d)| (*id, d)));
+    rt.compositor
+        .present(&scene, &upload_refs)
+        .map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
+    let model = hit_model_from(&rt.theme, &scene, &rt.desk);
+    memory::report("首帧呈现后");
+    // Shell 右键菜单预热：后台加载栅栏里文件类型的 Shell 扩展（百度网盘等扩展首次
+    // 加载会卡线程数秒），避免「首次右键」在主线程卡死被判无响应。预热在后台线程，
+    // 与用户交互并行，不拖慢启动。
+    {
+        let paths: Vec<String> = rt
+            .desk
+            .icons
+            .values()
+            .filter_map(|ic| ic.path.clone())
+            .collect();
+        // 虚拟壳项没有路径，另走解析名 + `virtual:` 类型键（假扩展名会让预热静默失效）
+        let parsing: Vec<String> = vsnap.iter().map(|s| s.parsing_name.clone()).collect();
+        shell_menu::prime_startup(&paths, &parsing);
+    }
+    // 启动期一次性分配已就绪：把不再活跃的内存页换出工作集（D3D/场景构建等），
+    // 降低常驻内存。GPU 侧资源由驱动管理不受影响，用到时自动换回。
+    memory::trim();
+    memory::report("工作集修剪后");
+
+    // 6) 事件回路：App 处理交互 → 重绘 → 返回新命中模型（overlay 据此更新区域）。
+    // 重绘（present）必须先于返回命中模型：区域若扩张，新暴露区域依赖刚提交的合成内容，
+    // 颠倒会露一帧陈旧内容——overlay `apply_region` 的 `bRedraw=false` 依赖此不变量。
+    let runtime = Rc::new(RefCell::new(rt));
+    let runtime2 = runtime.clone();
+    overlay.set_event_handler(Box::new(move |ev| {
+        // 心跳：本回调只在主线程被派发——能走到这里就说明消息回路还活着（模态菜单
+        // 期间的嵌套派发也算）。看门狗据此判定停摆，见 `watchdog` 模块。
+        watchdog::heartbeat();
+        // 模态菜单 / 属性页 / Shell 动词执行期间，嵌套消息循环会派发定时器、悬停、
+        // 注入等其它事件再入本回调。此时外层 `handle_event` 仍持有 `Runtime` 的可变
+        // 借用，再入必然 RefCell 借用冲突崩溃——一律丢弃再入事件，保持当前命中模型。
+        if HANDLING.with(|h| h.replace(true)) {
+            return None;
+        }
+        let _reentry = ReentryGuard;
+        handle_event(&mut runtime2.borrow_mut(), ev)
+    }));
+    overlay.set_model(model);
+
+    // 7) Ctrl+C：通知消息循环干净退出（图标由 _guard 在返回时恢复）
+    let _ = OVERLAY_HWND.set(overlay.hwnd.0 as usize);
+    unsafe {
+        let _ = SetConsoleCtrlHandler(Some(ctrl_handler), true);
+    }
+
+    // 测试钩子：设置 WINBOSK_AUTOSTOP_MS 后到点自动干净退出（CI/自动验证用）。
+    if let Some(ms) = std::env::var("WINBOSK_AUTOSTOP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        let hwnd = overlay.hwnd.0 as usize; // HWND 非 Send，转 usize 跨线程
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut core::ffi::c_void)),
+                    WM_APP_QUIT,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        });
+        tracing::info!(ms, "WINBOSK_AUTOSTOP_MS 已设置，到点自动退出");
+    }
+
+    // 8) 主线程看门狗：进消息循环前武装（停摆自证，见 `watchdog` 模块）。刻意放在
+    //    启动重活之后——启动期不计入停摆判定，否则冷启动的慢初始化会误报，
+    //    并把一次性的看门狗白白耗掉。
+    watchdog::spawn();
+
+    // 收尾限时兜底的两个线程必须**启动期**创建（收尾期新建线程会卡死在加载器锁
+    // 死锁上，见 `prepare_exit_deadline` 文档）。运行期它们只阻塞在事件上。
+    prepare_exit_deadline();
+
+    tracing::info!("WinBosk 已就绪：拖边缘/角缩放、标题栏拖动、双击打开、文件拖入/粘贴添加；Ctrl+Alt+T 控制中心，Ctrl+Shift+F10 退出");
+    run_message_loop();
+
+    // 收尾哨兵置位必须是**第一句**：其后每一步（IME 解除关联的 imm32 调用、内存快照
+    // 的分配、日志落盘、overlay Drop 的 GPU/COM 释放）都可能在加载器锁/堆锁死锁下
+    // 卡住——早一步置位就多一分覆盖；消息循环已返回 = 进程已决定退出，不会误伤运行期。
+    arm_exit_deadline();
+    // 退出收尾：解除 overlay 与 IME 上下文的关联（窗口仍在，把系统侧状态还原干净；
+    // 与编辑期的成对关联共用同一幂等出口）。
+    overlay.ime_detach();
+    memory::report("退出前");
+    tracing::info!("已退出（进入收尾）");
+    // 显式分阶段 drop：顺序与原隐式顺序（声明逆序：runtime → overlay → _guard）逐字
+    // 一致，只是把零埋点的收尾变成可判别——滞留时「最后一条进入/离开」即定位点
+    // （见 docs/plans/12；overlay 的 Drop 内另有 5 段细分计时）。
+    {
+        let _p = ExitPhase::begin("释放运行时句柄");
+        drop(runtime);
+    }
+    {
+        let _p = ExitPhase::begin("销毁 overlay 窗口（含合成器/GPU 资源）");
+        drop(overlay);
+    }
+    {
+        let _p = ExitPhase::begin("恢复真实桌面图标");
+        drop(_guard);
+    }
+    tracing::info!("收尾完成");
+    Ok(())
+}
+
+/// Ctrl+C / 关闭终端：通知主循环退出（信号线程不做窗口访问）。
+unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> BOOL {
+    if let Some(hwnd) = OVERLAY_HWND.get() {
+        let _ = PostMessageW(
+            Some(HWND(*hwnd as *mut core::ffi::c_void)),
+            WM_APP_QUIT,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+    BOOL(1) // 已处理，阻止默认终止行为（让主循环干净退出）
+}
+
+/// 栅栏用于碰撞/夹屏的真实矩形：自动高度（`bounds.h <= 0`）时用最近一次布局
+/// 渲染高度。视觉矩形 = 模型矩形（拖拽已无补间），碰撞检测与实际可见区域一致。
+/// 口径唯一真源是 `Fence::collision_rect`（core）。
+fn fence_collision_rect(rt: &Runtime, i: usize) -> Rect {
+    rt.desk.fences[i].collision_rect(rt.last_layout_h.get(i).copied().unwrap_or(0.0))
+}
+
+/// 除 `skip` 外其它栅栏的碰撞矩形（真实高度入算——自动高度栅栏不再以 0 高漏检，
+/// 两个栅栏叠加到同一个自动高度栅栏上就是旧版「栅栏重叠」的根因之一）。
+fn other_bounds(rt: &Runtime, skip: usize) -> Vec<Rect> {
+    (0..rt.desk.fences.len())
+        .filter(|&i| i != skip)
+        .map(|i| fence_collision_rect(rt, i))
+        .collect()
+}
+
+/// 启动重叠消解：加载的布局可能因历史 bug / DPI 变化存在重叠（尤其自动高度栅栏，
+/// 旧版碰撞检测把 0 高当真高）。按序把每个栅栏与其它栅栏推离（真实高度入算），
+/// 保证互不重叠且都在屏幕内。返回是否有变化（有变化才持久化 + 重排一帧）。
+/// 依赖 `last_layout_h` 已由首帧 `build_scene` 填充，故须在首帧布局之后调用。
+fn resolve_overlaps(rt: &mut Runtime) -> bool {
+    let mut changed = false;
+    let screen = screen_rect(rt);
+    for i in 0..rt.desk.fences.len() {
+        let others = other_bounds(rt, i);
+        let cur = fence_collision_rect(rt, i);
+        let out = settle_move(&cur, &others, &screen, FENCE_GAP);
+        // 只修位置（不改变用户已设的尺寸），并圆整到整数物理像素。
+        if (out.x - cur.x).abs() > 0.5 || (out.y - cur.y).abs() > 0.5 {
+            rt.desk.fences[i].bounds.x = out.x.round();
+            rt.desk.fences[i].bounds.y = out.y.round();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// 虚拟屏幕边界（物理像素；栅栏活动范围）。
+fn screen_rect(rt: &Runtime) -> Rect {
+    Rect::new(0.0, 0.0, rt.vw, rt.vh)
+}
+
+/// 主显示器工作区（任务栏扣除后；物理像素）。
+/// `SPI_GETWORKAREA` 返回的是**屏幕坐标**（主显示器左上 = (0,0)），而栅栏布局用
+/// 虚拟/客户端坐标（客户端 (0,0) = 虚拟屏 (0,0) = 屏幕 (ox, oy)）——转虚拟坐标
+/// 需减去 `(ox, oy)`。单屏时 (0,0) 减了无感；多屏主屏非虚拟原点时少了这一步
+/// 侧边栏夹屏会整体错位。失败回退整个虚拟屏幕。
+fn work_area_rect(ox: f32, oy: f32, vw: f32, vh: f32) -> Rect {
+    let mut rc = RECT::default();
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut rc as *mut RECT as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() || rc.right <= rc.left || rc.bottom <= rc.top {
+        return Rect::new(0.0, 0.0, vw, vh);
+    }
+    Rect::new(
+        rc.left as f32 - ox,
+        rc.top as f32 - oy,
+        (rc.right - rc.left) as f32,
+        (rc.bottom - rc.top) as f32,
+    )
+}
+
+/// 执行一键全自动分类整理（控制中心、托盘菜单、栅栏右键菜单共用同一套逻辑）。
+pub(crate) fn execute_auto_organize(rt: &mut Runtime) {
+    let desktop_dir = shell_desktop_path();
+    let default_source = rt
+        .desk
+        .fences
+        .iter()
+        .find(|f| {
+            f.title.as_deref() == Some("桌面")
+                || (desktop_dir.is_some() && f.storage_path.as_deref() == desktop_dir.as_deref())
+        })
+        .or_else(|| rt.desk.fences.first())
+        .map(|f| f.id);
+    let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
+    let report = rt
+        .desk
+        .auto_organize_all(default_source, wa, rt.theme.scale);
+    if report.created_fences > 0 || report.moved_icons > 0 {
+        tracing::info!(
+            created = report.created_fences,
+            moved = report.moved_icons,
+            "一键全自动分类整理已完成"
+        );
+        rt.last_layout_h.resize(rt.desk.fences.len(), 0.0);
+        let _ = rt.store.save(&rt.desk);
+    }
+}
+
+/// 跨栅栏命中图标的来源栅栏分组
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConflictGroup {
+    pub(crate) fence_id: u64,
+    pub(crate) fence_title: String,
+    pub(crate) icon_ids: Vec<String>,
+    pub(crate) icon_names: Vec<String>,
+}
+
+/// 冲突处理结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictResolution {
+    /// 全部转移到当前栅栏
+    MoveAll,
+    /// 仅转移特定栅栏（携带 fence_id）
+    MoveSpecific(u64),
+    /// 忽略冲突（仅收纳桌面及未分组项）
+    IgnoreConflicts,
+    /// 取消（放弃本次整理）
+    Cancel,
+}
+
+fn show_rule_conflict_dialog(
+    rt: &Runtime,
+    target_title: &str,
+    conflicts: &[ConflictGroup],
+) -> ConflictResolution {
+    let total_conflicts: usize = conflicts.iter().map(|c| c.icon_ids.len()).sum();
+    let title_w = wide("规则收纳冲突");
+    let main_inst_w = wide(&format!(
+        "发现 {} 个匹配文件已被其他栅栏收纳",
+        total_conflicts
+    ));
+
+    let mut content = format!("以下文件符合【{target_title}】规则，但当前已被其他栅栏持有：\n\n");
+    for c in conflicts {
+        let names = if c.icon_names.len() <= 4 {
+            c.icon_names.join(", ")
+        } else {
+            format!(
+                "{} 等共 {} 个文件",
+                c.icon_names[..4].join(", "),
+                c.icon_names.len()
+            )
+        };
+        content.push_str(&format!("• 【{}】：{}\n", c.fence_title, names));
+    }
+    content.push_str(&format!("\n请选择是否将文件转移收纳到【{target_title}】？"));
+    let content_w = wide(&content);
+
+    // 构造 Command Link 按钮（保持 wide 字符串存活直到调用结束）
+    let mut btn_texts_w = Vec::new();
+    let mut buttons = Vec::new();
+
+    // 按钮 101：全部转移
+    let move_all_text = wide(&format!(
+        "全部转移到【{target_title}】\n从所有其他栅栏移入全部 {total_conflicts} 个冲突文件"
+    ));
+    btn_texts_w.push(move_all_text);
+    buttons.push(TASKDIALOG_BUTTON {
+        nButtonID: 101,
+        pszButtonText: PCWSTR(btn_texts_w.last().unwrap().as_ptr()),
+    });
+
+    // 若有多个冲突栅栏，分别增加每个栅栏的专属转移按键（点选特定栅栏转移，其余忽略）
+    if conflicts.len() > 1 {
+        for (idx, c) in conflicts.iter().enumerate() {
+            let spec_text = wide(&format!(
+                "仅转移【{}】\n仅从该栅栏移入 {} 个文件，保留其他栅栏不变",
+                c.fence_title,
+                c.icon_ids.len()
+            ));
+            btn_texts_w.push(spec_text);
+            buttons.push(TASKDIALOG_BUTTON {
+                nButtonID: 102 + idx as i32,
+                pszButtonText: PCWSTR(btn_texts_w.last().unwrap().as_ptr()),
+            });
+        }
+    }
+
+    // 按钮 200：忽略冲突
+    let ignore_text = wide("忽略冲突项\n保留其他栅栏不变，仅收纳桌面及未分组文件");
+    btn_texts_w.push(ignore_text);
+    buttons.push(TASKDIALOG_BUTTON {
+        nButtonID: 200,
+        pszButtonText: PCWSTR(btn_texts_w.last().unwrap().as_ptr()),
+    });
+
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: rt.hwnd,
+        pszWindowTitle: PCWSTR(title_w.as_ptr()),
+        pszMainInstruction: PCWSTR(main_inst_w.as_ptr()),
+        pszContent: PCWSTR(content_w.as_ptr()),
+        dwFlags: TDF_USE_COMMAND_LINKS,
+        dwCommonButtons: TDCBF_CANCEL_BUTTON,
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: 101,
+        ..Default::default()
+    };
+
+    let mut selected_button = 0i32;
+    unsafe {
+        let prev = GetForegroundWindow();
+        let proxy = (*rt.overlay_ptr).menu_owner();
+        (*rt.overlay_ptr).raise_to_foreground();
+
+        let _ = TaskDialogIndirect(&config, Some(&mut selected_button), None, None);
+
+        let fg = GetForegroundWindow();
+        if !prev.is_invalid() && (fg == rt.hwnd || fg == proxy) {
+            let _ = SetForegroundWindow(prev);
+        }
+    }
+
+    match selected_button {
+        101 => ConflictResolution::MoveAll,
+        b if b >= 102 && (b - 102) < conflicts.len() as i32 => {
+            let idx = (b - 102) as usize;
+            ConflictResolution::MoveSpecific(conflicts[idx].fence_id)
+        }
+        200 => ConflictResolution::IgnoreConflicts,
+        _ => ConflictResolution::Cancel,
+    }
+}
+
+/// 收集指定栅栏规则的候选项目：分为本地无冲突项与跨栅栏冲突项
+pub(crate) fn detect_rule_candidates(
+    desk: &Desk,
+    target_fid: u64,
+    rule: &winbosk_core::model::FenceRule,
+    desktop_dir: Option<&str>,
+) -> (Vec<String>, Vec<ConflictGroup>) {
+    let src_id = desk
+        .fences
+        .iter()
+        .find(|f| {
+            f.id != target_fid
+                && (f.title.as_deref() == Some("桌面")
+                    || (desktop_dir.is_some() && f.storage_path.as_deref() == desktop_dir))
+        })
+        .map(|f| f.id);
+
+    let mut local_matches = Vec::new();
+    if let Some(src_fid) = src_id {
+        if let Some(src) = desk.fence(src_fid) {
+            for id in &src.icon_ids {
+                if let Some(ic) = desk.icons.get(id) {
+                    if rule.matches_icon(ic) {
+                        local_matches.push(id.clone());
+                    }
+                }
+            }
+        }
+    }
+    for id in &desk.free_icons {
+        if let Some(ic) = desk.icons.get(id) {
+            if rule.matches_icon(ic) && !local_matches.contains(id) {
+                local_matches.push(id.clone());
+            }
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    for f in &desk.fences {
+        if f.id == target_fid || Some(f.id) == src_id {
+            continue;
+        }
+        let mut group_ids = Vec::new();
+        let mut group_names = Vec::new();
+        for id in &f.icon_ids {
+            if let Some(ic) = desk.icons.get(id) {
+                if rule.matches_icon(ic) {
+                    group_ids.push(id.clone());
+                    group_names.push(ic.display_name.clone());
+                }
+            }
+        }
+        if !group_ids.is_empty() {
+            conflicts.push(ConflictGroup {
+                fence_id: f.id,
+                fence_title: f.title.clone().unwrap_or_else(|| format!("栅栏 {}", f.id)),
+                icon_ids: group_ids,
+                icon_names: group_names,
+            });
+        }
+    }
+
+    (local_matches, conflicts)
+}
+
+/// 针对指定栅栏的规则立即执行收纳整理（包含桌面、未分组池以及跨栅栏冲突探测与弹窗选择）。
+pub(crate) fn execute_apply_fence_rule(rt: &mut Runtime, fence_idx: usize) {
+    let Some(target_fence) = rt.desk.fences.get(fence_idx) else {
+        return;
+    };
+    let target_fid = target_fence.id;
+    let target_title = target_fence
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("栅栏 {}", target_fid));
+    let Some(rule) = target_fence.rule.clone() else {
+        return;
+    };
+    if !rule.is_effective() {
+        modal_box(
+            rt,
+            "规则未开启",
+            "当前栅栏的分类规则未开启，或未配置任何包含后缀/通配符。",
+            MB_OK | MB_ICONWARNING,
+        );
+        return;
+    }
+
+    let desktop_dir = shell_desktop_path();
+    let (local_matches, conflicts) =
+        detect_rule_candidates(&rt.desk, target_fid, &rule, desktop_dir.as_deref());
+
+    // 3. 决策与收集要移动的项目
+    let mut to_move = Vec::new();
+    if conflicts.is_empty() {
+        if local_matches.is_empty() {
+            modal_box(
+                rt,
+                "规则整理提示",
+                &format!("未在桌面或未分组池中找到符合【{target_title}】规则的文件。"),
+                MB_OK,
+            );
+            return;
+        }
+        to_move.extend(local_matches);
+    } else {
+        let res = show_rule_conflict_dialog(rt, &target_title, &conflicts);
+        match res {
+            ConflictResolution::MoveAll => {
+                to_move.extend(local_matches);
+                for c in conflicts {
+                    to_move.extend(c.icon_ids);
+                }
+            }
+            ConflictResolution::MoveSpecific(fid) => {
+                to_move.extend(local_matches);
+                if let Some(c) = conflicts.into_iter().find(|c| c.fence_id == fid) {
+                    to_move.extend(c.icon_ids);
+                }
+            }
+            ConflictResolution::IgnoreConflicts => {
+                to_move.extend(local_matches);
+            }
+            ConflictResolution::Cancel => {
+                return;
+            }
+        }
+    }
+
+    let count = to_move.len();
+    for id in to_move {
+        rt.desk.move_icon(&id, Some(target_fid));
+    }
+    if count > 0 {
+        tracing::info!(count, fence = fence_idx, "针对指定栅栏规则整理完成");
+        let _ = rt.store.save(&rt.desk);
+        inject_rebuild(rt);
+    }
+}
+
+/// 该事件是否代表「用户真正点/拖了某处」（内联编辑打开时据此提交/失焦）。
+/// 悬停、滚轮、定时器、注入重绘等非交互事件不在此列——它们不该关掉刚打开的编辑框。
+fn is_popup_dismiss_event(ev: &OverlayEvent) -> bool {
+    matches!(
+        ev,
+        OverlayEvent::FenceMove { .. }
+            | OverlayEvent::FenceResize { .. }
+            | OverlayEvent::IconClicked { .. }
+            | OverlayEvent::IconDoubleClicked { .. }
+            | OverlayEvent::SelectDrag { .. }
+            | OverlayEvent::ContextMenu { .. }
+            | OverlayEvent::FilesDropped { .. }
+            | OverlayEvent::FenceScroll { .. }
+            | OverlayEvent::FenceCollapseToggle { .. }
+            | OverlayEvent::FenceTitleDoubleClicked { .. }
+            // 控制台交互（点按钮/滚待办/拖动面板/热键开关）都是真实交互，编辑期间应提交。
+            | OverlayEvent::ConsoleClick { .. }
+            | OverlayEvent::ConsoleScroll { .. }
+            | OverlayEvent::ConsoleMove { .. }
+            | OverlayEvent::ConsoleResize { .. }
+            | OverlayEvent::ConsoleResizeEnd
+            | OverlayEvent::ConsoleToggle
+    )
+}
+
+/// 前置会话的 Z 序单出口：把「表面该不该留在普通 Z 序带」这件事收敛到一个函数。
+///
+/// 两个前置来源——**控制中心展开**（`desk.console_open`）与**栅栏前置开关**
+/// （`rt.fences_front`）——共用同一套提权/回落，任一方为真就提权并置位会话位
+/// （`OverlayWindow::set_keep_front`），全假才落回桌面带。
+///
+/// 为什么必须共用：Z 序与会话位是**同一次事务**（分开写会留下「已提权但会话位假」
+/// 的组合态，光标一离开表面就回落，表现为刚提上去又自己掉下去）。也正因为位是共用的，
+/// 关掉其中一个功能不能连带撤掉另一个的提权——判据只能是「两者相或」。
+fn sync_front_band(rt: &mut Runtime) {
+    let keep = rt.desk.console_open || rt.fences_front;
+    unsafe {
+        if keep {
+            (*rt.overlay_ptr).raise_to_normal_band();
+        } else {
+            (*rt.overlay_ptr).restore_desktop_band();
+        }
+        (*rt.overlay_ptr).set_keep_front(keep);
+    }
+}
+
+/// 「栅栏前置」开关的唯一写入点（全局热键触发）。
+///
+/// 与控制中心开合的区别只有一点：**不展开面板**——不动 `console_open`、不跑面板补间、
+/// 不重绘场景，只推 Z 序（提权后栅栏盖住浏览器等普通窗口；再按一次落回桌面层）。
+pub(crate) fn set_fences_front(rt: &mut Runtime, on: bool) {
+    rt.fences_front = on;
+    sync_front_band(rt);
+    tracing::info!(front = on, "栅栏前置开关切换");
+}
+
+/// 控制中心开合的单一状态变迁出口：写状态 → 持久化 → 同步 overlay Z 序 → 驱动补间。
+///
+/// 全仓库唯一的 `desk.console_open` 写入点。控制中心是用户显式唤出的面板，展开期间
+/// overlay 临时提升到普通 Z 序带顶部（盖住浏览器等普通窗口），收起立即落回桌面带；
+/// 状态与 Z 序在同一函数内同步（Z 序推送见 `sync_front_band`），杜绝「面板开着但仍在
+/// 桌面带 / 关了却悬在普通带」的组合态。
+/// 提权仅存在于本会话显式唤出期间，不持久化（重启后 overlay 始终在桌面带）。
+pub(crate) fn set_console_open(rt: &mut Runtime, open: bool) {
+    // 开合都要清掉控制台悬停。收起时不清，重开（热键 / 托盘）后 `rt.console_hover` 仍留着
+    // 上次那个控件，而面板刚展开、光标未必动过 → 一条不该亮的路径下划线会亮到用户移动鼠标为止。
+    // 展开时也清：唤出那一刻光标位置未知，等第一次 `WM_MOUSEMOVE` 再建立才是对的。
+    // （overlay 侧只补了 `WM_MOUSEMOVE` 与 `WM_MOUSELEAVE` 两条通路，覆盖不到"面板凭空出现"。）
+    rt.console_hover = None;
+    rt.desk.console_open = open;
+    if let Err(e) = rt.store.save(&rt.desk) {
+        tracing::warn!("控制台状态持久化失败: {e}");
+    }
+    // Z 序与会话位同一事务推送：控制中心期间光标离开表面不回落（见 overlay 的
+    // WM_MOUSELEAVE）。收起时若「栅栏前置」仍开着，会由 `sync_front_band` 保持提权。
+    sync_front_band(rt);
+    start_panel_tween(rt, if open { 1.0 } else { 0.0 });
+}
+
+/// 左键当前是否按下（取的是本线程消息队列对应的按键状态，非异步物理状态）。
+///
+/// 用于给「拖动是否仍在进行」一个不依赖事件送达的判据：拖动异常终止（capture 被
+/// 系统抢占、模态循环打断）时收不到 `FenceDragEnd`，只靠事件白名单会把占位框
+/// 永久留在屏幕上。
+fn left_button_down() -> bool {
+    unsafe { GetKeyState(VK_LBUTTON.0 as i32) < 0 }
+}
+
+/// 图标拖放是否可提交（护栏，纯判定不落盘）。
+///
+/// 三条拒绝规则，全部是「宁可拒绝也不做半吊子的事」：
+///
+/// 1. **同栅栏换位恒可提交**——它不改变成员集合，任何存储语义下都与镜像一致；
+/// 2. **虚拟壳项（回收站/此电脑/网络…）不可移动**：它们的归属由 `VirtualPool::sync`
+///    在启动时收敛到桌面栅栏（`register` 会把快照里的每一项挂回桌面栅栏），拖走会在
+///    下次启动被拉回、甚至同时出现在两块栅栏里；
+/// 3. **源或目标是普通链接文件夹镜像时不可提交**：这类栅栏的成员被 4s 后台镜像按
+///    「可见 ⊆ 已归属 ∧ 已归属 ⊆ 磁盘」两条子集断言锁死，"只看归属、不动磁盘"的
+///    搬迁必被抢回或剔掉。桌面镜像不受此限（它的归属口径是全部栅栏的并集，见
+///    `is_plain_link_mirror`）。要跨这类栅栏拖动，得先做物理搬迁——那是独立一件事。
+pub(crate) fn icon_drop_allowed(
+    rt: &Runtime,
+    from_fence: usize,
+    to_fence: usize,
+    id: &str,
+) -> bool {
+    if from_fence == to_fence {
+        return true;
+    }
+    if winbosk_core::shell_items::is_virtual_id(id) {
+        return false;
+    }
+    let desktop = shell_desktop_path();
+    let public = shell_public_desktop_path();
+    ![from_fence, to_fence].iter().any(|&i| {
+        let storage = rt
+            .desk
+            .fences
+            .get(i)
+            .and_then(|f| f.storage_path.as_deref());
+        let is_dir = storage.map(|p| Path::new(p).is_dir()).unwrap_or(false);
+        is_plain_link_mirror(storage, is_dir, desktop.as_deref(), public.as_deref())
+    })
+}
+
+/// 提交一次图标拖放：把 `id` 挪到 `to_fence` 的第 `to_index` 位，否则回弹。
+///
+/// `id` 是拖动开始时解析好的**稳定身份**；源栅栏由它在模型里的当前位置反查，
+/// 而不是用按下时的下标——拖动期间后台 4s 库同步可能已经增删过该栅栏成员。
+///
+/// 拒绝路径（无落点、虚拟壳项、链接文件夹镜像）**不改任何归属**，只留一条日志：
+/// 拖动过程中渲染层已经把该落点画成红色高亮，用户不会对"松手后什么都没发生"意外。
+/// 无落点时的"回弹"同样是刻意行为（用户定的语义：拖到空白处 = 取消）。
+fn apply_icon_drop(rt: &mut Runtime, id: &str, to_fence: Option<usize>, to_index: usize) {
+    let Some(to_fence) = to_fence else {
+        return; // 光标不在任何栅栏内 → 回弹
+    };
+    let id = id.to_string();
+    let Some(to_id) = rt.desk.fences.get(to_fence).map(|f| f.id) else {
+        return;
+    };
+    // 源栅栏反查：找不到（已被后台同步移除）就什么都不做
+    let Some(from_fence) = rt
+        .desk
+        .icon_location(&id)
+        .and_then(|l| l.fence_id())
+        .and_then(|fid| rt.desk.fences.iter().position(|f| f.id == fid))
+    else {
+        return;
+    };
+    if !icon_drop_allowed(rt, from_fence, to_fence, &id) {
+        tracing::info!(
+            from = from_fence,
+            to = to_fence,
+            id,
+            "图标拖放被拒绝（虚拟壳项或链接文件夹镜像）"
+        );
+        return;
+    }
+    rt.desk.move_icon_at(&id, Some(to_id), Some(to_index));
+
+    // 选中态与悬停缓存都按 `(栅栏下标, 图标下标)` 索引，成员一变即全部失效：
+    // 先清空，再把刚搬过去的那个重新选中（用户刚操作的就是它）。
+    rt.selected.clear();
+    rt.hover = None;
+    rt.icon_hover = None;
+    rt.select_band = None;
+    if let Some(fi) = rt.desk.fences.iter().position(|f| f.id == to_id) {
+        if let Some(ii) = rt.desk.fences[fi].icon_ids.iter().position(|x| *x == id) {
+            rt.selected.push((fi, ii));
+        }
+    }
+    if let Err(e) = rt.store.save(&rt.desk) {
+        tracing::warn!("图标拖放持久化失败: {e}");
+    }
+    tracing::info!(
+        from = from_fence,
+        to = to_fence,
+        to_index,
+        id,
+        "图标已拖入目标栅栏"
+    );
+}
+
+/// 图标拖动**结束**事件：它自带落点，需要在 `match` 里读到拖动状态（被拖的是哪个 id），
+/// 所以不参与上面那遍「拖动状态清理」——清理规则本身见 `keeps_drag_hint`。
+///
+/// 与「白名单里的事件都保留状态」并不冲突：白名单管的是**拖动仍在进行**的事件，
+/// 本函数管的是**拖动已经结束**的那一个。
+fn carries_icon_drag_state(ev: &OverlayEvent) -> bool {
+    matches!(ev, OverlayEvent::IconDragEnd { .. })
+}
+
+/// 拖动进行中可能上报的事件白名单：只有它们（且左键仍按下）才允许保留占位框提示，
+/// 其余任何事件都意味着拖动已经结束（`FenceDragEnd` / 右键菜单 / 托盘 / DPI 变化 /
+/// 控制台操作…）。
+///
+/// **新增事件变体默认落入"清理"一侧**，这是刻意选的安全默认值：漏清会让占位框滞留
+/// 并吞掉它覆盖区域的桌面点击；误清最多让提示晚一帧出现（下一帧 `FenceMove` 立即重建）。
+fn keeps_drag_hint(ev: &OverlayEvent) -> bool {
+    matches!(
+        ev,
+        OverlayEvent::FenceMove { .. }
+            | OverlayEvent::FenceResize { .. }
+            | OverlayEvent::FenceScroll { .. }
+            | OverlayEvent::IconDragMove { .. }
+            | OverlayEvent::AnimTick
+            | OverlayEvent::SyncLibrary
+            | OverlayEvent::KeyDown { .. }
+            // 全局热键是键盘事件，与鼠标拖动正交：拖动中用另一只手按它不能让拖动会话被
+            // 静默中断（`KeyDown` 同理在列）。它不改任何拖动相关状态，只是推一下 Z 序。
+            | OverlayEvent::FencesFront
+            | OverlayEvent::HoverEnter { .. }
+            | OverlayEvent::HoverLeave
+            | OverlayEvent::CursorMove { .. }
+            | OverlayEvent::CursorLeave
+            | OverlayEvent::ConsoleHover { .. }
+    )
+}
+
+/// 处理一个用户交互事件：更新布局 → （按需）重绘 → 生成新命中模型。
+///
+/// 返回 `None` 表示本事件不改变任何可见状态，无需重绘（overlay 保持当前
+/// 命中模型与窗口区域）。这是空闲 CPU/GPU 与桌面闪烁的关键门控：
+/// 无侧边栏时鼠标扫过（`CursorMove`）与 4s 心跳（`SyncLibrary` 无变化）
+/// 都不再触发全量重绘。
+fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
+    // 空闲修剪门控：除周期性的 `SyncLibrary` 外都算用户活动，刷新时间戳。
+    // `SyncLibrary` 每 4s 触发一次，若算活动则永远「不空闲」，修剪永不执行。
+    if !matches!(ev, OverlayEvent::SyncLibrary) {
+        rt.last_activity = std::time::Instant::now();
+    }
+    // 占位框提示的收口（两条规则，缺一不可，见字段注释与 `keeps_drag_hint`）：
+    //   1) 拖动进行中只可能收到白名单事件；
+    //   2) 左键仍按下。
+    // 占位框会并入窗口区域（区域外不渲染），滞留就等于那块区域永远吞掉桌面点击，
+    // 所以这里宁可多清不可漏清；清理后必须强制重绘一帧，否则窗口区域不会收缩。
+    let mut reserved_changed = false;
+    if rt.drag_hint.is_some() && !(keeps_drag_hint(&ev) && left_button_down()) {
+        rt.drag_hint = None;
+        reserved_changed = true;
+    }
+    // 拖动幽灵（`icon_drag`）并入窗口区域的理由与占位框完全相同，清理规则也照抄：
+    // 白名单 + 左键仍按下。异常终止（capture 被抢、模态打断）时必须立刻清掉，
+    // 否则那块矩形会一直吞桌面点击。
+    // 例外：结束事件本身要带着拖动状态进 match（它只带落点，被拖的是谁在状态里），
+    // 所以它不参与这一遍清理，由 match 分支 `take()` 收口。
+    if rt.icon_drag.is_some()
+        && !carries_icon_drag_state(&ev)
+        && !(keeps_drag_hint(&ev) && left_button_down())
+    {
+        rt.icon_drag = None;
+        reserved_changed = true;
+    }
+    if rt.resize_session.is_some() && !keeps_drag_hint(&ev) {
+        rt.resize_session = None;
+    }
+    // 就地重命名编辑期间，真正的用户交互事件先提交编辑（资源管理器行为：点击别处即确认）。
+    // 只对「用户确实在别处点/拖/滚」的事件提交——定时器（SyncLibrary）与悬停高亮
+    // （HoverEnter/Leave）不算，否则编辑框会被后台同步或鼠标扫过自动关掉，用户根本没
+    // 来得及输入（曾导致重命名看起来完全坏掉）。`EditCommitted` 是注入的「仅重绘」
+    // 事件，此时编辑会话已结束，同样不在此处理。判断复用下方透明度滑块的同一语义。
+    if rt.edit.is_some() && is_popup_dismiss_event(&ev) {
+        dismiss_edit(rt);
+    }
+    // 控制中心联动门控：在控制中心开启时，若用户与桌面栅栏发生交互，自动跟随高亮并滚动到可视区
+    let active_fence = match &ev {
+        OverlayEvent::FenceMove { fence, .. }
+        | OverlayEvent::FenceResize { fence, .. }
+        | OverlayEvent::IconDoubleClicked { fence, .. }
+        | OverlayEvent::IconClicked { fence, .. }
+        | OverlayEvent::SelectDrag { fence, .. }
+        | OverlayEvent::ContextMenu { fence, .. }
+        | OverlayEvent::FenceScroll { fence, .. }
+        | OverlayEvent::FenceDragEnd { fence }
+        | OverlayEvent::FenceCollapseToggle { fence }
+        | OverlayEvent::FenceTitleDoubleClicked { fence } => Some(*fence),
+        // 图标拖动事件绑定的是 `from_fence`，字段名与上面那组不同，
+        // 不能并进同一个 `|` 分支（Rust 要求各分支绑定同名变量）。
+        OverlayEvent::IconDragMove { from_fence, .. }
+        | OverlayEvent::IconDragEnd { from_fence, .. } => Some(*from_fence),
+        _ => None,
+    };
+    // 重绘门控：默认 true（一切改变可见状态的事件照常重绘），
+    // 仅对「可能无事可画」的事件显式置 false。
+    let mut redraw = true;
+    if let Some(fence) = active_fence {
+        if rt.desk.console_open && fence < rt.desk.fences.len() && rt.selected_fence != fence {
+            rt.selected_fence = fence;
+            ensure_selected_fence_visible(rt);
+            redraw = true;
+        }
+    }
+    match ev {
+        OverlayEvent::FenceMove { fence, pos } => {
+            // 拖动标题栏：不交叉（无重叠推挤）+ 磁吸吸附 + 限制在虚拟屏幕内。
+            // 直接落到目标（无补间）：视觉 = 模型 = 鼠标位置，拖拽即时跟手；
+            // 且鼠标坐标是整数，拖拽中不存在分数坐标导致的边框发虚。
+            let (x, y) = pos;
+            // 拖动矩形与"别人看它"的碰撞矩形同源（`fence_height`）：自动高度栅栏
+            // （`bounds.h <= 0`）不能再退化成 0 高，否则自身会漏检邻居并可被拖出屏幕。
+            let cur = rt
+                .desk
+                .fences
+                .get(fence)
+                .map(|f| (f.bounds.w, fence_height(rt, fence)));
+            if let Some((w, h)) = cur {
+                let others = other_bounds(rt, fence);
+                let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
+                let cand = Rect::new(x, y, w, h);
+                let mut out = settle_move(&cand, &others, &wa, FENCE_GAP);
+                // 侧边栏 dock 夹在工作区内（任务栏扣除后），下沿不越过任务栏
+                if let Some(f) = rt.desk.fences.get(fence) {
+                    if f.appearance.layout == FenceLayout::Sidebar {
+                        out = clamp_sidebar_work_rect(out, wa, f.appearance.sidebar_pos);
+                    }
+                }
+                if let Some(f) = rt.desk.fences.get_mut(fence) {
+                    f.bounds.x = out.x;
+                    f.bounds.y = out.y;
+                }
+                // 占位框提示：记录**请求位置**（settle 之前），收起栅栏才能显示
+                // "我仍按原尺寸占着这里"以及"是哪个收起栅栏挡住了我"。
+                // `left_button_down()` 守卫是必需的，不是冗余检查：capture 被系统
+                // 抢占后 overlay 的拖动状态可能残留，鼠标在窗口上移动仍会发
+                // `FenceMove`（此时左键早已松开）。若无条件重建提示，就会出现
+                // "上面刚清、这里又建"的循环，占位框与窗口区域双双滞留。
+                if left_button_down() {
+                    rt.drag_hint = Some(DragHint {
+                        fence,
+                        requested: cand,
+                    });
+                }
+            }
+        }
+        OverlayEvent::FenceResize { fence, zone, rect } => {
+            // 折叠状态栅栏严禁缩放，防止破坏自适应高度或展开时的真实几何尺寸
+            if fence < rt.desk.fences.len() && rt.desk.fences[fence].collapsed {
+                return None;
+            }
+            if fence >= rt.desk.fences.len() {
+                return None;
+            }
+
+            // 初始化或获取单次调整尺寸拖拽会话（记录初始位置，防止连续微调时单向漂移）
+            if rt.resize_session.as_ref().map(|s| s.fence) != Some(fence) {
+                let initial_collision_rects: Vec<Rect> = (0..rt.desk.fences.len())
+                    .map(|i| fence_collision_rect(rt, i))
+                    .collect();
+                let initial_bounds: Vec<Rect> = rt.desk.fences.iter().map(|f| f.bounds).collect();
+                rt.resize_session = Some(ResizeSession {
+                    fence,
+                    initial_collision_rects,
+                    initial_bounds,
+                });
+            }
+
+            let session = rt.resize_session.as_ref().unwrap();
+            let initial_collision = session.initial_collision_rects.clone();
+            let initial_bounds = session.initial_bounds.clone();
+
+            let (nx, ny, nw, nh) = rect;
+            let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
+            let free = match zone {
+                ResizeZone::Right => FreeSides::Right,
+                ResizeZone::Bottom => FreeSides::Bottom,
+                ResizeZone::BottomRight => FreeSides::BottomRight,
+                ResizeZone::Left => FreeSides::Left,
+                ResizeZone::BottomLeft => FreeSides::BottomLeft,
+                ResizeZone::TopRight => FreeSides::TopRight,
+            };
+            let cand = Rect::new(nx, ny, nw, nh);
+            let fixed: Vec<bool> = rt
+                .desk
+                .fences
+                .iter()
+                .enumerate()
+                .map(|(i, f)| i != fence && f.appearance.layout == FenceLayout::Sidebar)
+                .collect();
+
+            let new_rects = settle_resize_with_push(
+                &initial_collision,
+                fence,
+                &cand,
+                &ResizePushConfig {
+                    screen: &wa,
+                    free,
+                    min_w: MIN_FENCE_W,
+                    min_h: MIN_FENCE_H,
+                    gap: FENCE_GAP,
+                    fixed: &fixed,
+                },
+            );
+
+            let mut out = new_rects[fence];
+            // 侧边栏 dock：厚度轴锁定为「紧贴放大图标」的停靠值——纵向锁 x/w、
+            // 横向锁 y/h，只保留用户拖动的那一轴，宽度/高度弹回锁定值，放大图标不再被裁。
+            if let Some(f) = rt.desk.fences.get(fence) {
+                if f.appearance.layout == FenceLayout::Sidebar {
+                    let d = sidebar_dock_rect(rt.theme.scale, f, &wa);
+                    out = if f.appearance.sidebar_pos == SidebarPosition::Top {
+                        Rect::new(out.x, d.y, out.w, d.h)
+                    } else {
+                        Rect::new(d.x, out.y, d.w, out.h)
+                    };
+                    // 夹在工作区内（任务栏扣除后）：纵向 dock 下沿不越过任务栏
+                    out = clamp_sidebar_work_rect(
+                        out,
+                        work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh),
+                        f.appearance.sidebar_pos,
+                    );
+                }
+            }
+            if let Some(f) = rt.desk.fences.get_mut(fence) {
+                f.bounds = Rect::new(out.x.round(), out.y.round(), out.w.round(), out.h.round());
+            }
+
+            // 同步更新所有被推开的邻居栅栏位置
+            for i in 0..rt.desk.fences.len() {
+                if i != fence
+                    && i < new_rects.len()
+                    && i < initial_collision.len()
+                    && i < initial_bounds.len()
+                {
+                    let dx = new_rects[i].x - initial_collision[i].x;
+                    let dy = new_rects[i].y - initial_collision[i].y;
+                    rt.desk.fences[i].bounds.x = (initial_bounds[i].x + dx).round();
+                    rt.desk.fences[i].bounds.y = (initial_bounds[i].y + dy).round();
+                }
+            }
+        }
+        OverlayEvent::IconDoubleClicked { fence, icon } => {
+            // 双击栅栏内图标：若属于多选集合则全部打开，否则打开双击项（资源管理器行为）
+            if rt.selected.len() > 1 && rt.selected.contains(&(fence, icon)) {
+                let targets = rt.selected.clone();
+                for (f, i) in targets {
+                    launch_fence_icon(rt, f, i);
+                }
+            } else {
+                launch_fence_icon(rt, fence, icon);
+            }
+        }
+        OverlayEvent::IconClicked { fence, icon, ctrl } => {
+            // 单击选中（如资源管理器）：Ctrl+单击切换该图标（不连续多选），普通单击单选
+            // 埋点：单击路径此前完全静默——2026-09-28 假死时日志里连「点到哪」都查不到。
+            tracing::info!(fence, icon, ctrl, "单击图标（选中）");
+            let key = (fence, icon);
+            if ctrl {
+                if rt.selected.contains(&key) {
+                    rt.selected.retain(|&k| k != key);
+                } else {
+                    rt.selected.push(key);
+                }
+            } else {
+                rt.selected = vec![key];
+            }
+        }
+        OverlayEvent::SelectDrag {
+            fence,
+            rect,
+            selected,
+        } => {
+            // 框选拖拽：更新选择集合 + 橡皮筋矩形（App 持有，供绘制）
+            rt.selected = selected;
+            rt.select_band = Some((
+                fence,
+                RectF {
+                    x: rect.0,
+                    y: rect.1,
+                    w: rect.2,
+                    h: rect.3,
+                },
+            ));
+        }
+        OverlayEvent::SelectEnd => {
+            // 框选结束：清除橡皮筋显示（选择结果保留）
+            rt.select_band = None;
+        }
+        OverlayEvent::CursorMove { x, y } => {
+            // 侧边栏 Dock 放大的连续光标驱动（build_scene 据此每帧算缩放）。
+            // 仅当存在 Dock 栅栏时光标才影响画面 → 无 Dock 时不重绘，
+            // 桌面任意鼠标移动都不再触发全量重绘（闪烁根治）。
+            rt.cursor = Some((x, y));
+            redraw = has_sidebar_dock(rt);
+        }
+        OverlayEvent::CursorLeave => {
+            // 光标离开窗口：清除 Dock 放大（下一帧全部恢复 1.0）。
+            rt.cursor = None;
+            redraw = has_sidebar_dock(rt);
+        }
+        OverlayEvent::HoverEnter { fence, icon } => {
+            rt.hover = Some((fence, icon));
+            // 悬停放大补间：从当前状态继续（进入 = 放大方向）
+            let base = rt
+                .icon_hover
+                .filter(|h| h.fence == fence && h.icon == icon)
+                .map(|h| h.progress(Instant::now()))
+                .unwrap_or(0.0);
+            rt.icon_hover = Some(IconHoverAnim {
+                fence,
+                icon,
+                t0: Instant::now(),
+                dur: 0.14,
+                from: base,
+                to: 1.0,
+            });
+            arm_anim_timer(rt);
+        }
+        OverlayEvent::HoverLeave => {
+            rt.hover = None;
+            if let Some(h) = rt.icon_hover {
+                let p = h.progress(Instant::now());
+                rt.icon_hover = Some(IconHoverAnim {
+                    fence: h.fence,
+                    icon: h.icon,
+                    t0: Instant::now(),
+                    dur: 0.18,
+                    from: p,
+                    to: 0.0,
+                });
+                arm_anim_timer(rt);
+            }
+        }
+        OverlayEvent::ContextMenu { fence, icon, pos } => {
+            handle_context_menu(rt, fence, icon, pos);
+        }
+        OverlayEvent::FilesDropped { fence, paths } => {
+            // 拖入任意文件/文件夹/快捷方式：加入该栅栏（位图进 pending_uploads）
+            add_paths_to_fence(rt, fence, &paths);
+        }
+        OverlayEvent::FenceScroll { fence, delta } => {
+            // 滚轮滚动：平滑阻尼插值滚动，抑制悬停动画抖动，停滚后统一防抖持久化。
+            rt.hover = None;
+            rt.icon_hover = None;
+            let s = rt.theme.scale;
+            let step = if let Some(f) = rt.desk.fences.get(fence) {
+                match f.appearance.layout {
+                    FenceLayout::List => LIST_ICON_SIZE * s + rt.theme.list_row_gap,
+                    FenceLayout::Grid | FenceLayout::Sidebar => {
+                        (f.appearance.icon_size + f.appearance.gap) * s
+                    }
+                }
+            } else {
+                40.0 * s
+            };
+            let delta_px = (delta as f32 / 120.0) * step;
+            let current_scroll = rt.desk.fences.get(fence).map(|f| f.scroll).unwrap_or(0.0);
+            let base_target = if let Some(tw) = rt.scroll_tweens.iter().find(|t| t.fence == fence) {
+                tw.to
+            } else {
+                current_scroll
+            };
+            let target = (base_target - delta_px).max(0.0);
+            if let Some(pos) = rt.scroll_tweens.iter().position(|t| t.fence == fence) {
+                rt.scroll_tweens[pos] = ScrollTween {
+                    fence,
+                    from: current_scroll,
+                    to: target,
+                    t0: Instant::now(),
+                    dur: 0.16,
+                };
+            } else {
+                rt.scroll_tweens.push(ScrollTween {
+                    fence,
+                    from: current_scroll,
+                    to: target,
+                    t0: Instant::now(),
+                    dur: 0.16,
+                });
+            }
+            arm_anim_timer(rt);
+        }
+        OverlayEvent::FenceDragEnd { .. } => {
+            rt.resize_session = None;
+            // 拖动结束：持久化当前布局
+            if let Err(e) = rt.store.save(&rt.desk) {
+                tracing::warn!("布局持久化失败: {e}");
+            }
+        }
+        OverlayEvent::FenceCollapseToggle { fence }
+        | OverlayEvent::FenceTitleDoubleClicked { fence } => {
+            if let Some(f) = rt.desk.fences.get_mut(fence) {
+                if f.appearance.layout != FenceLayout::Sidebar {
+                    f.collapsed = !f.collapsed;
+                    if let Err(e) = rt.store.save(&rt.desk) {
+                        tracing::warn!("折叠状态持久化失败: {e}");
+                    }
+                }
+            }
+        }
+        OverlayEvent::ConsoleClick { zone } => match zone {
+            ConsoleZone::Close => {
+                // 收起面板（完全不渲染，不留胶囊）；保存开关状态供重启恢复
+                set_console_open(rt, false);
+            }
+            ConsoleZone::Expand => {
+                // 唤出面板（热键/托盘/入口按钮同语义）
+                set_console_open(rt, true);
+            }
+            ConsoleZone::DesktopToggle => {
+                toggle_desktop(rt);
+            }
+            ConsoleZone::ToggleSettingsPage => {
+                rt.console_page = match rt.console_page {
+                    ConsolePage::Fences => ConsolePage::Settings,
+                    ConsolePage::Settings => ConsolePage::Fences,
+                };
+                rt.recording_hotkey = None;
+            }
+            ConsoleZone::HotkeyRecord(action) => {
+                rt.recording_hotkey = Some(action);
+                focus_overlay(rt);
+            }
+            ConsoleZone::HotkeyClear(action) => {
+                if rt.recording_hotkey == Some(action) {
+                    rt.recording_hotkey = None;
+                }
+                rt.desk.settings.hotkeys.set_action(action, None);
+                hotkeys::apply_all_hotkeys(rt);
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::HotkeyResetDefault => {
+                rt.desk.settings.hotkeys = winbosk_core::config::HotkeyConfig::default();
+                hotkeys::apply_all_hotkeys(rt);
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::QuitApp => {
+                let _ = unsafe { PostMessageW(Some(rt.hwnd), WM_APP_QUIT, WPARAM(0), LPARAM(0)) };
+            }
+            ConsoleZone::AutostartToggle => {
+                let next = !rt.desk.settings.autostart;
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Err(e) = winbosk_shell::autostart::set_autostart("WinBosk", &exe, next) {
+                        tracing::error!("切换开机自启状态失败: {e}");
+                    } else {
+                        rt.desk.settings.autostart = next;
+                        if let Err(e) = rt.store.save(&rt.desk) {
+                            tracing::warn!("开机自启配置保存失败: {e}");
+                        }
+                    }
+                }
+            }
+            ConsoleZone::FenceSelect(i) => {
+                if i < rt.desk.fences.len() {
+                    rt.selected_fence = i;
+                }
+            }
+            ConsoleZone::FenceLayout(l) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if l == FenceLayout::List {
+                    let w = list_auto_width(rt, i);
+                    if let Some(f) = rt.desk.fences.get_mut(i) {
+                        f.appearance.layout = l;
+                        f.bounds.w = w;
+                    }
+                } else if l == FenceLayout::Sidebar {
+                    if let Some(f) = rt.desk.fences.get_mut(i) {
+                        f.appearance.layout = l;
+                        f.sidebar_collapsed = false;
+                        // 停靠到屏幕边缘（侧 = 当前设置的停靠位置），并夹到屏幕内，
+                        // 图标多时高度不超过屏幕（超出滚动），不会跑到屏幕外。
+                        let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
+                        let b = sidebar_dock_rect(rt.theme.scale, f, &wa);
+                        // 夹在工作区内（任务栏扣除后），下沿不越过任务栏
+                        f.bounds = clamp_sidebar_work_rect(b, wa, f.appearance.sidebar_pos);
+                    }
+                } else if let Some(f) = rt.desk.fences.get_mut(i) {
+                    f.appearance.layout = l;
+                }
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::FenceIconSize(sz) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    f.appearance.icon_size = sz;
+                }
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::FenceStyle(style) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    f.appearance.bg_style = style;
+                }
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::FenceTint(tint) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    f.appearance.tint = tint;
+                }
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::FenceSidebarPos(pos) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    f.appearance.sidebar_pos = pos;
+                    // 位置切换：重新停靠到新的一侧（否则只高亮、不移动）
+                    if f.appearance.layout == FenceLayout::Sidebar {
+                        let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
+                        let b = sidebar_dock_rect(rt.theme.scale, f, &wa);
+                        // 夹在工作区内（任务栏扣除后），下沿不越过任务栏
+                        f.bounds = clamp_sidebar_work_rect(b, wa, f.appearance.sidebar_pos);
+                    }
+                }
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::FenceRulePreset(preset) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    let mut rule = f.rule.clone().unwrap_or_default();
+                    rule.enabled = true;
+                    rule.is_custom = false;
+                    rule.preset = preset;
+                    f.rule = Some(rule);
+                }
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::RuleEnterCustom => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    let mut rule = f.rule.clone().unwrap_or_default();
+                    rule.enabled = true;
+                    if !rule.is_custom_mode() {
+                        let cur_preset = rule.preset;
+                        rule.inherit_from_preset(cur_preset);
+                    }
+                    f.rule = Some(rule);
+                }
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::AutoOrganize => {
+                execute_auto_organize(rt);
+            }
+            ConsoleZone::AddFence => {
+                // 新建空白栅栏：直接生成，无需弹窗选择文件夹（纯收纳属性）
+                let title = {
+                    let mut idx = 1;
+                    loop {
+                        let name = format!("新栅栏 {}", idx);
+                        if !rt
+                            .desk
+                            .fences
+                            .iter()
+                            .any(|f| f.title.as_deref() == Some(&name))
+                        {
+                            break name;
+                        }
+                        idx += 1;
+                    }
+                };
+                let id = rt.desk.next_fence_id();
+                let s = rt.theme.scale;
+                let w = 360.0 * s;
+                let h = 220.0 * s;
+                let count = rt.desk.fences.len();
+                let offset_x = (count % 6) as f32 * 30.0 * s;
+                let offset_y = (count % 6) as f32 * 30.0 * s;
+                let start = Rect::new(80.0 * s + offset_x, 120.0 * s + offset_y, w, h);
+                let others = (0..rt.desk.fences.len())
+                    .map(|j| fence_collision_rect(rt, j))
+                    .collect::<Vec<_>>();
+                let screen = screen_rect(rt);
+                let out = settle_move(&start, &others, &screen, FENCE_GAP * s);
+                let bounds = Rect::new(out.x.round(), out.y.round(), w.round(), h.round());
+                rt.desk.fences.push(Fence {
+                    id,
+                    title: Some(title),
+                    monitor_id: 0,
+                    bounds,
+                    state: FenceState::Expanded,
+                    icon_ids: Vec::new(),
+                    appearance: FenceAppearance::default(),
+                    scroll: 0.0,
+                    storage_path: None,
+                    sidebar_collapsed: false,
+                    rule: None,
+                    collapsed: false,
+                });
+                rt.last_layout_h.push(0.0);
+                rt.selected_fence = rt.desk.fences.len() - 1;
+                let _ = rt.store.save(&rt.desk);
+                tracing::info!(id, "已快速创建空白收纳栅栏");
+            }
+            ConsoleZone::RemoveFence => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                delete_fence_and_reclaim_icons(rt, i);
+            }
+            ConsoleZone::ChangeStoragePath => {
+                // 更改选中栅栏的存储位置：打开文件夹选择器，移动已有库内项到新路径。
+                // 顺序有意为之：先弹选择器（单选、标题明确）→ 再校验目标目录 → 确有文件要搬
+                // 才弹确认 → 最后才写盘。校验放在确认之前，避免"先问再拒绝"。
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                // 这里提权是给下面的 `pick_folder`（`IFileDialog`）用的：它不走
+                // `modal_box`，不会自己提权。其后的确认框 / 告警框都在 `modal_box`
+                // 内部自行提权，不依赖这里。
+                unsafe { (*rt.overlay_ptr).raise_to_foreground() };
+                if let Some(new_dir) = pick_folder(rt.hwnd) {
+                    match validate_storage_dir(rt, &new_dir) {
+                        Err(reason) => warn_storage_reject(rt, reason.reason()),
+                        Ok(()) => {
+                            let n = count_movable_items(rt, i);
+                            if n == 0 || confirm_move_storage(rt, n, &new_dir) {
+                                if let Err(reason) = change_fence_storage(rt, i, &new_dir) {
+                                    warn_storage_reject(rt, reason.reason());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ConsoleZone::OpenStoragePath => {
+                // 在资源管理器中打开选中栅栏的真实落地目录。
+                // 路径取自 `storage::describe`（与绘制同源），不在这里另写一份 match。
+                // `is_dir()` 只在此处（点击时）调用一次——**绝不放进绘制路径**。
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                let storage = winbosk_core::storage::describe(
+                    rt.desk
+                        .fences
+                        .get(i)
+                        .and_then(|f| f.storage_path.as_deref()),
+                    &rt.library.to_string_lossy(),
+                    rt.desktop_dir.as_deref(),
+                );
+                if std::path::Path::new(&storage.path).is_dir() {
+                    // 提权后再拉起资源管理器：本进程常驻后台，不提权的话新窗口可能
+                    // 不获焦、被前台窗口盖住（与模态框同一套手法）。
+                    unsafe { (*rt.overlay_ptr).raise_to_foreground() };
+                    if !winbosk_shell::items::open_folder(&storage.path) {
+                        tracing::warn!(path = %storage.path, "拉起资源管理器失败");
+                    }
+                } else {
+                    // 目录已被外部删除：不弹系统错误框（栅栏内容此时已被后台同步清空，
+                    // 用户看得到状态），只留日志。
+                    tracing::warn!(path = %storage.path, "落地目录不存在，忽略「打开」");
+                }
+            }
+            ConsoleZone::ResetStoragePath => {
+                // 恢复默认：解除外部文件夹链接，回到应用内部库（不移动任何磁盘文件）
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                reset_fence_storage(rt, i);
+            }
+            ConsoleZone::ToggleAdvancedMode => {
+                rt.desk.console_advanced = !rt.desk.console_advanced;
+                let _ = rt.store.save(&rt.desk);
+            }
+            ConsoleZone::RuleToggleEnabled => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    let mut rule = f.rule.clone().unwrap_or_default();
+                    rule.enabled = !rule.enabled;
+                    f.rule = Some(rule);
+                    let _ = rt.store.save(&rt.desk);
+                }
+            }
+            ConsoleZone::RuleToggleAutoCapture => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    let mut rule = f.rule.clone().unwrap_or_default();
+                    rule.auto_capture = !rule.auto_capture;
+                    f.rule = Some(rule);
+                    let _ = rt.store.save(&rt.desk);
+                }
+            }
+            ConsoleZone::RuleDeleteExtension(idx) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    if let Some(r) = f.rule.as_mut() {
+                        if idx < r.custom_extensions.len() {
+                            r.custom_extensions.remove(idx);
+                            let _ = rt.store.save(&rt.desk);
+                        }
+                    }
+                }
+            }
+            ConsoleZone::RuleDeleteExcludeExtension(idx) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    if let Some(r) = f.rule.as_mut() {
+                        if idx < r.exclude_extensions.len() {
+                            r.exclude_extensions.remove(idx);
+                            let _ = rt.store.save(&rt.desk);
+                        }
+                    }
+                }
+            }
+            ConsoleZone::RuleDeletePattern(idx) => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                if let Some(f) = rt.desk.fences.get_mut(i) {
+                    if let Some(r) = f.rule.as_mut() {
+                        if idx < r.name_patterns.len() {
+                            r.name_patterns.remove(idx);
+                            let _ = rt.store.save(&rt.desk);
+                        }
+                    }
+                }
+            }
+            ConsoleZone::RuleAddExtension => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                open_rule_input(
+                    rt,
+                    EditTarget::RuleExtension { fence: i },
+                    "输入后缀如 png, jpg",
+                );
+            }
+            ConsoleZone::RuleAddExcludeExtension => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                open_rule_input(
+                    rt,
+                    EditTarget::RuleExcludeExtension { fence: i },
+                    "输入排除后缀如 tmp, bak",
+                );
+            }
+            ConsoleZone::RuleAddPattern => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                open_rule_input(
+                    rt,
+                    EditTarget::RulePattern { fence: i },
+                    "输入通配符如 draft*, log_?",
+                );
+            }
+            ConsoleZone::RuleApplyFence => {
+                let i = rt
+                    .selected_fence
+                    .min(rt.desk.fences.len().saturating_sub(1));
+                execute_apply_fence_rule(rt, i);
+            }
+            // 标签页已随小组件一并移除；命中模型不再产生该控件，兜底吞掉。
+            ConsoleZone::Tab(_) => {}
+        },
+        OverlayEvent::ConsoleScroll { delta } => {
+            // 栅栏管理页滚轮：滚动栅栏列表
+            let s = rt.theme.scale;
+            let step = CONSOLE_FENCE_ROW_H * s;
+            let max = fence_scroll_max(rt);
+            rt.fence_scroll = (rt.fence_scroll - (delta as f32 / 120.0) * step).clamp(0.0, max);
+        }
+        OverlayEvent::ConsoleHover { zone } => {
+            // 控件悬停：存下供下一帧绘制高亮（仅展开面板内上报）
+            rt.console_hover = zone;
+        }
+        OverlayEvent::KeyDown {
+            vk,
+            ctrl,
+            shift,
+            alt,
+            win,
+        } => {
+            if rt.recording_hotkey.is_some() {
+                if vk == 0x1B {
+                    // VK_ESCAPE: 取消录制
+                    rt.recording_hotkey = None;
+                } else if (vk == 0x08 || vk == 0x2E) && !ctrl && !shift && !alt && !win {
+                    // VK_BACK / VK_DELETE 且无修饰键：清除该快捷键
+                    let action = rt.recording_hotkey.take().unwrap();
+                    rt.desk.settings.hotkeys.set_action(action, None);
+                    hotkeys::apply_all_hotkeys(rt);
+                    let _ = rt.store.save(&rt.desk);
+                } else if vk == 0x11
+                    || vk == 0x10
+                    || vk == 0x12
+                    || vk == 0x5B
+                    || vk == 0x5C
+                    || (0xA0..=0xA5).contains(&vk)
+                {
+                    // 纯修饰键按下时（如 VK_CONTROL/VK_SHIFT/VK_MENU/VK_LWIN/VK_RWIN）：忽略不提交
+                } else if let Some(key_name) = hotkeys::vk_to_key_name(vk) {
+                    let binding =
+                        winbosk_core::hotkey::HotkeyBinding::new(ctrl, alt, shift, win, key_name);
+                    let recording_act = rt.recording_hotkey.unwrap();
+                    let mut conflict_label = None;
+                    for act in winbosk_core::hotkey::HotkeyAction::ALL {
+                        if act != recording_act {
+                            if let Some(other_b) = rt.desk.settings.hotkeys.get_binding(act) {
+                                if other_b == binding {
+                                    conflict_label = Some(act.label());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(label) = conflict_label {
+                        rt.hotkey_conflicts
+                            .insert(recording_act, format!("与{}快捷键冲突", label));
+                    } else {
+                        let action = rt.recording_hotkey.take().unwrap();
+                        rt.desk
+                            .settings
+                            .hotkeys
+                            .set_action(action, Some(binding.to_string()));
+                        hotkeys::apply_all_hotkeys(rt);
+                        let _ = rt.store.save(&rt.desk);
+                    }
+                }
+            } else {
+                edit_key(rt, vk, ctrl);
+            }
+        }
+        OverlayEvent::Char { ch } => {
+            edit_char(rt, ch);
+        }
+        OverlayEvent::EditCaret { x } => {
+            // 鼠标点编辑框内文本：光标跳到对应字符（不触发「点击别处提交」，
+            // 该事件由 overlay 命中模型把框内点击单独路由而来）
+            edit_click(rt, x);
+        }
+        OverlayEvent::ImeStart => {
+            if let Some(e) = rt.edit.as_mut() {
+                e.composing = true;
+                e.comp.clear();
+                position_ime_window(rt);
+            }
+        }
+        OverlayEvent::ImeCompose { text, caret } => {
+            if let Some(e) = rt.edit.as_mut() {
+                e.composing = true;
+                e.comp = text;
+                let _ = caret;
+                position_ime_window(rt);
+            }
+        }
+        OverlayEvent::ImeResult { text } => {
+            if let Some(e) = rt.edit.as_mut() {
+                e.committing = true;
+                e.commit_ime(&text);
+                e.committing = false;
+                e.composing = false;
+            }
+        }
+        OverlayEvent::ImeEnd => {
+            if let Some(e) = rt.edit.as_mut() {
+                e.composing = false;
+                e.comp.clear();
+            }
+        }
+        OverlayEvent::OverlayFocusLost => {
+            if rt.recording_hotkey.is_some() {
+                rt.recording_hotkey = None;
+            }
+            // 焦点离开 overlay：内联编辑失焦（待办输入/便签提交文本，重命名提交）
+            dismiss_edit(rt);
+        }
+        OverlayEvent::ConsoleMove { pos } => {
+            // 拖动标题栏移动面板：记录左上角（原始坐标 + 增量，避免粘连）
+            rt.desk.console_pos = Some(Vec2 { x: pos.0, y: pos.1 });
+        }
+        OverlayEvent::ConsoleDragEnd => {
+            // 拖动结束：持久化面板位置
+            if let Err(e) = rt.store.save(&rt.desk) {
+                tracing::warn!("控制台位置持久化失败: {e}");
+            }
+        }
+        OverlayEvent::ConsoleResize { rect } => {
+            // 拖右/下边缘缩放面板：宽度直接生效；高度换算为「完全展开高度」。
+            // 几何契约是「可见高度 = 展开高 × panel 进度」（无胶囊基线），故反解为除法；
+            // 动画中途缩放时按当前进度反解，稳定态 panel=1 时即等于拖出的高度。
+            let s = rt.theme.scale;
+            // 补间进行中（面板尚未完全展开）时按满进度反解：否则同一段拖动会随
+            // `panel` 逐帧变化算出不同的展开高度并持久化，松手后尺寸漂移。
+            let panel = if rt.console_anim.panel_tween.is_some() {
+                1.0
+            } else {
+                rt.console_anim.panel.max(0.05) // 折叠态按最小进度反解，避免除零
+            };
+            let full_w = rect.2.max(CONSOLE_MIN_W * s);
+            // 反解值必须钳在合法区间：否则动画中途缩放（panel 很小）会把展开高度放大
+            // 数十倍并**持久化**进 `console_size`，之后面板永远高得离谱。
+            let full_h = (rect.3 / panel).clamp(CONSOLE_MIN_H * s, CONSOLE_MAX_H * s);
+            rt.desk.console_size = Some((full_w, full_h));
+        }
+        OverlayEvent::ConsoleResizeEnd => {
+            // 缩放结束：持久化面板尺寸
+            if let Err(e) = rt.store.save(&rt.desk) {
+                tracing::warn!("控制台尺寸持久化失败: {e}");
+            }
+        }
+        OverlayEvent::ConsoleToggle => {
+            // 热键 Ctrl+Alt+T：唤出/收起面板（与托盘左键同语义）
+            set_console_open(rt, !rt.desk.console_open);
+        }
+        OverlayEvent::FencesFront => {
+            // 全局热键：栅栏前置开关。与控制中心热键的唯一区别是**不展开面板**——
+            // 不动 `console_open`、不跑补间；Z 序由 `set_fences_front` 推。
+            // 场景本身没有任何可见变化（栅栏内容照旧，只是窗口 Z 序变了），
+            // 因此显式不重绘：省掉一次 build_scene + 全量 D2D 绘制 + commit，
+            // 新 Z 序由 DWM 直接合成既有表面。
+            set_fences_front(rt, !rt.fences_front);
+            redraw = false;
+        }
+        OverlayEvent::DesktopToggle => {
+            toggle_desktop(rt);
+        }
+        OverlayEvent::AutoOrganize => {
+            execute_auto_organize(rt);
+        }
+        OverlayEvent::TrayToggle => {
+            // 托盘图标左键单击：切换控制中心开合（与 Ctrl+Alt+T 相同）
+            set_console_open(rt, !rt.desk.console_open);
+        }
+        OverlayEvent::TrayMenu => {
+            handle_tray_menu(rt);
+        }
+        OverlayEvent::EditCommitted => {
+            // 就地重命名提交后的注入事件：数据已改好，这里只需让尾部重建场景。
+        }
+        OverlayEvent::AnimTick => {
+            // 动画帧：推进面板/行补间；全部结束后停用定时器，回到空闲 0% CPU。
+            if !advance_anim(rt) {
+                unsafe { (*rt.overlay_ptr).set_anim_active(false) };
+            }
+        }
+        OverlayEvent::SyncLibrary => {
+            // 双向同步：内部库被外部删除 → 栅栏项移除；链接文件夹增删改名 → 栅栏镜像
+            // （文件夹是事实来源，栅栏即文件夹；有变化才持久化）
+            let changed = reconcile_fences(rt);
+            if changed {
+                let _ = rt.store.save(&rt.desk);
+            }
+            // 空闲修剪工作集：启动后用户长时间不操作时，把不再活跃的内存页换出 RAM，
+            // 保持低常驻（任务管理器「内存」列）。用户交互换入后再空闲同样触发；限频避免频繁调用。
+            const IDLE_TRIM_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+            const TRIM_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+            if rt.last_activity.elapsed() >= IDLE_TRIM_AFTER
+                && rt.last_trim.elapsed() >= TRIM_MIN_INTERVAL
+            {
+                rt.last_trim = std::time::Instant::now();
+                memory::trim();
+            }
+            // 无变化不重绘（消除 4s 心跳脉冲）
+            redraw = changed;
+        }
+        OverlayEvent::DpiChanged { dpi } => {
+            // 所在显示器 DPI 变化（Per-Monitor v2）：重算主题缩放（覆盖旧的缩放
+            // 字段），并重排栅栏——侧边栏停靠尺寸随缩放变化，普通栅栏夹回屏内。
+            let scale = dpi as f32 / 96.0;
+            if (scale - rt.theme.scale).abs() < 1e-4 {
+                // DPI 实际未变（PerMonitorV2 下窗口跨显示器移动也可能触发）：
+                // 无需重画。
+                redraw = false;
+            } else {
+                let mut t = Theme::default();
+                apply_theme_scale(&mut t, scale);
+                rt.theme = t;
+                if reanchor_fences(rt) {
+                    let _ = rt.store.save(&rt.desk);
+                }
+                tracing::info!(dpi, scale, "DPI 变化：主题已重缩放并重排栅栏");
+            }
+        }
+        OverlayEvent::DisplayChange => {
+            // 显示拓扑/分辨率变化：重查虚拟屏，重设 overlay 窗口（移动 + 缩放），
+            // 再把超屏栅栏夹回屏内——修复「拔掉显示器/改分辨率后栅栏找不到」。
+            let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+            let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+            let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) } as u32;
+            let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) } as u32;
+            let changed = (vw as f32 - rt.vw).abs() > 0.5
+                || (vh as f32 - rt.vh).abs() > 0.5
+                || vx as f32 != rt.origin.0
+                || vy as f32 != rt.origin.1;
+            if changed {
+                unsafe { (*rt.overlay_ptr).resize(vx, vy, vw, vh) };
+                rt.vw = vw as f32;
+                rt.vh = vh as f32;
+                rt.origin = (vx as f32, vy as f32);
+                if reanchor_fences(rt) {
+                    let _ = rt.store.save(&rt.desk);
+                }
+                tracing::info!(vx, vy, vw, vh, "显示拓扑变化：overlay 已重设并夹回栅栏");
+            }
+        }
+        OverlayEvent::IconDragMove {
+            from_fence,
+            icon,
+            to_fence,
+            to_index,
+            mx,
+            my,
+        } => {
+            // 图标拖动中：只记录「光标在哪、落点是谁」，**不动模型**（见 `IconDragState`）。
+            // 幽灵/插入位/目标高亮都在 build_scene 里按本帧场景几何算出来。
+            if rt.icon_drag.is_none() {
+                // 拖动起点：把「按下时的下标」解析成稳定 id，此后只认 id。
+                // 解析不出来（栅栏/成员已被后台同步移除）→ 不建立拖动状态，也就没有幽灵。
+                rt.icon_drag = rt
+                    .desk
+                    .fences
+                    .get(from_fence)
+                    .and_then(|f| f.icon_ids.get(icon))
+                    .cloned()
+                    .map(|id| IconDragState {
+                        from_fence,
+                        id,
+                        to_fence,
+                        to_index,
+                        cursor: (mx, my),
+                    });
+            } else if let Some(d) = rt.icon_drag.as_mut() {
+                d.to_fence = to_fence;
+                d.to_index = to_index;
+                d.cursor = (mx, my);
+            }
+            redraw = rt.icon_drag.is_some();
+        }
+        OverlayEvent::IconDragEnd {
+            to_fence, to_index, ..
+        } => {
+            // 拖动结束：唯一一次归属变更落点。被拖的是谁只认拖动状态里的 id
+            // （事件里的 `from_fence`/`icon` 是按下时的快照，可能已经过期）。
+            if let Some(d) = rt.icon_drag.take() {
+                apply_icon_drop(rt, &d.id, to_fence, to_index);
+            }
+            redraw = true;
+        }
+    }
+
+    // 重绘门控落点：无可见变化的事件直接返回 None（overlay 保持当前命中模型
+    // 与区域），省掉一次 build_scene + D2D 全量绘制 + commit。
+    // 占位框刚被清除时必须重绘一帧：命中模型携带窗口区域，不重建就不会收缩，
+    // 那块区域会继续吞掉桌面点击（清理与区域更新必须同一帧闭环）。
+    if reserved_changed {
+        redraw = true;
+    }
+    if !redraw {
+        return None;
+    }
+
+    // 重新排布 + 重绘 + 生成新命中模型（含区域）。
+    // 高度策略：`bounds.h == 0` 表示未手动缩放，每帧按内容自适应（增删应用自动长高）；
+    // 用户拖角标缩放后 `bounds.h` 变为具体值，高度固定，放不下的图标以 "+N" 提示。
+    let scene = build_scene(rt, Instant::now());
+    let ups = std::mem::take(&mut rt.pending_uploads);
+    let upload_refs: Vec<(u64, &IconData)> = ups.iter().map(|(id, d)| (*id, d)).collect();
+    if let Err(e) = rt.compositor.present(&scene, &upload_refs) {
+        tracing::warn!("重绘失败: {e}");
+    }
+    Some(hit_model_from(&rt.theme, &scene, &rt.desk))
+}
+
+/// 是否存在侧边栏 Dock 栅栏（决定 `CursorMove` 是否需要驱动重绘）。
+fn has_sidebar_dock(rt: &Runtime) -> bool {
+    rt.desk
+        .fences
+        .iter()
+        .any(|f| f.appearance.layout == FenceLayout::Sidebar)
+}
+
+/// 把默认主题按 DPI 缩放系数放大（`scale = 系统DPI/96`）。
+/// 所有 DIP 度量必须一起缩放，只放文字不放行距/间距正是「行列重叠」的根因。
+/// `Theme::default()` 是未缩放基准；DPI 变化时用本函数重新应用，覆盖旧缩放。
+fn apply_theme_scale(theme: &mut Theme, scale: f32) {
+    theme.scale = scale;
+    theme.controls = theme.controls.scale(scale);
+    theme.title.size *= scale;
+    theme.label.size *= scale;
+    theme.console_title.size *= scale;
+    theme.console_label.size *= scale;
+    theme.icon_size *= scale;
+    theme.icon_gap *= scale;
+    theme.icon_caption_gap *= scale;
+    theme.fence_padding *= scale;
+    theme.fence_corner_radius *= scale;
+    theme.fence_highlight_h *= scale;
+    theme.fence_shadow_h *= scale;
+    theme.title_padding_bottom *= scale;
+    theme.caption_max_width *= scale;
+    theme.list_row_gap *= scale;
+    theme.list_label_gap *= scale;
+}
+
+/// 栅栏当前实际高度（物理像素）：`bounds.h > 0` 为固定高度；否则（自动高度）用
+/// 最近一次布局渲染高度。碰撞检测与夹屏都必须按真实高度入算——自动高度栅栏
+/// `bounds.h == 0`，直接当 0 高会把碰撞检测和夹屏一起带偏。
+///
+/// 口径唯一真源是 `Fence::collision_height`（core），本函数只负责把 App 层的
+/// 旁路高度表 `last_layout_h` 喂进去。
+fn fence_height(rt: &Runtime, i: usize) -> f32 {
+    match rt.desk.fences.get(i) {
+        Some(f) => f.collision_height(rt.last_layout_h.get(i).copied().unwrap_or(0.0)),
+        None => 0.0,
+    }
+}
+
+/// 把矩形左上角夹回虚拟屏内（宽高不变；矩形宽高本身超出屏幕时贴左/上边缘）。
+fn clamp_into_screen(x: f32, y: f32, w: f32, h: f32, vw: f32, vh: f32) -> (f32, f32) {
+    (
+        x.clamp(0.0, (vw - w).max(0.0)),
+        y.clamp(0.0, (vh - h).max(0.0)),
+    )
+}
+
+/// DPI / 显示拓扑变化后的统一重排：
+/// - 侧边栏 Dock：尺寸随主题缩放，重新停靠到屏边（任务栏扣除）。
+/// - 普通栅栏：夹回虚拟屏内（真实高度参与，超屏即找回）。
+///
+/// 返回是否有变化（有变化才需要持久化）。启动恢复与 `WM_DPICHANGED`/
+/// `WM_DISPLAYCHANGE` 都走这里，保证同一套语义。
+fn reanchor_fences(rt: &mut Runtime) -> bool {
+    let mut changed = false;
+    for i in 0..rt.desk.fences.len() {
+        if rt.desk.fences[i].appearance.layout == FenceLayout::Sidebar {
+            let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
+            let b = sidebar_dock_rect(rt.theme.scale, &rt.desk.fences[i], &wa);
+            let b = clamp_sidebar_work_rect(b, wa, rt.desk.fences[i].appearance.sidebar_pos);
+            if rt.desk.fences[i].bounds != b {
+                rt.desk.fences[i].bounds = b;
+                changed = true;
+            }
+        } else {
+            let (nx, ny) = clamp_into_screen(
+                rt.desk.fences[i].bounds.x,
+                rt.desk.fences[i].bounds.y,
+                rt.desk.fences[i].bounds.w,
+                fence_height(rt, i),
+                rt.vw,
+                rt.vh,
+            );
+            if nx != rt.desk.fences[i].bounds.x || ny != rt.desk.fences[i].bounds.y {
+                rt.desk.fences[i].bounds.x = nx;
+                rt.desk.fences[i].bounds.y = ny;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// 把 overlay 窗口设为前台并聚焦（内联编辑接收键盘/IME 的前提）。
+fn focus_overlay(rt: &Runtime) {
+    // IME 关联只属于内联编辑会话，且必须在给焦点**之前**完成（反过来 IME 会按旧
+    // 状态激活）。非编辑路径（如热键录制）不关联——常态即「未关联」，普通点击/拖动
+    // 不再让系统向本窗口派发 WM_IME_*（2026-09-28 假死现场，见 docs/plans/11）。
+    if rt.edit.is_some() {
+        unsafe { (*rt.overlay_ptr).ime_attach() };
+    }
+    // 前台交给隐藏焦点代理，overlay 本体保持 WS_EX_NOACTIVATE（不把桌面壳层提到应用之上）。
+    unsafe { (*rt.overlay_ptr).focus_for_input() };
+}
+
+/// 内联编辑会话结束：解除 overlay 与 IME 上下文的关联（幂等）。
+///
+/// 与 `focus_overlay` 的关联严格成对，覆盖提交 / 取消 / 失焦 / 退出全部出口——
+/// 漏掉任何一个都会让窗口退化为「IME 常驻关联」，b 的目标随之失效。
+fn release_overlay_ime(rt: &Runtime) {
+    unsafe { (*rt.overlay_ptr).ime_detach() };
+}
+
+/// 内联编辑失焦/点击别处：重命名提交（资源管理器行为）。
+fn launch_fence_icon(rt: &mut Runtime, fence: usize, icon: usize) {
+    let target = rt
+        .desk
+        .fences
+        .get(fence)
+        .and_then(|f| f.icon_ids.get(icon))
+        .and_then(|id| rt.item_index.get(id))
+        .and_then(|&i| rt.items.get(i));
+    if let Some(item) = target {
+        tracing::info!(name = %item.display_name, "打开桌面图标");
+        // 虚拟壳项（回收站）走 PIDL 路线，失败必须留日志——静默失败在 UI 上
+        // 表现为「点了没反应」。
+        if let Err(e) = item.launch() {
+            tracing::warn!(name = %item.display_name, "打开失败: {e}");
+        }
+    }
+}
+
+/// 把栅栏内第 `icon` 个图标移出栅栏：新增项（非桌面枚举）直接删除，桌面图标移回未分组区。
+fn remove_fence_icon(rt: &mut Runtime, fence: usize, icon: usize) {
+    let id = rt
+        .desk
+        .fences
+        .get(fence)
+        .and_then(|f| f.icon_ids.get(icon))
+        .cloned();
+    if let Some(id) = id {
+        remove_fence_icon_by_id(rt, &id);
+    }
+    let _ = rt.store.save(&rt.desk);
+}
+
+/// 「移出栅栏」的意图裁决（**纯判定**，只读 `Desk`，便于单测）。
+///
+/// 虚拟壳项（`shell:` 前缀）单独一个变体：它们不在磁盘上、也没有「移出」语义——
+/// 回收站移出栅栏不等于从桌面消失，用户看到的是「点了没反应」。`remove_fence_icon`
+/// / `remove_selected` 都经 `remove_fence_icon_by_id`，天然覆盖两条入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoveFenceIntent {
+    /// 虚拟壳项：拒绝移出。
+    Reject,
+    /// 管理区新增项：删引用（必要时先删磁盘文件）。
+    DeleteAdded,
+    /// 真实桌面项：移回未分组区。
+    ToFree,
+}
+
+pub(crate) fn remove_fence_intent(desk: &Desk, id: &str) -> RemoveFenceIntent {
+    if winbosk_core::shell_items::is_virtual_id(id) {
+        return RemoveFenceIntent::Reject;
+    }
+    // `added` 缺失的 id（元数据已被清）按真实桌面项处理：最坏只是移回未分组区，
+    // 不会误删磁盘文件。
+    if desk.icons.get(id).map(|i| i.added).unwrap_or(false) {
+        RemoveFenceIntent::DeleteAdded
+    } else {
+        RemoveFenceIntent::ToFree
+    }
+}
+
+/// 按 id 移出栅栏：内部库项直接删除（引用，库文件由「删除」动作负责）；链接文件夹的
+/// 镜像项**删除文件**（栅栏即文件夹，否则同步会把图标加回来，用户已确认此语义）；
+/// 桌面图标移回未分组区。虚拟壳项直接拒绝（见 [`remove_fence_intent`]）。
+fn remove_fence_icon_by_id(rt: &mut Runtime, id: &String) {
+    match remove_fence_intent(&rt.desk, id) {
+        RemoveFenceIntent::Reject => {
+            tracing::info!(id, "虚拟壳项不支持移出栅栏");
+        }
+        RemoveFenceIntent::DeleteAdded => {
+            if rt
+                .desk
+                .icons
+                .get(id)
+                .and_then(|ic| ic.path.clone())
+                .map(|p| is_linked_path(rt, &p))
+                .unwrap_or(false)
+            {
+                delete_managed_file(rt, id);
+            }
+            remove_icon_entirely(rt, id);
+        }
+        RemoveFenceIntent::ToFree => {
+            rt.desk.move_icon(id, None);
+        }
+    }
+}
+
+/// 选中集合的 id 快照（先收集后操作，避免移除过程中下标/栅栏顺序变化）。
+fn selected_ids(rt: &Runtime) -> Vec<String> {
+    rt.selected
+        .iter()
+        .filter_map(|&(f, i)| {
+            rt.desk
+                .fences
+                .get(f)
+                .and_then(|f| f.icon_ids.get(i))
+                .cloned()
+        })
+        .collect()
+}
+
+/// 选中集合的路径快照（复制到剪贴板用）。
+fn selected_paths(rt: &Runtime) -> Vec<String> {
+    selected_ids(rt)
+        .iter()
+        .filter_map(|id| rt.desk.icons.get(id).and_then(|ic| ic.path.clone()))
+        .collect()
+}
+
+/// 打开全部选中项。
+fn open_selected(rt: &mut Runtime) {
+    let targets = rt.selected.clone();
+    for (f, i) in targets {
+        launch_fence_icon(rt, f, i);
+    }
+}
+
+/// 复制全部选中项到剪贴板（CF_HDROP，与资源管理器「复制」一致，可粘贴到任意文件夹）。
+fn copy_selected(rt: &mut Runtime) {
+    let paths = selected_paths(rt);
+    if paths.is_empty() {
+        return;
+    }
+    set_clipboard_paths(&paths);
+}
+
+/// 移出栅栏：选中项全部移出（内部库项删除引用，桌面图标移回未分组区）。
+fn remove_selected(rt: &mut Runtime) {
+    let ids = selected_ids(rt);
+    for id in &ids {
+        remove_fence_icon_by_id(rt, id);
+    }
+    let _ = rt.store.save(&rt.desk);
+}
+
+/// 删除选中项：管理区（内部库/链接文件夹）内的文件连同磁盘文件一并删除（文件夹删 →
+/// 栅栏项消失，与同步机制一致）；桌面图标移出栅栏（回未分组区，不碰源文件）。
+fn delete_selected(rt: &mut Runtime) {
+    let ids = selected_ids(rt);
+    for id in &ids {
+        let added = rt.desk.icons.get(id).map(|ic| ic.added).unwrap_or(false);
+        if added {
+            delete_managed_file(rt, id);
+            remove_icon_entirely(rt, id);
+        } else {
+            rt.desk.move_icon(id, None);
+        }
+    }
+    let _ = rt.store.save(&rt.desk);
+}
+
+/// 在桌面上寻找用于受纳回流图标的目标「桌面」栅栏
+pub(crate) fn resolve_desktop_fence(desk: &Desk, exclude_id: Option<u64>) -> Option<u64> {
+    // 1. 语义优先：标题为「桌面」且非排除项
+    if let Some(f) = desk
+        .fences
+        .iter()
+        .find(|f| exclude_id != Some(f.id) && f.title.as_deref() == Some("桌面"))
+    {
+        return Some(f.id);
+    }
+    // 2. 规则优先：未配置分类规则且未绑定外部目录的通用栅栏
+    if let Some(f) = desk
+        .fences
+        .iter()
+        .find(|f| exclude_id != Some(f.id) && f.rule.is_none() && f.storage_path.is_none())
+    {
+        return Some(f.id);
+    }
+    // 3. 兜底：任意其他存活的栅栏
+    desk.fences
+        .iter()
+        .find(|f| exclude_id != Some(f.id))
+        .map(|f| f.id)
+}
+
+/// 安全删除指定索引的栅栏，并将其中的图标完整归流至「桌面」栅栏
+pub(crate) fn delete_fence_and_reclaim_icons(rt: &mut Runtime, fence_idx: usize) {
+    let Some(fence) = rt.desk.fences.get(fence_idx) else {
+        return;
+    };
+    let deleting_id = fence.id;
+    let icon_ids = fence.icon_ids.clone();
+    let title = fence
+        .title
+        .clone()
+        .unwrap_or_else(|| "未命名栅栏".to_string());
+
+    // 删除不可撤销（栅栏配置随 `fences.remove` 消失并立即落盘），且入口之一是控制中心里
+    // 单击即触发的「移出栅栏」，故统一在此收口做二次确认。图标本身不会丢失：下方会无损
+    // 归流到「桌面」栅栏。确认弹窗是模态的，期间的再入事件由 `ReentryGuard` 丢弃。
+    if !confirm_delete_fence(rt, &title, icon_ids.len()) {
+        return;
+    }
+
+    // 1. 寻找或兜底创建受纳栅栏
+    let target_fid = match resolve_desktop_fence(&rt.desk, Some(deleting_id)) {
+        Some(fid) => fid,
+        None => {
+            // 桌面上所有栅栏均被删除，自动重置出一个标准默认「桌面」栅栏
+            let wa = work_area_rect(rt.origin.0, rt.origin.1, rt.vw, rt.vh);
+            let fallback_id = rt.desk.next_fence_id();
+            let fallback = Fence {
+                id: fallback_id,
+                title: Some("桌面".to_string()),
+                monitor_id: 0,
+                bounds: Rect::new(wa.x + 40.0, wa.y + 40.0, 320.0 * rt.theme.scale, 0.0),
+                state: FenceState::Expanded,
+                icon_ids: Vec::new(),
+                appearance: FenceAppearance::default(),
+                scroll: 0.0,
+                storage_path: None,
+                sidebar_collapsed: false,
+                collapsed: false,
+                rule: None,
+            };
+            rt.desk.fences.push(fallback);
+            rt.last_layout_h.push(0.0);
+            fallback_id
+        }
+    };
+
+    // 2. 将被删除栅栏内的图标无损移入目标栅栏
+    for id in icon_ids {
+        rt.desk.move_icon(&id, Some(target_fid));
+    }
+
+    // 3. 物理移除被删栅栏
+    if fence_idx < rt.desk.fences.len() {
+        rt.desk.fences.remove(fence_idx);
+    }
+
+    // 4. 旁路缓存对齐（Sidecar Invariant）
+    if fence_idx < rt.last_layout_h.len() {
+        rt.last_layout_h.remove(fence_idx);
+    }
+
+    // 5. 选中状态与滚动修正
+    rt.selected_fence =
+        adjust_selected_fence_on_delete(rt.selected_fence, fence_idx, rt.desk.fences.len());
+    ensure_selected_fence_visible(rt);
+
+    // 清空包含 (fence_idx, icon_idx) 的瞬态索引缓存，杜绝越界或指向错误图标
+    rt.selected.clear();
+    rt.hover = None;
+    rt.icon_hover = None;
+    rt.select_band = None;
+
+    // 6. 立即持久化
+    if let Err(e) = rt.store.save(&rt.desk) {
+        tracing::warn!("删除栅栏持久化失败: {e}");
+    }
+}
+
+/// 开始就地重命名（D2D 内联编辑，Explorer 风格）：Enter/失焦提交，Esc 取消。
+/// 编辑框与栅栏/标签同表面渲染，无黑边、无层级问题，IME 中文直接可用。
+fn fence_scroll_max(rt: &Runtime) -> f32 {
+    let n = rt.desk.fences.len();
+    if n <= CONSOLE_FENCE_MAX_ROWS {
+        return 0.0;
+    }
+    (n - CONSOLE_FENCE_MAX_ROWS) as f32 * CONSOLE_FENCE_ROW_H * rt.theme.scale
+}
+
+/// 一键切换桌面模式：栅栏 ⇄ 原始桌面。
+///
+/// 切到原始桌面：立即恢复真实图标，栅栏 0.22s 淡出（淡完不再接收命中）；
+/// 切回栅栏：隐藏真实图标，栅栏淡入。控制中心本身始终可见，保证随时能切回。
+fn toggle_desktop(rt: &mut Runtime) {
+    rt.desk.desktop_mode = !rt.desk.desktop_mode;
+    if rt.desk.desktop_mode {
+        rt.hierarchy.restore_icons();
+        // 桌面淡出：缓动固定为 ease_out_cubic（`fence_alpha` 内取值），此处仅对齐字段语义。
+        rt.desktop_fade = Some(PanelTween {
+            t0: Instant::now(),
+            dur: 0.22,
+            from: 1.0,
+            to: 0.0,
+            ease: PanelEase::CubicOut,
+        });
+    } else {
+        rt.hierarchy.hide_icons();
+        rt.desktop_fade = Some(PanelTween {
+            t0: Instant::now(),
+            dur: 0.22,
+            from: 0.0,
+            to: 1.0,
+            ease: PanelEase::CubicOut,
+        });
+    }
+    arm_anim_timer(rt);
+    if let Err(e) = rt.store.save(&rt.desk) {
+        tracing::warn!("桌面模式持久化失败: {e}");
+    }
+}
+
+/// 当前光标在虚拟屏幕的物理坐标（右键菜单弹出位置 / IME 窗口定位用）。
+fn cursor_screen() -> (i32, i32) {
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    (pt.x, pt.y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winbosk_core::config::AppSettings;
+    use winbosk_core::model::{
+        CategoryPreset, Fence, FenceAppearance, FenceRule, FenceState, Icon, ItemKind, Rect,
+    };
+
+    /// 占位框安全网的自检：白名单必须精确覆盖"拖动中会上报的事件"，其余一律清理。
+    ///
+    /// 这份断言的真正价值在于——将来新增 `OverlayEvent` 变体时若忘了考虑占位框，
+    /// 新变体会默认落入"清理"一侧（安全方向），而本测试会立刻暴露白名单的漂移。
+    #[test]
+    fn drag_hint_whitelist_covers_only_drag_events() {
+        // 拖动进行中会上报 → 保留
+        assert!(keeps_drag_hint(&OverlayEvent::FenceMove {
+            fence: 0,
+            pos: (1.0, 2.0)
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::FenceResize {
+            fence: 0,
+            zone: ResizeZone::BottomRight,
+            rect: (0.0, 0.0, 10.0, 10.0)
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::FenceScroll {
+            fence: 0,
+            delta: 120
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::KeyDown {
+            vk: 27,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            win: false,
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::AnimTick));
+        assert!(keeps_drag_hint(&OverlayEvent::SyncLibrary));
+        assert!(keeps_drag_hint(&OverlayEvent::CursorMove {
+            x: 1.0,
+            y: 2.0
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::CursorLeave));
+        assert!(keeps_drag_hint(&OverlayEvent::HoverEnter {
+            fence: 0,
+            icon: 0
+        }));
+        assert!(keeps_drag_hint(&OverlayEvent::HoverLeave));
+        // 图标拖动中：幽灵矩形同样并入窗口区域，必须留在白名单里
+        assert!(keeps_drag_hint(&OverlayEvent::IconDragMove {
+            from_fence: 0,
+            icon: 0,
+            to_fence: Some(1),
+            to_index: 0,
+            mx: 1.0,
+            my: 2.0,
+        }));
+
+        // 意味着拖动已结束 → 必须清理（否则占位框/幽灵滞留、区域继续吞桌面点击）
+        assert!(!keeps_drag_hint(&OverlayEvent::FenceDragEnd { fence: 0 }));
+        // `IconDragEnd` 是唯一「不在白名单、但仍要保留拖动状态到 match」的事件：
+        // 它只带落点，被拖的是谁（id）在拖动状态里，必须由 match 分支 `take()` 收口。
+        assert!(!keeps_drag_hint(&OverlayEvent::IconDragEnd {
+            from_fence: 0,
+            icon: 0,
+            to_fence: Some(1),
+            to_index: 0,
+        }));
+        assert!(carries_icon_drag_state(&OverlayEvent::IconDragEnd {
+            from_fence: 0,
+            icon: 0,
+            to_fence: Some(1),
+            to_index: 0,
+        }));
+        // 白名单里的两个拖动事件都**不是**结束事件（否则会被提前 take 掉）
+        assert!(!carries_icon_drag_state(&OverlayEvent::IconDragMove {
+            from_fence: 0,
+            icon: 0,
+            to_fence: None,
+            to_index: 0,
+            mx: 0.0,
+            my: 0.0,
+        }));
+        assert!(!carries_icon_drag_state(&OverlayEvent::FenceMove {
+            fence: 0,
+            pos: (0.0, 0.0)
+        }));
+        assert!(!keeps_drag_hint(&OverlayEvent::ContextMenu {
+            fence: 0,
+            icon: None,
+            pos: (0.0, 0.0)
+        }));
+        assert!(!keeps_drag_hint(&OverlayEvent::FenceCollapseToggle {
+            fence: 0
+        }));
+        assert!(!keeps_drag_hint(&OverlayEvent::IconClicked {
+            fence: 0,
+            icon: 0,
+            ctrl: false
+        }));
+        assert!(!keeps_drag_hint(&OverlayEvent::TrayMenu));
+        // 「栅栏前置」是键盘热键：与 `KeyDown` 同属「拖动中可能发生、但不代表拖动结束」
+        // 的一类，必须留在白名单里（否则拖动中按它会把拖动会话与占位框一起清掉）
+        assert!(keeps_drag_hint(&OverlayEvent::FencesFront));
+        assert!(!keeps_drag_hint(&OverlayEvent::DisplayChange));
+        assert!(!keeps_drag_hint(&OverlayEvent::OverlayFocusLost));
+        assert!(!keeps_drag_hint(&OverlayEvent::FilesDropped {
+            fence: 0,
+            paths: vec![],
+        }));
+    }
+
+    fn make_test_fence(id: u64, title: &str) -> Fence {
+        Fence {
+            id,
+            title: Some(title.to_string()),
+            monitor_id: 0,
+            bounds: Rect::default(),
+            state: FenceState::Expanded,
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance::default(),
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed: false,
+        }
+    }
+
+    /// 验证规则预设切换至「全部」（preset 为 None）时保留 rule 对象与自定义后缀配置，
+    /// 杜绝之前因直接置 f.rule = None 导致规则失效的缺陷。
+    #[test]
+    fn test_rule_preset_none_preserves_custom_extensions() {
+        let mut fence = make_test_fence(1, "测试栅栏");
+        let mut initial_rule = FenceRule::default();
+        initial_rule.enabled = true;
+        initial_rule.preset = Some(CategoryPreset::Apps);
+        initial_rule.custom_extensions = vec!["bat".to_string()];
+        fence.rule = Some(initial_rule);
+
+        // 模拟用户在控制面板中点击「全部」（None）
+        let preset: Option<CategoryPreset> = None;
+        let mut rule = fence.rule.clone().unwrap_or_default();
+        rule.enabled = true;
+        rule.preset = preset;
+        fence.rule = Some(rule);
+
+        assert!(fence.rule.is_some());
+        let rule = fence.rule.as_ref().unwrap();
+        assert!(rule.enabled);
+        assert_eq!(rule.preset, None);
+        assert_eq!(rule.custom_extensions, vec!["bat".to_string()]);
+        assert!(rule.is_effective());
+    }
+
+    /// 虚拟壳项「移出栅栏」必须被拒绝：`remove_fence_icon` / `remove_selected` 都经
+    /// `remove_fence_icon_by_id`，天然覆盖两条入口。同时不得过度拒绝真实桌面项
+    /// / 管理区新增项——那会把用户 desktop.ini 之外的合法移出行为打挂。
+    #[test]
+    fn remove_fence_intent_rejects_virtual_only() {
+        let mut desk = Desk::new(AppSettings::default());
+        // 虚拟壳项（回收站）：added=true 但必须拒
+        let mut bin = make_icon_for_intent("shell:回收站-645ff040", true);
+        bin.path = None; // H4：虚拟项无路径
+        desk.icons.insert(bin.id.clone(), bin);
+        // 真实桌面项
+        let native = make_icon_for_intent(r"c:\users\me\desktop\a.txt", false);
+        desk.icons.insert(native.id.clone(), native);
+        // 管理区新增项
+        let added = make_icon_for_intent(r"c:\app\data\library\copy.txt", true);
+        desk.icons.insert(added.id.clone(), added);
+
+        assert_eq!(
+            remove_fence_intent(&desk, "shell:回收站-645ff040"),
+            RemoveFenceIntent::Reject,
+            "虚拟壳项不得被移出（即使 added=true）"
+        );
+        assert_eq!(
+            remove_fence_intent(&desk, r"c:\users\me\desktop\a.txt"),
+            RemoveFenceIntent::ToFree
+        );
+        assert_eq!(
+            remove_fence_intent(&desk, r"c:\app\data\library\copy.txt"),
+            RemoveFenceIntent::DeleteAdded
+        );
+        // 元数据缺失的 id：不得误伤，也不得误删盘上文件
+        assert_eq!(
+            remove_fence_intent(&desk, "ghost-id"),
+            RemoveFenceIntent::ToFree
+        );
+    }
+
+    fn make_icon_for_intent(id: &str, added: bool) -> Icon {
+        let mut ic = Icon::new(id.to_ascii_lowercase(), id.into(), ItemKind::Unknown);
+        ic.path = Some(id.to_string());
+        ic.added = added;
+        ic
+    }
+
+    /// 同步前后 `free_icons` / 池 / 成员不被误改的边界：虚拟 id 前缀判定只认 `shell:`。
+    #[test]
+    fn virtual_id_prefix_does_not_swallow_real_paths() {
+        // 普通路径（含 "shell" 字样）不是虚拟 id
+        assert!(!winbosk_core::shell_items::is_virtual_id(
+            r"c:\tools\shell\run.exe"
+        ));
+        assert!(!winbosk_core::shell_items::is_virtual_id(r"c:\a\shell.lnk"));
+        assert!(winbosk_core::shell_items::is_virtual_id(
+            "shell:回收站-645ff040"
+        ));
+    }
+
+    /// 验证跨栅栏规则冲突检测：
+    /// - 桌面源栅栏中的匹配项与未分组池中的匹配项归入本地无冲突列表；
+    /// - 其他普通栅栏中持有的匹配项归入跨栅栏冲突列表，并按来源栅栏分组。
+    #[test]
+    fn test_detect_rule_candidates_identifies_cross_fence_conflicts() {
+        let mut desk = Desk::new(AppSettings::default());
+
+        // 目标栅栏（Fence 10）
+        let target_fid = 10;
+        let target_fence = make_test_fence(target_fid, "目标栅栏");
+        desk.fences.push(target_fence);
+
+        // 桌面源栅栏（Fence 1）
+        let mut desktop_fence = make_test_fence(1, "桌面");
+        desktop_fence.storage_path = Some("C:\\Users\\Test\\Desktop".to_string());
+        desktop_fence.icon_ids.push("desktop_bat".to_string());
+        desk.fences.push(desktop_fence);
+
+        // 冲突普通栅栏（Fence 2，例如「常用应用」）
+        let mut apps_fence = make_test_fence(2, "常用应用");
+        apps_fence.icon_ids.push("apps_bat".to_string());
+        apps_fence.icon_ids.push("apps_exe".to_string());
+        desk.fences.push(apps_fence);
+
+        // 另一个无冲突普通栅栏（Fence 3）
+        let mut docs_fence = make_test_fence(3, "文档栅栏");
+        docs_fence.icon_ids.push("docs_txt".to_string());
+        desk.fences.push(docs_fence);
+
+        // 未分组池 free_icons
+        desk.free_icons.push("free_bat".to_string());
+
+        // 注册所有图标元数据
+        let make_icon = |id: &str, name: &str, path: &str, kind: ItemKind| {
+            let mut ic = Icon::new(id.to_string(), name.to_string(), kind);
+            ic.path = Some(path.to_string());
+            ic
+        };
+
+        desk.icons.insert(
+            "desktop_bat".to_string(),
+            make_icon(
+                "desktop_bat",
+                "reboot.bat",
+                "C:\\Users\\Test\\Desktop\\reboot.bat",
+                ItemKind::App,
+            ),
+        );
+        desk.icons.insert(
+            "apps_bat".to_string(),
+            make_icon(
+                "apps_bat",
+                "run.bat",
+                "C:\\Users\\Test\\Desktop\\run.bat",
+                ItemKind::App,
+            ),
+        );
+        desk.icons.insert(
+            "apps_exe".to_string(),
+            make_icon(
+                "apps_exe",
+                "tool.exe",
+                "C:\\Users\\Test\\Desktop\\tool.exe",
+                ItemKind::App,
+            ),
+        );
+        desk.icons.insert(
+            "docs_txt".to_string(),
+            make_icon(
+                "docs_txt",
+                "note.txt",
+                "C:\\Users\\Test\\Desktop\\note.txt",
+                ItemKind::Doc,
+            ),
+        );
+        desk.icons.insert(
+            "free_bat".to_string(),
+            make_icon(
+                "free_bat",
+                "build.bat",
+                "C:\\Users\\Test\\Desktop\\build.bat",
+                ItemKind::App,
+            ),
+        );
+
+        // 规则：启用，无 preset（全部），自定义包含 bat
+        let mut rule = FenceRule::default();
+        rule.enabled = true;
+        rule.preset = None;
+        rule.custom_extensions = vec!["bat".to_string()];
+
+        let (local_matches, conflicts) =
+            detect_rule_candidates(&desk, target_fid, &rule, Some("C:\\Users\\Test\\Desktop"));
+
+        // 本地无冲突项应包含桌面源栅栏中的 desktop_bat 与未分组的 free_bat
+        assert_eq!(local_matches.len(), 2);
+        assert!(local_matches.contains(&"desktop_bat".to_string()));
+        assert!(local_matches.contains(&"free_bat".to_string()));
+
+        // 冲突项应且仅应包含来自 Fence 2 的 apps_bat，apps_exe 和 docs_txt 不应出现
+        assert_eq!(conflicts.len(), 1);
+        let conflict = &conflicts[0];
+        assert_eq!(conflict.fence_id, 2);
+        assert_eq!(conflict.fence_title, "常用应用");
+        assert_eq!(conflict.icon_ids, vec!["apps_bat".to_string()]);
+        assert_eq!(conflict.icon_names, vec!["run.bat".to_string()]);
+    }
+}
