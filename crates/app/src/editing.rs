@@ -13,7 +13,7 @@ pub(crate) enum EditTarget {
 }
 
 /// D2D 内联文本编辑：文本、光标与 IME 合成状态全在 App 层，绘制与输入同表面，
-/// 彻底摆脱 HWND 弹出框的层级/焦点/对齐问题。支持单行（待办/重命名）与多行（便签）。
+/// 彻底摆脱 HWND 弹出框的层级/焦点/对齐问题。支持单行（重命名/规则输入）与多行（便签）。
 #[derive(Debug)]
 pub(crate) struct InlineEdit {
     pub(crate) target: EditTarget,
@@ -27,6 +27,10 @@ pub(crate) struct InlineEdit {
     /// 空文本时的占位提示。
     pub(crate) placeholder: String,
     pub(crate) single_line: bool,
+    /// **视觉折行**的估算宽度预算：`Some` = 宽度有界、超宽内容换行显示（就地重命名框，
+    /// 见 [`rename_edit_rect`]）；`None` = 不折行（规则输入框 / 便签按逻辑行绘制）。
+    /// 与绘制层 `SceneEdit::wrap_w` 同值，两边必须用同一个 `wrap_visual_lines` 折行。
+    pub(crate) wrap_w: Option<f32>,
     /// 是否聚焦（绘制光标/聚焦描边）。
     pub(crate) focused: bool,
     /// IME 合成状态。
@@ -39,6 +43,89 @@ pub(crate) struct InlineEdit {
 impl InlineEdit {
     fn current_line(&self) -> &str {
         self.lines.get(self.line).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// 当前行**实际绘制**的文本：光标处插入 IME 合成串。拼接顺序与
+    /// `draw_inline_edit` 逐字一致——编辑框宽度与折行都必须按「真正画出去的那串」算，
+    /// 否则合成中的候选串会被框裁掉或与光标错位。
+    fn display_text(&self) -> String {
+        let line = self.current_line();
+        let before: String = line.chars().take(self.col).collect();
+        let after: String = line.chars().skip(self.col).collect();
+        format!("{before}{}{after}", self.comp)
+    }
+
+    /// 光标在**显示串**（`display_text`）里的字符下标：合成串插在光标处，光标跟在它后面。
+    fn caret_index(&self) -> usize {
+        self.col + self.comp.chars().count()
+    }
+
+    /// 当前行的视觉行划分（折行口径与绘制层共用 `winbosk_core::text`）。
+    fn visual_lines(&self, font_size: f32) -> Vec<winbosk_core::text::VisualLine> {
+        let text = self.display_text();
+        match self.wrap_w {
+            Some(budget) => winbosk_core::text::wrap_visual_lines(&text, budget, font_size),
+            None => vec![winbosk_core::text::VisualLine {
+                start: 0,
+                end: text.chars().count(),
+            }],
+        }
+    }
+
+    /// 光标所在的**全局视觉行序号**：光标之前所有逻辑行的视觉行数之和 + 本行内的视觉行下标。
+    ///
+    /// 不能简写成 `line + vi`：折行（`wrap_w = Some`）与多逻辑行（便签）同时成立时，
+    /// 前面的逻辑行也可能各自折成多行。必须与 `draw.rs` 逐视觉行排布**同一个行序号口径**，
+    /// 否则 IME 候选窗会落在别的行上。
+    fn caret_row(&self, font_size: f32) -> usize {
+        let mut row = 0usize;
+        for (i, line) in self.lines.iter().enumerate() {
+            if i == self.line {
+                return row
+                    + winbosk_core::text::visual_line_of(
+                        &self.visual_lines(font_size),
+                        self.caret_index(),
+                    );
+            }
+            row += match self.wrap_w {
+                // 非光标行不含合成串，直接按原文折行
+                Some(budget) => {
+                    winbosk_core::text::wrap_visual_lines(line, budget, font_size).len()
+                }
+                None => 1,
+            };
+        }
+        row
+    }
+
+    /// 折行框内按**视觉行**上下移动光标（保持行内字符偏移，落点越界则贴行尾）。
+    ///
+    /// 仅用于「单逻辑行 + 折行」的重命名框（多行便签走 `cursor_up_down`）。
+    /// 合成期间不介入：合成串的定位归 IME，抢方向键会让候选选择与光标互相打架。
+    fn move_visual_line(&mut self, font_size: f32, down: bool) {
+        if self.composing {
+            return;
+        }
+        let lines = self.visual_lines(font_size);
+        if lines.len() <= 1 {
+            return;
+        }
+        let cur = winbosk_core::text::visual_line_of(&lines, self.caret_index());
+        let target = if down { cur + 1 } else { cur.saturating_sub(1) };
+        if target == cur || target >= lines.len() {
+            return;
+        }
+        let offset = self.caret_index() - lines[cur].start;
+        let want = (lines[target].start + offset).min(lines[target].end);
+        // 显示串下标 → 逻辑列（与 `edit_click` 同一折算：合成串区间内一律回落到合成起点）
+        let (logical, comp_len) = (self.col, self.comp.chars().count());
+        self.col = if want <= logical {
+            want
+        } else if want <= logical + comp_len {
+            logical
+        } else {
+            want - comp_len
+        };
     }
 
     /// 在光标处插入一个字符。
@@ -315,6 +402,8 @@ pub(crate) fn open_rule_input(rt: &mut Runtime, target: EditTarget, placeholder:
         col: 0,
         placeholder: placeholder.to_string(),
         single_line: true,
+        // 规则输入框宽度由控制台布局逐帧回写，不折行（见 `rename_edit_rect` 的 Non-Goal）
+        wrap_w: None,
         focused: true,
         composing: false,
         comp: String::new(),
@@ -377,14 +466,25 @@ pub(crate) fn edit_key(rt: &mut Runtime, vk: u32, ctrl: bool) {
             caret_moved = true;
         }
         v if v == VK_UP.0 as u32 => {
+            let font = rt.theme.label.size;
             if let Some(e) = rt.edit.as_mut() {
-                e.cursor_up_down(false);
+                if e.single_line && e.wrap_w.is_some() {
+                    // 折行框：上下 = 视觉行；多行便签与规则输入走逻辑行
+                    e.move_visual_line(font, false);
+                } else {
+                    e.cursor_up_down(false);
+                }
             }
             caret_moved = true;
         }
         v if v == VK_DOWN.0 as u32 => {
+            let font = rt.theme.label.size;
             if let Some(e) = rt.edit.as_mut() {
-                e.cursor_up_down(true);
+                if e.single_line && e.wrap_w.is_some() {
+                    e.move_visual_line(font, true);
+                } else {
+                    e.cursor_up_down(true);
+                }
             }
             caret_moved = true;
         }
@@ -526,84 +626,160 @@ pub(crate) fn position_ime_window(rt: &Runtime) {
 }
 
 /// 内联编辑光标屏幕坐标（IME 窗口定位用；物理像素）。
+///
+/// 三个分支对应三种排布，必须与 `draw.rs::draw_inline_edit` 逐像素同源：
+/// - 多行便签：按逻辑行（不折行）；
+/// - 单视觉行的重命名/规则输入：整框垂直居中；
+/// - 折成多行的重命名：光标所在视觉行自上而下排布（`EDIT_LINE_H_MULT` 行距）。
 pub(crate) fn edit_caret_point(rt: &Runtime) -> (i32, i32) {
     let Some(edit) = &rt.edit else {
         return (0, 0);
     };
     let font = rt.theme.label.size;
-    let before: String = edit.current_line().chars().take(edit.col).collect();
-    let w = label_width(&before, font) + label_width(&edit.comp, font);
-    let x = edit.rect.x + rt.theme.controls.input_pad_x + w;
-    let y = if edit.single_line {
+    let pad_y = rt.theme.controls.input_pad_y;
+    let line_h = font * winbosk_render::EDIT_LINE_H_MULT;
+    let text = edit.display_text();
+    let caret = edit.caret_index();
+    let lines = edit.visual_lines(font);
+    let vi = winbosk_core::text::visual_line_of(&lines, caret);
+    let before: String = text.chars().take(caret).skip(lines[vi].start).collect();
+    let x = edit.rect.x + rt.theme.controls.input_pad_x + label_width(&before, font);
+    let y = if !edit.single_line {
+        // 多行便签：按**全局视觉行序号**（前面各逻辑行的视觉行数之和 + 本行内下标）
+        edit.rect.y + pad_y + edit.caret_row(font) as f32 * line_h + font * 0.8
+    } else if lines.len() <= 1 {
         edit.rect.y + edit.rect.h / 2.0
     } else {
-        edit.rect.y + rt.theme.controls.input_pad_y + edit.line as f32 * (font * 1.5) + font * 0.8
+        edit.rect.y + pad_y + vi as f32 * line_h + font * 0.8
     };
     (x as i32, y as i32)
 }
 
 /// 鼠标点在编辑框内（x 为虚拟屏幕物理坐标）：把光标定位到对应字符。
-/// 与 `edit_caret_point` 同口径（文本左缘 = rect.x + input_pad_x，逐字累计宽度），
+/// 与 `edit_caret_point` 同口径（**文本左缘 = rect.x + input_pad_x**，逐字累计宽度），
 /// 半字宽以上的点击进下一格，与常见编辑器行为一致。
-pub(crate) fn edit_click(rt: &mut Runtime, x: f32) {
+pub(crate) fn edit_click(rt: &mut Runtime, x: f32, y: f32) {
     let font = rt.theme.label.size;
+    let pad_x = rt.theme.controls.input_pad_x;
+    let pad_y = rt.theme.controls.input_pad_y;
+    let line_h = font * winbosk_render::EDIT_LINE_H_MULT;
     let Some(edit) = rt.edit.as_mut() else {
         return;
     };
     if !edit.single_line {
-        return; // 多行定位需按 y 判行，重命名不用；待办编辑暂保持键盘定位
+        return; // 多行便签仍走键盘定位（本轮不涉及）
     }
-    let text_left = edit.rect.x + rt.theme.controls.input_pad_x;
+    // 折行框必须按 y 先定行：只给 x 无法判断点在第几行（`OverlayEvent::EditCaret` 两个坐标都带）
+    let (rect, text, col) = (edit.rect, edit.display_text(), edit.col);
+    let visual = edit.visual_lines(font);
+    let comp_len = edit.comp.chars().count();
+    edit.col = click_column_wrapped(
+        x, y, rect, &text, &visual, col, comp_len, font, pad_x, pad_y, line_h,
+    );
+    position_ime_window(rt);
+}
+
+/// 折行框内的点击定位（纯内核，`edit_click` 的可测部分）：`(x, y)` → 逻辑光标列。
+///
+/// - `y` 决定视觉行（单视觉行恒第 0 行；落在行间/框外按最近行处理，绝不越界）；
+/// - `x` 在该视觉行内按 [`click_column`] 定位（文本左缘仍是 `rect.x + pad_x`）；
+/// - 显示串下标 → 逻辑列：落在 IME 合成串区间内一律折算回合成起点。
+#[allow(clippy::too_many_arguments)]
+fn click_column_wrapped(
+    x: f32,
+    y: f32,
+    rect: RectF,
+    text: &str,
+    visual: &[winbosk_core::text::VisualLine],
+    col: usize,
+    comp_len: usize,
+    font: f32,
+    pad_x: f32,
+    pad_y: f32,
+    line_h: f32,
+) -> usize {
+    if visual.is_empty() {
+        return col;
+    }
+    let vi = if visual.len() > 1 {
+        let rel_y = (y - (rect.y + pad_y)).max(0.0);
+        ((rel_y / line_h) as usize).min(visual.len() - 1)
+    } else {
+        0
+    };
+    let vl = visual[vi];
+    let seg: String = text
+        .chars()
+        .skip(vl.start)
+        .take(vl.end - vl.start)
+        .collect();
+    let display_idx = vl.start + click_column(x, rect.x + pad_x, &seg, font);
+    if display_idx <= col {
+        display_idx
+    } else if display_idx <= col + comp_len {
+        col
+    } else {
+        display_idx - comp_len
+    }
+}
+
+/// 点击位置 → 光标列（纯函数，`edit_click` 的可测内核）。
+///
+/// **对齐契约**：编辑文本恒左对齐于 `text_left = rect.x + input_pad_x`，绘制
+/// （`draw.rs::draw_inline_edit` 的 `lr.left`）、光标（同处 `caret_x`）、IME 窗口
+/// （`edit_caret_point`）与这里**共用同一个左缘**。`rect` 只描述「框」，任何生长
+/// 方式都不得再引入第二份文本原点——否则「看到第 N 个字、点到第 M 个字」。
+pub(crate) fn click_column(x: f32, text_left: f32, line: &str, font_size: f32) -> usize {
     let rel = (x - text_left).max(0.0);
-    let line = edit.current_line().to_string();
     let mut col = 0;
     let mut acc = 0.0;
     for (idx, c) in line.char_indices() {
-        let w = label_width(&line[..idx + c.len_utf8()], font) - label_width(&line[..idx], font);
+        let w = label_width(&line[..idx + c.len_utf8()], font_size)
+            - label_width(&line[..idx], font_size);
         if acc + w / 2.0 >= rel {
             break;
         }
         acc += w;
         col += 1;
     }
-    edit.col = col;
-    position_ime_window(rt);
+    col
 }
 
 /// 双击/右键打开：按显式成员列表反查并启动。
 pub(crate) fn start_inplace_rename(rt: &mut Runtime, target: EditTarget) {
-    // 初始文本 + 定位矩形（物理像素）
-    let (current, rect) = match target {
-        EditTarget::Item { fence, icon } => {
-            let Some(r) = item_label_rect(rt, fence, icon) else {
+    // 初始文本
+    let current = match target {
+        EditTarget::Item { fence, icon } => match item_name(rt, fence, icon) {
+            Some(name) => name,
+            None => {
                 tracing::warn!(fence, icon, "无法定位图标标签，跳过就地改名");
                 return;
-            };
-            let Some(name) = item_name(rt, fence, icon) else {
-                return;
-            };
-            (name, r)
-        }
-        EditTarget::FenceTitle { fence } => {
-            let Some(name) = rt.desk.fences.get(fence).map(|f| {
-                f.title
-                    .clone()
-                    .unwrap_or_else(|| format!("栅栏 {}", fence + 1))
-            }) else {
-                return;
-            };
-            (name, fence_title_rect(rt, fence))
-        }
+            }
+        },
+        EditTarget::FenceTitle { fence } => match rt.desk.fences.get(fence) {
+            Some(f) => f
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("栅栏 {}", fence + 1)),
+            None => return,
+        },
         _ => return,
+    };
+    // 定位矩形（物理像素）：与逐帧刷新同一真源 `rename_edit_rect`——打开的那一刻就按
+    // 当前文本算好宽/高与折行预算，整个名字（含扩展名）完整落在输入框内，与 Windows 一致。
+    let Some(bbox) = rename_edit_rect(rt, target, &current) else {
+        tracing::warn!(target = ?target, "无法定位编辑框，跳过就地改名");
+        return;
     };
     rt.edit = Some(InlineEdit {
         target,
-        rect,
+        rect: bbox.rect,
         lines: vec![current],
         line: 0,
         col: 0,
         placeholder: String::new(),
         single_line: true,
+        wrap_w: Some(bbox.wrap_w),
         focused: true,
         composing: false,
         comp: String::new(),
@@ -831,7 +1007,8 @@ pub(crate) fn item_label_rect(rt: &Runtime, fence: usize, icon: usize) -> Option
             // 编辑框高度 = 文本行高 + 上下剪裁余量（同 Grid：见 Grid 分支注释）。
             let edit_h = label_h + rt.theme.controls.input_pad_y * 2.0;
             let text = item_name(rt, fence, icon).unwrap_or_default();
-            let w = (crate::scene::estimate_text_width(&text, rt.theme.label.size) * 1.2
+            let w = (crate::scene::estimate_text_width(&text, rt.theme.label.size)
+                * crate::scene::TEXT_WIDTH_SLACK
                 + rt.theme.controls.input_pad_x * 2.0)
                 .max(label_h);
             let gap_to_icon = 10.0 * s;
@@ -860,6 +1037,298 @@ pub(crate) fn item_label_rect(rt: &Runtime, fence: usize, icon: usize) -> Option
             })
         }
     }
+}
+
+/// 重命名框与虚拟屏幕边缘的最小留白（物理像素）。
+const RENAME_SCREEN_MARGIN: f32 = 4.0;
+
+/// 折行预算相对框内可用宽的余量：折行逐字宽度已取**上界**（[`winbosk_core::text::char_upper_unit`]），
+/// 这里只留 5% 吸收浮点累计与抗锯齿，不再乘 [`crate::scene::TEXT_WIDTH_SLACK`]（那是平均口径
+/// 的补偿，两档叠乘会让折行过早、框无谓变高）。
+const WRAP_WIDTH_SLACK: f32 = 1.05;
+
+/// 就地重命名框的一次求值结果：矩形 + 折行预算。
+///
+/// 「框」与「折行」必须同时求出并一起回写（[`refresh_rename_rect`]）：绘制层要用同一个
+/// `wrap_w` 把文本折成同样的行，App 层要用它算光标/点击/IME 位置。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RenameBox {
+    pub(crate) rect: RectF,
+    /// 视觉折行的估算宽度预算（与 [`rename_width_for`] 同口径的估算宽度）。
+    pub(crate) wrap_w: f32,
+    /// 折出的视觉行数（≥1；测试与日志用，绘制层自行按同一函数重算）。
+    pub(crate) lines: usize,
+}
+
+/// 折行/定宽所需的度量（物理像素，与绘制层同口径）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EditMetrics {
+    pub(crate) font: f32,
+    pub(crate) pad_x: f32,
+    pub(crate) pad_y: f32,
+}
+
+/// 就地重命名编辑框几何：锚点（图标标签矩形 / 栅栏标题矩形）不变，
+/// **框宽以卡片为上限生长，装不下的部分改走折行**。
+///
+/// 两轮用户实测把口径逼成了现在这条（缺一不可）：
+/// 1. 框宽必须随文本生长 —— 原来的框宽就是一个格宽，长文件名被静默裁掉；
+/// 2. 生长必须有上限 —— 无界生长会让框越过栅栏卡片（截图实测：第 0 列的居中生长
+///    把左半边推到卡片外，右侧同样会盖住邻栏）；
+/// 3. 超上限的内容 **换行显示**，而不是裁掉、也不是缩字号/横向滚动 ——
+///    框高随视觉行数增长（`font × EDIT_LINE_H_MULT` 每行）。
+///
+/// 宽度上限 = 卡片横向内缘（侧边栏挂在 dock 之外，上限为虚拟屏幕）。**折行预算** =
+/// 框内可用宽 ÷ [`TEXT_WIDTH_SLACK`]：估算口径偏乐观，按可用宽直接折行仍可能画出框外。
+///
+/// 生长/定位方向：网格以图标中心对称（标签本就居中于图标下方），侧边栏按停靠边反向
+/// （右侧停靠向左长），其余（列表 / 栅栏标题 / 左停靠侧边栏）自左缘向右长。
+///
+/// 非重命名目标（规则输入框）返回 `None`：其矩形由控制台布局逐帧回写，不参与生长。
+pub(crate) fn rename_edit_rect(rt: &Runtime, target: EditTarget, text: &str) -> Option<RenameBox> {
+    let metrics = EditMetrics {
+        font: rt.theme.label.size,
+        pad_x: pad_x(rt),
+        pad_y: rt.theme.controls.input_pad_y,
+    };
+    match target {
+        EditTarget::Item { fence, icon } => {
+            let f = rt.desk.fences.get(fence)?;
+            f.icon_ids.get(icon)?;
+            let base = item_label_rect(rt, fence, icon)?;
+            let dir = grow_dir_for(f.appearance.layout, f.appearance.sidebar_pos);
+            // 侧边栏的框按设计挂在 dock **之外**（与工具提示同口径，见 `item_label_rect`），
+            // 既不受卡片横向约束、也不受纵向约束（它不在卡片里）。
+            let sidebar = f.appearance.layout == FenceLayout::Sidebar;
+            let pad = f.appearance.padding * rt.theme.scale;
+            let hspan = (!sidebar)
+                .then(|| fence_inner_span(rt, fence, pad))
+                .flatten();
+            let vspan = (!sidebar)
+                .then(|| fence_inner_vspan(rt, fence, pad))
+                .flatten();
+            Some(rename_box_geometry(
+                base,
+                dir,
+                text,
+                metrics,
+                hspan,
+                vspan,
+                (rt.vw, rt.vh),
+            ))
+        }
+        EditTarget::FenceTitle { fence } => {
+            // `fence_title_rect` 直接下标取栅栏：越界必须先在这里挡住（返回 None 而非 panic）
+            rt.desk.fences.get(fence)?;
+            let base = fence_title_rect(rt, fence);
+            // 内缩与 `fence_title_rect` 同源（theme.fence_padding）：装得下时原样不动
+            let hspan = fence_inner_span(rt, fence, rt.theme.fence_padding)?;
+            let vspan = fence_inner_vspan(rt, fence, rt.theme.fence_padding);
+            Some(rename_box_geometry(
+                base,
+                RenameGrow::Right,
+                text,
+                metrics,
+                Some(hspan),
+                vspan,
+                (rt.vw, rt.vh),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// 纯几何流水线：锚点 → 定宽（卡片上限内）→ 折行 → 框高随行数增长 → 钳制。
+///
+/// 抽成纯函数是为了让「用户实测的两条路径」能脱离 `Runtime` 单测：
+/// 长名字在第 0 列不再越出卡片（横向钳制），且**整段内容仍完整可见**（折行而非裁字）。
+#[allow(clippy::too_many_arguments)]
+fn rename_box_geometry(
+    base: RectF,
+    dir: RenameGrow,
+    text: &str,
+    metrics: EditMetrics,
+    fence_span: Option<(f32, f32)>,
+    fence_vspan: Option<(f32, f32)>,
+    view: (f32, f32),
+) -> RenameBox {
+    let (vw, vh) = view;
+    let need = rename_width_for(text, metrics.font, metrics.pad_x);
+    // 宽度上限：卡片横向内缘 ∩ 屏幕可用宽（无卡片约束时 = 屏幕可用宽）。
+    // **必须先与屏幕取交**：钳制顺序里屏幕那道在最前，若 cap 超过屏幕可用宽，
+    // 后面的 `rect.w.min(..)` 会在**折行预算算完之后**把框改窄，
+    // 于是「按旧宽折的行」放不进「变窄后的框」→ 又出现裁字。
+    let screen_cap = (vw - RENAME_SCREEN_MARGIN * 2.0).max(1.0);
+    let cap = match fence_span {
+        Some((l, r)) => (r - l).max(1.0).min(screen_cap),
+        None => screen_cap,
+    };
+    let w = rename_box_width(need, base.w, cap);
+    let mut rect = sized_rect(base, dir, w);
+    // 折行预算：可用宽 ÷ [`WRAP_WIDTH_SLACK`]；下限半个字宽，保证任何情况下每行至少
+    // 能放一个字（否则折行会退化成逐字一行）。折行逐字宽度本身已用上界口径
+    // （`char_upper_unit`），此处只留一点点余量吸收浮点与抗锯齿。
+    let wrap_w = ((rect.w - metrics.pad_x * 2.0).max(metrics.font * 0.5)) / WRAP_WIDTH_SLACK;
+    let lines = winbosk_core::text::wrap_visual_lines(text, wrap_w, metrics.font).len();
+    // 框高随视觉行数增长（与绘制层 `line_h` 同一倍数），向下长。
+    // 仅 ≥2 行时才需要：单行沿用锚点高度（绘制层单行走「整框垂直居中」，与旧行为一致），
+    // 否则短名字的框会被这里撑高一截。
+    if lines > 1 {
+        let need_h =
+            lines as f32 * metrics.font * winbosk_render::EDIT_LINE_H_MULT + metrics.pad_y * 2.0;
+        rect.h = rect.h.max(need_h);
+    }
+    // 横向：先钳屏幕（硬边界），再收进卡片（只平移；宽已在上面收到上限内，宽度不变）
+    rect.w = rect.w.min(screen_cap);
+    rect.x = rect.x.clamp(
+        RENAME_SCREEN_MARGIN,
+        (vw - rect.w - RENAME_SCREEN_MARGIN).max(RENAME_SCREEN_MARGIN),
+    );
+    if let Some(span) = fence_span {
+        rect = clamp_into_span(rect, span);
+    }
+    // 纵向：优先留在卡片内（卡片够高时整框上移贴住内下缘），最后钳屏幕
+    if let Some((top, bottom)) = fence_vspan {
+        if rect.y + rect.h > bottom {
+            rect.y = (bottom - rect.h).max(top);
+        }
+    }
+    rect.y = rect.y.clamp(
+        RENAME_SCREEN_MARGIN,
+        (vh - rect.h - RENAME_SCREEN_MARGIN).max(RENAME_SCREEN_MARGIN),
+    );
+    RenameBox {
+        rect,
+        wrap_w,
+        lines,
+    }
+}
+
+/// 框宽口径：不小于锚点宽（网格短名字的框仍是一个整格）、不超过卡片上限；
+/// 超出上限的部分由折行承担。
+fn rename_box_width(need: f32, base_w: f32, cap: f32) -> f32 {
+    need.max(base_w).min(cap.max(1.0))
+}
+
+/// 栅栏卡片的横向内缘 `(left, right)`：左右各内缩 `pad`（由调用方给出与锚点矩形**同一个**
+/// 内缩量，装得下时钳制恒等、不产生位置漂移）。
+fn fence_inner_span(rt: &Runtime, fence: usize, pad: f32) -> Option<(f32, f32)> {
+    let f = rt.desk.fences.get(fence)?;
+    Some((f.bounds.x + pad, f.bounds.x + f.bounds.w - pad))
+}
+
+/// 栅栏卡片的纵向内缘 `(top, bottom)`：上下各内缩 `pad`。
+///
+/// 高度必须取**真实布局高度**：自动高度栅栏（`bounds.h <= 0`）在数据模型里没有高度，
+/// 由 App 层旁路表 `last_layout_h` 提供（见 AGENTS.md 第 8 条），直接读 `bounds.h`
+/// 会把卡片判成 0 高、纵向钳制立刻失效。
+fn fence_inner_vspan(rt: &Runtime, fence: usize, pad: f32) -> Option<(f32, f32)> {
+    let f = rt.desk.fences.get(fence)?;
+    let h = if f.bounds.h > 0.0 {
+        f.bounds.h
+    } else {
+        *rt.last_layout_h.get(fence)?
+    };
+    if h <= 0.0 {
+        return None;
+    }
+    Some((f.bounds.y + pad, f.bounds.y + h - pad))
+}
+
+/// 把框横向收进 `[left, right]`：**只平移、不压缩**（压缩就是裁字）。
+///
+/// 框比区间还宽（区间被 `rename_box_width` 保证不会发生）或区间退化（`right < left`）时，
+/// 退化为「左缘贴 `left`」——绝不改成裁字或缩字号。
+fn clamp_into_span(r: RectF, (left, right): (f32, f32)) -> RectF {
+    let max_x = (right - r.w).max(left);
+    RectF {
+        x: r.x.clamp(left, max_x),
+        ..r
+    }
+}
+
+/// 编辑框生长方向。
+///
+/// 判定依据是**框内文本的观感**（编辑文本恒左对齐于 `rect.x + input_pad_x`，见
+/// [`click_column`] 的对齐契约），不是「标签/标题原来的绘制对齐方式」：
+/// 网格与横向 dock 的标签本就**居中于图标**，框对称生长 + 文本左对齐 ⇒ 文本中心
+/// `= 图标中心 − 0.1×文本宽`（余量的一半），整段文本始终「绕着图标中心两侧展开」，
+/// 与 Windows 桌面上图标名的观感一致；列表名称列、栅栏标题、左停靠侧边栏的框与
+/// 文本本就从栅栏/图标的左缘起算，钉住左缘向右长才不会让文字在打字时整体漂移。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameGrow {
+    /// 以中心为锚向两侧定宽（网格标签居中于图标下方；横向 dock 的编辑框居中于图标下方）。
+    Centered,
+    /// 保持左缘（列表名称列 / 栅栏标题 / 左停靠侧边栏）。
+    Right,
+    /// 保持右缘（右停靠侧边栏：编辑框挂在图标左侧，右缘贴图标，向右长会盖住 dock）。
+    Left,
+}
+
+/// 生长方向由布局与停靠边唯一决定——**不是**每处自己 `match` 的局部约定。
+fn grow_dir_for(layout: FenceLayout, pos: SidebarPosition) -> RenameGrow {
+    match layout {
+        FenceLayout::Grid => RenameGrow::Centered,
+        FenceLayout::List => RenameGrow::Right,
+        FenceLayout::Sidebar => match pos {
+            SidebarPosition::Left => RenameGrow::Right,
+            SidebarPosition::Top => RenameGrow::Centered,
+            SidebarPosition::Right => RenameGrow::Left,
+        },
+    }
+}
+
+/// 按方向把框**定宽**到 `want_w`（只动宽度与相应的一侧锚点）。
+///
+/// 与「只增不减」的旧写法不同：宽度上限来自卡片，宽于上限的文本改走折行，
+/// 所以这里允许比锚点窄（退化卡片下 `want_w` 可能小于锚点宽）。
+fn sized_rect(mut base: RectF, dir: RenameGrow, want_w: f32) -> RectF {
+    let want = want_w.max(1.0);
+    match dir {
+        RenameGrow::Centered => base.x += (base.w - want) / 2.0,
+        RenameGrow::Right => {}
+        RenameGrow::Left => base.x += base.w - want,
+    }
+    base.w = want;
+    base
+}
+
+/// 编辑框左右内边距（物理像素，已随 DPI 缩放）。
+fn pad_x(rt: &Runtime) -> f32 {
+    rt.theme.controls.input_pad_x
+}
+
+/// 「完整显示 `text` 所需的最小框宽」= 文本**上界**宽 × [`TEXT_WIDTH_SLACK`] + 左右内边距。
+///
+/// 用 `upper_width`（逐字形上界）而不是平均口径 `label_width`：全大写或含大量
+/// `W/M/@/m/w` 的文件名平均字宽可达 0.9 em 以上，按平均口径算出来的框会让 DirectWrite
+/// 画出的字形溢出框右缘、被静默裁掉。抽成纯函数是为了把这条口径钉进单测。
+fn rename_width_for(text: &str, font_size: f32, pad_x: f32) -> f32 {
+    winbosk_core::text::upper_width(text, font_size) * crate::scene::TEXT_WIDTH_SLACK + pad_x * 2.0
+}
+
+/// 逐帧回写就地重命名框：文本一变（打字 / 退格 / 粘贴 / IME 上屏）框就跟着变宽、
+/// 变到卡片上限后转为增加行数，输入框内始终完整显示全部内容，且不越出卡片。
+///
+/// 由 `build_scene` 在绘制前调用，因此**本帧**的绘制、窗口区域（`build_region`）与命中热区
+/// （`HitModel::edit_rect`）共用同一个矩形与同一个折行预算。
+/// 几何无变化时直接返回，不白做 IME 窗口重定位。
+pub(crate) fn refresh_rename_rect(rt: &mut Runtime) {
+    let Some((target, text)) = rt.edit.as_ref().map(|e| (e.target, e.display_text())) else {
+        return;
+    };
+    let Some(bbox) = rename_edit_rect(rt, target, &text) else {
+        return;
+    };
+    let same = rt.edit.as_ref().map(|e| (e.rect, e.wrap_w)) == Some((bbox.rect, Some(bbox.wrap_w)));
+    if same {
+        return;
+    }
+    if let Some(e) = rt.edit.as_mut() {
+        e.rect = bbox.rect;
+        e.wrap_w = Some(bbox.wrap_w);
+    }
+    position_ime_window(rt);
 }
 
 /// 栅栏标题文本矩形（就地编辑框的定位基准）。
@@ -904,5 +1373,755 @@ mod tests {
         // 测试空输入
         assert!(parse_pattern_tokens("   ").is_empty());
         assert!(parse_pattern_tokens(",，;;").is_empty());
+    }
+
+    fn rect(x: f32, w: f32) -> RectF {
+        RectF {
+            x,
+            y: 100.0,
+            w,
+            h: 20.0,
+        }
+    }
+
+    /// 定宽锚点：网格保持中心、列表/标题保持左缘、右停靠侧边栏保持右缘；
+    /// 宽度等于锚点宽时几何必须逐字段不变（逐帧刷新的幂等底线）。
+    #[test]
+    fn sized_rect_anchors_and_identity() {
+        let base = rect(50.0, 80.0);
+        assert_eq!(sized_rect(base, RenameGrow::Centered, 80.0), base);
+        assert_eq!(sized_rect(base, RenameGrow::Right, 80.0), base);
+        assert_eq!(sized_rect(base, RenameGrow::Left, 80.0), base);
+
+        let c = sized_rect(base, RenameGrow::Centered, 200.0);
+        assert!((c.x + c.w / 2.0 - (base.x + base.w / 2.0)).abs() < 1e-3);
+        assert_eq!(c.w, 200.0);
+        let r = sized_rect(base, RenameGrow::Right, 200.0);
+        assert_eq!(r.x, base.x);
+        let l = sized_rect(base, RenameGrow::Left, 200.0);
+        assert!((l.x + l.w - (base.x + base.w)).abs() < 1e-3);
+        // 允许比锚点窄（卡片上限小于格宽时）：这正是「改走折行」的前提
+        assert_eq!(sized_rect(base, RenameGrow::Right, 40.0).w, 40.0);
+    }
+
+    /// 框宽口径：不小于锚点宽、不超过卡片上限。
+    #[test]
+    fn rename_box_width_is_capped() {
+        assert_eq!(rename_box_width(200.0, 72.0, 360.0), 200.0);
+        assert_eq!(
+            rename_box_width(40.0, 72.0, 360.0),
+            72.0,
+            "短名字不得小于格宽"
+        );
+        assert_eq!(
+            rename_box_width(500.0, 72.0, 360.0),
+            360.0,
+            "超宽必须收到卡片上限"
+        );
+        assert_eq!(
+            rename_box_width(500.0, 72.0, 0.0),
+            1.0,
+            "退化上限不得出现 0 宽"
+        );
+    }
+
+    /// 内容宽度口径：必须容得下「文本 + 左右内边距」，且带安全余量（估算偏乐观时兜底）。
+    #[test]
+    fn rename_width_covers_text_and_padding() {
+        let (font, pad) = (12.0, 8.0);
+        let text = "一个很长的文件名示例.docx";
+        let text_w = crate::scene::label_width(text, font);
+        let w = rename_width_for(text, font, pad);
+        assert!(w > text_w + pad * 2.0);
+        assert!(
+            (w - (text_w * crate::scene::TEXT_WIDTH_SLACK + pad * 2.0)).abs() < 1e-3,
+            "重命名框必须复用全局余量，不许另写一个字面量"
+        );
+    }
+
+    /// 空文本：只剩左右内边距，不得为 0（否则框会缩成一条线看不见）。
+    #[test]
+    fn rename_width_of_empty_text_is_padding_only() {
+        assert_eq!(rename_width_for("", 12.0, 8.0), 16.0);
+    }
+
+    /// 回归：网格格宽装不下的长名字，所需框宽必须真的超过格宽——这正是「框不生长就必然
+    /// 裁字」的量化证据；顺带锁住 `TEXT_WIDTH_SLACK` 不被压到 1.0。
+    #[test]
+    fn rename_width_exceeds_grid_cell_for_long_name() {
+        let theme = Theme::default();
+        let (font, pad) = (theme.label.size, theme.controls.input_pad_x);
+        let cell_w = crate::scene::grid_cell_w(theme.icon_size, theme.icon_gap);
+        let long = "项目文档归档2026年10月最终版.docx";
+        assert!(
+            crate::scene::label_width(long, font) > cell_w,
+            "前提失效：这个名字应当装不进一个格"
+        );
+        assert!(rename_width_for(long, font, pad) > cell_w);
+        assert!(rename_width_for(long, font, pad) > crate::scene::label_width(long, font));
+    }
+
+    /// 生长方向矩阵：网格居中、列表向右、侧边栏按停靠边反向。
+    #[test]
+    fn rename_grow_dir_matrix() {
+        assert_eq!(
+            grow_dir_for(FenceLayout::Grid, SidebarPosition::Left),
+            RenameGrow::Centered
+        );
+        assert_eq!(
+            grow_dir_for(FenceLayout::List, SidebarPosition::Right),
+            RenameGrow::Right
+        );
+        assert_eq!(
+            grow_dir_for(FenceLayout::Sidebar, SidebarPosition::Left),
+            RenameGrow::Right
+        );
+        assert_eq!(
+            grow_dir_for(FenceLayout::Sidebar, SidebarPosition::Top),
+            RenameGrow::Centered
+        );
+        assert_eq!(
+            grow_dir_for(FenceLayout::Sidebar, SidebarPosition::Right),
+            RenameGrow::Left
+        );
+    }
+
+    /// 对齐契约：`click_column` 是宽度累计函数的逆——给定文本左缘，点击第 N 个字符的
+    /// 估算位置必须定位到第 N 列；且该左缘就是绘制/光标/IME 共用的 `rect.x + input_pad_x`。
+    /// 这条断言把「rect 只描述框、不得另立文本原点」钉死（任何居中/向左定位都必须让
+    /// 文本实际画在 `rect.x + pad_x` 上，否则「看到第 N 个字、点到第 M 个字」）。
+    #[test]
+    fn click_column_is_inverse_of_text_layout() {
+        let font = 12.0;
+        let pad_x = 8.0;
+        let line = "一个很长的文件名示例.docx";
+        // 居中定宽后的框：文本左缘仍严格等于 rect.x + pad_x
+        let icon_center = 500.0;
+        let base = rect(icon_center - 36.0, 72.0); // 格宽 72、图标中心 500
+        let text_w = crate::scene::label_width(line, font);
+        let grown = sized_rect(
+            base,
+            RenameGrow::Centered,
+            text_w * crate::scene::TEXT_WIDTH_SLACK + pad_x * 2.0,
+        );
+        let text_left = grown.x + pad_x;
+        // 逐字累计：点到第 N 个字的前半格 → 第 N 列；后半格 → 第 N+1 列
+        let mut acc = 0.0;
+        for (n, c) in line.chars().enumerate() {
+            let w = label_width(&c.to_string(), font);
+            let mid = text_left + acc + w * 0.25;
+            assert_eq!(
+                click_column(mid, text_left, line, font),
+                n,
+                "点在第 {n} 个字的前半格应停在第 {n} 列"
+            );
+            let late = text_left + acc + w * 0.75;
+            assert_eq!(
+                click_column(late, text_left, line, font),
+                n + 1,
+                "点在第 {n} 个字的四分之三处应进到第 {} 列",
+                n + 1
+            );
+            acc += w;
+        }
+        // 点在文本左缘之前（框内左侧内边距）→ 恒为第 0 列
+        assert_eq!(click_column(text_left - 5.0, text_left, line, font), 0);
+    }
+
+    /// 卡片内约束：框装得下时**只平移**、必须完整落在 `[left, right]` 内，宽度一个像素都不动。
+    #[test]
+    fn clamp_into_span_translates_only() {
+        let span = (100.0, 400.0);
+        // 居中定位把左缘推到卡片外 → 平移回来，宽度不变
+        let out = clamp_into_span(rect(10.0, 252.0), span);
+        assert_eq!(out.x, 100.0);
+        assert_eq!(out.w, 252.0);
+        assert!(out.x + out.w <= 400.0 + 1e-3);
+        // 右缘越界 → 左移到贴右缘，宽度不变
+        let out = clamp_into_span(rect(300.0, 252.0), span);
+        assert!((out.x + out.w - 400.0).abs() < 1e-3);
+        assert_eq!(out.w, 252.0);
+        // 已经装得下 → 原样不动（幂等：逐帧刷新不会把框越推越偏）
+        let inside = rect(120.0, 200.0);
+        assert_eq!(clamp_into_span(inside, span), inside);
+        // 防御性：区间退化（卡片窄于两倍内边距）时退化为「左缘贴 left」，不 panic、不出 NaN
+        let degen = clamp_into_span(rect(-50.0, 40.0), (100.0, 60.0));
+        assert_eq!(degen.x, 100.0);
+        assert_eq!(degen.w, 40.0);
+    }
+
+    /// **用户实测回归点**：窄卡片 + 长名字（截图场景）——框宽收到卡片上限后，
+    /// 内容**换行**完整显示：整框不出卡片，且每一视觉行的估算宽度都在框内可用宽之内
+    /// （即「没有任何一个字被裁掉」）。
+    #[test]
+    fn long_name_wraps_inside_narrow_fence() {
+        let metrics = EditMetrics {
+            font: 12.0,
+            pad_x: 8.0,
+            pad_y: 4.0,
+        };
+        let fence_span = (40.0, 240.0); // 卡片内容内缘：宽 200
+        let base = rect(40.0, 72.0); // 第 0 列格：左缘 = 卡片内缘
+        let text = "launch-author.bat - 快捷方式";
+        let out = rename_box_geometry(
+            base,
+            RenameGrow::Centered,
+            text,
+            metrics,
+            Some(fence_span),
+            None,
+            (1920.0, 1080.0),
+        );
+        assert!(out.rect.x >= fence_span.0 - 1e-3, "左缘不得越过卡片");
+        assert!(
+            out.rect.x + out.rect.w <= fence_span.1 + 1e-3,
+            "右缘不得越过卡片"
+        );
+        assert_eq!(out.rect.w, 200.0, "宽度必须收到卡片上限");
+        assert!(
+            out.lines >= 2,
+            "装不下时必须折行，而不是裁字：{:?}",
+            out.lines
+        );
+        // 每行内容都装得进框内可用宽（无裁字），且框高覆盖全部行
+        let avail = out.rect.w - metrics.pad_x * 2.0;
+        let wrapped = winbosk_core::text::wrap_visual_lines(text, out.wrap_w, metrics.font);
+        let mut covered = 0usize;
+        for l in &wrapped {
+            let seg: String = text.chars().skip(l.start).take(l.end - l.start).collect();
+            let w = crate::scene::label_width(&seg, metrics.font);
+            assert!(
+                w <= avail + 1e-3,
+                "视觉行 {seg:?} 宽 {w} 超出框内可用宽 {avail}"
+            );
+            covered += l.end - l.start;
+        }
+        assert_eq!(covered, text.chars().count(), "折行不得丢字");
+        let need_h = wrapped.len() as f32 * metrics.font * winbosk_render::EDIT_LINE_H_MULT
+            + metrics.pad_y * 2.0;
+        assert!(
+            out.rect.h >= need_h - 1e-3,
+            "框高 {:?} 必须覆盖 {} 行所需的 {need_h}",
+            out.rect.h,
+            wrapped.len()
+        );
+    }
+
+    /// 宽卡片 + 长名字：一行装得下就不折行（框高保持锚点高度，避免短名字/中等名字的框变高）。
+    #[test]
+    fn name_that_fits_does_not_wrap() {
+        let metrics = EditMetrics {
+            font: 12.0,
+            pad_x: 8.0,
+            pad_y: 4.0,
+        };
+        let base = rect(40.0, 72.0);
+        let text = "launch-author.bat - 快捷方式";
+        let out = rename_box_geometry(
+            base,
+            RenameGrow::Centered,
+            text,
+            metrics,
+            Some((40.0, 640.0)),
+            None,
+            (1920.0, 1080.0),
+        );
+        assert_eq!(out.lines, 1);
+        assert_eq!(out.rect.h, base.h, "单行不得改变锚点高度");
+    }
+
+    /// 折行框贴到卡片底部时整框上移（不越出卡片下缘）；卡片本身就装不下时保持锚点并
+    /// 交给屏幕钳制，绝不 panic / 出 NaN。
+    #[test]
+    fn wrapped_box_clamps_into_fence_vertically() {
+        let metrics = EditMetrics {
+            font: 12.0,
+            pad_x: 8.0,
+            pad_y: 4.0,
+        };
+        let base = RectF {
+            x: 40.0,
+            y: 300.0,
+            w: 72.0,
+            h: 40.0,
+        };
+        let text = "一个很长很长的文件名示例文档2026年最终版.docx";
+        let out = rename_box_geometry(
+            base,
+            RenameGrow::Centered,
+            text,
+            metrics,
+            Some((40.0, 240.0)),
+            Some((20.0, 340.0)), // 卡片内缘：底 340
+            (1920.0, 1080.0),
+        );
+        assert!(out.rect.y + out.rect.h <= 340.0 + 1e-3, "整框必须落进卡片");
+        assert!(out.rect.y >= 20.0 - 1e-3, "上移不得越过卡片上缘");
+        // 卡片太矮（高度不够）时：贴卡片上缘、允许向下溢出，仍留在屏幕内
+        let out = rename_box_geometry(
+            base,
+            RenameGrow::Centered,
+            text,
+            metrics,
+            Some((40.0, 240.0)),
+            Some((20.0, 60.0)),
+            (1920.0, 1080.0),
+        );
+        assert!(out.rect.y >= 20.0 - 1e-3);
+        assert!(out.rect.y + out.rect.h <= 1080.0 - RENAME_SCREEN_MARGIN + 1e-3);
+    }
+
+    /// 屏幕钳制：卡片约束缺席（侧边栏挂在 dock 外）时，仍不得越出虚拟屏幕。
+    #[test]
+    fn sidebar_rename_box_clamps_to_screen_only() {
+        let metrics = EditMetrics {
+            font: 12.0,
+            pad_x: 8.0,
+            pad_y: 4.0,
+        };
+        let base = rect(4.0, 60.0);
+        let out = rename_box_geometry(
+            base,
+            RenameGrow::Left,
+            "一个很长很长的文件名示例文档2026年最终版.docx",
+            metrics,
+            None,
+            None,
+            (800.0, 600.0),
+        );
+        assert!(out.rect.x >= RENAME_SCREEN_MARGIN - 1e-3);
+        assert!(out.rect.x + out.rect.w <= 800.0 - RENAME_SCREEN_MARGIN + 1e-3);
+        assert!(out.rect.w <= 800.0 - RENAME_SCREEN_MARGIN * 2.0 + 1e-3);
+    }
+
+    /// **钳制顺序回归点**：卡片横向内缘比屏幕可用宽还宽时，屏幕那道必须先与上限取交——
+    /// 否则折行按「旧宽」算完，横向钳制又把框改窄，折出来的行就放不进框里（又裁字）。
+    #[test]
+    fn cap_never_exceeds_screen_so_wrap_matches_final_width() {
+        let metrics = EditMetrics {
+            font: 12.0,
+            pad_x: 8.0,
+            pad_y: 4.0,
+        };
+        let vw = 200.0;
+        let text = "一个比较长的文件名示例.docx";
+        // 卡片横向内缘越出屏幕（贴边栅栏），宽度上限必须被屏幕收住
+        let out = rename_box_geometry(
+            rect(-40.0, 72.0),
+            RenameGrow::Right,
+            text,
+            metrics,
+            Some((-50.0, 250.0)),
+            None,
+            (vw, 600.0),
+        );
+        let avail = out.rect.w - metrics.pad_x * 2.0;
+        let expected = avail.max(metrics.font * 0.5) / WRAP_WIDTH_SLACK;
+        assert!(
+            (out.wrap_w - expected).abs() < 1e-3,
+            "折行预算必须按**最终**框宽算：wrap_w={} 期望={expected}",
+            out.wrap_w
+        );
+        let wrapped = winbosk_core::text::wrap_visual_lines(text, out.wrap_w, metrics.font);
+        for l in &wrapped {
+            let seg: String = text.chars().skip(l.start).take(l.end - l.start).collect();
+            let w = crate::scene::label_width(&seg, metrics.font);
+            assert!(
+                w <= avail + 1e-3,
+                "行 {seg:?} 宽 {w} 超出最终框内可用宽 {avail}"
+            );
+        }
+    }
+
+    /// 折行预算：比框内可用宽保守（÷ `WRAP_WIDTH_SLACK`），并带半个字宽的下限。
+    #[test]
+    fn wrap_budget_is_conservative() {
+        let metrics = EditMetrics {
+            font: 12.0,
+            pad_x: 8.0,
+            pad_y: 4.0,
+        };
+        let out = rename_box_geometry(
+            rect(40.0, 72.0),
+            RenameGrow::Right,
+            "中等长度的名字.txt",
+            metrics,
+            Some((40.0, 400.0)),
+            None,
+            (1920.0, 1080.0),
+        );
+        let avail = out.rect.w - metrics.pad_x * 2.0;
+        assert!((out.wrap_w - avail / WRAP_WIDTH_SLACK).abs() < 1e-3);
+        assert!(out.wrap_w < avail);
+        // 极窄框：预算下限为半个字宽（否则折行退化成逐字一行）
+        let tiny = rename_box_geometry(
+            rect(40.0, 10.0),
+            RenameGrow::Right,
+            "宽",
+            metrics,
+            Some((40.0, 42.0)),
+            None,
+            (1920.0, 1080.0),
+        );
+        assert!(tiny.wrap_w >= metrics.font * 0.5 / WRAP_WIDTH_SLACK - 1e-3);
+    }
+
+    /// **回归（审查 F1）**：宽字形名字（全大写 / 大量 `W M @ m w`）必须真的装得下——
+    /// 框宽与折行都按**上界**口径算，逐行上界宽 ≤ 框内可用宽（⇒ 真实排版宽度也 ≤ 可用宽）。
+    /// 旧口径（平均 0.62 em）在这类名字上会「以为装得下」而完全不折行，末尾被静默裁掉。
+    #[test]
+    fn wide_glyph_names_fit_without_clipping() {
+        let metrics = EditMetrics {
+            font: 12.0,
+            pad_x: 8.0,
+            pad_y: 4.0,
+        };
+        for text in [
+            "WWWWWWWWWWWWWWWWWWWW",
+            "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW.txt",
+            "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@",
+            "MMMMMMMMMM.doc",
+            "mmmmmmmmmmmmmmmmmm.txt",
+            "PROJEKT-MUSTERDATEI-2026.DOCX",
+        ] {
+            for cap in [800.0, 300.0, 200.0, 120.0] {
+                let base = rect(40.0, 72.0);
+                let out = rename_box_geometry(
+                    base,
+                    RenameGrow::Right,
+                    text,
+                    metrics,
+                    Some((40.0, 40.0 + cap)),
+                    None,
+                    (1920.0, 1080.0),
+                );
+                let avail = out.rect.w - metrics.pad_x * 2.0;
+                assert!(
+                    out.rect.w <= cap + 1e-3,
+                    "{text:?} cap={cap}: 框宽 {:?} 越出卡片",
+                    out.rect.w
+                );
+                let wrapped = winbosk_core::text::wrap_visual_lines(text, out.wrap_w, metrics.font);
+                assert_eq!(
+                    wrapped.iter().map(|l| l.end - l.start).sum::<usize>(),
+                    text.chars().count(),
+                    "{text:?}: 折行不得丢字"
+                );
+                for l in &wrapped {
+                    let seg: String = text.chars().skip(l.start).take(l.end - l.start).collect();
+                    // 上界宽必须装得下 ⇒ 真实排版宽（≤ 上界）也装得下
+                    let uw = winbosk_core::text::upper_width(&seg, metrics.font);
+                    assert!(
+                        uw <= avail + 1e-3,
+                        "{text:?} cap={cap}: 行 {seg:?} 上界宽 {uw} 超出可用宽 {avail}"
+                    );
+                    // 旧的平均口径在这些名字上确实会低估（否则本测试没有意义）
+                    let avg = crate::scene::label_width(&seg, metrics.font);
+                    assert!(avg <= uw + 1e-3, "上界口径必须 ≥ 平均口径");
+                }
+            }
+        }
+        // 对照：旧口径（平均宽）在 `W×20` 上确实「以为一行装得下」
+        let wide = "WWWWWWWWWWWWWWWWWWWW";
+        let avg_need = crate::scene::label_width(wide, metrics.font)
+            * crate::scene::TEXT_WIDTH_SLACK
+            + metrics.pad_x * 2.0;
+        assert!(
+            winbosk_core::text::upper_width(wide, metrics.font) * crate::scene::TEXT_WIDTH_SLACK
+                + metrics.pad_x * 2.0
+                > avg_need,
+            "上界口径必须比平均口径更宽，否则 F1 没修"
+        );
+    }
+
+    /// 网格的居中定宽必须让整段文本「绕着图标中心两侧展开」：文本中心与图标中心的
+    /// 偏差只来自余量的一半（0.1×文本宽），不随文本变长而漂向一侧。
+    /// 若有人把网格改成单向右长，这条断言会立刻失败（长名字会整段右偏）。
+    #[test]
+    fn grid_growth_keeps_text_centered_on_icon() {
+        let font = 12.0;
+        let pad_x = 8.0;
+        let icon_center = 500.0;
+        let base = rect(icon_center - 36.0, 72.0);
+        for name in ["短名.txt", "一个很长的文件名示例文档2026.docx"] {
+            let text_w = crate::scene::label_width(name, font);
+            let need = text_w * crate::scene::TEXT_WIDTH_SLACK + pad_x * 2.0;
+            let grown = sized_rect(base, RenameGrow::Centered, need.max(base.w));
+            let text_center = grown.x + pad_x + text_w / 2.0;
+            let drift = (text_center - icon_center).abs();
+            assert!(
+                drift <= text_w * 0.1 + 1e-3,
+                "{name}: 文本中心偏离图标中心 {drift}（上限 {}）",
+                text_w * 0.1
+            );
+        }
+    }
+
+    /// 视觉折行与光标口径：合成串参与折行、光标落在合成串之后；行尾光标停在本行。
+    #[test]
+    fn visual_lines_and_caret_index_follow_wrap() {
+        let mut e = InlineEdit {
+            target: EditTarget::Item { fence: 0, icon: 0 },
+            rect: rect(0.0, 120.0),
+            lines: vec!["一二三四五六七八".into()], // 8 个全角字
+            line: 0,
+            col: 2,
+            placeholder: String::new(),
+            single_line: true,
+            wrap_w: Some(48.0), // 每行 4 个全角字（12px 字号 × 4 = 48）
+            focused: true,
+            composing: true,
+            comp: "甲".into(),
+            committing: false,
+        };
+        assert_eq!(e.display_text(), "一二甲三四五六七八");
+        assert_eq!(e.caret_index(), 3, "光标跟在合成串之后");
+        let lines = e.visual_lines(12.0);
+        assert_eq!(lines.len(), 3, "9 个字按每行 4 个折成 3 行: {lines:?}");
+        assert_eq!(
+            winbosk_core::text::visual_line_of(&lines, e.caret_index()),
+            0,
+            "光标仍在第 0 行"
+        );
+        // 光标移到末尾 → 末行（8 个字按每行 4 个折成 2 行，行尾光标停在末行）
+        e.comp.clear();
+        e.composing = false;
+        e.col = 8;
+        let lines = e.visual_lines(12.0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            winbosk_core::text::visual_line_of(&lines, e.caret_index()),
+            1
+        );
+        // 折行边界：第 4 列（第一行行尾）停在第 0 行，不跳到下一行开头
+        e.col = 4;
+        let lines = e.visual_lines(12.0);
+        assert_eq!(
+            winbosk_core::text::visual_line_of(&lines, e.caret_index()),
+            0
+        );
+        // 不折行（规则输入框）：恒单行
+        e.wrap_w = None;
+        assert_eq!(e.visual_lines(12.0).len(), 1);
+    }
+
+    /// 折行框内的上下键 = 视觉行移动（保持行内偏移；合成期间不介入；越界不动作）。
+    #[test]
+    fn visual_line_cursor_moves_between_wrapped_lines() {
+        let mut e = InlineEdit {
+            target: EditTarget::Item { fence: 0, icon: 0 },
+            rect: rect(0.0, 120.0),
+            lines: vec!["一二三四五六七八九十".into()], // 10 个全角字
+            line: 0,
+            col: 1,
+            placeholder: String::new(),
+            single_line: true,
+            wrap_w: Some(48.0), // 每行 4 个字
+            focused: true,
+            composing: false,
+            comp: String::new(),
+            committing: false,
+        };
+        assert_eq!(e.visual_lines(12.0).len(), 3, "10 字按每行 4 字折成 3 行");
+        e.move_visual_line(12.0, true);
+        assert_eq!(e.col, 5, "下移一行保持行内偏移 1");
+        e.move_visual_line(12.0, true);
+        assert_eq!(e.col, 9);
+        e.move_visual_line(12.0, true);
+        assert_eq!(e.col, 9, "已在末行：不动作");
+        e.move_visual_line(12.0, false);
+        assert_eq!(e.col, 5);
+        // 目标行更短时贴行尾（末行只有 2 个字：从第 0 行偏移 3 下移 → 贴到 10）
+        e.col = 3;
+        e.move_visual_line(12.0, true);
+        assert_eq!(e.col, 7, "第二行仍有 4 个字符");
+        e.move_visual_line(12.0, true);
+        assert_eq!(e.col, 10, "末行只有 2 个字符 → 贴行尾");
+        // 合成期间不抢方向键
+        e.composing = true;
+        e.comp = "甲".into();
+        e.col = 0;
+        let before = e.col;
+        e.move_visual_line(12.0, true);
+        assert_eq!(e.col, before);
+    }
+
+    /// 折行框内点击定位：y 判行 + 行内 x 定位 + 合成串区间折算。**user 场景**：点第 2 行的
+    /// 第 2 个字必须落到那一列，而不是按整串宽度算出的别处。
+    #[test]
+    fn wrapped_click_lands_on_the_visual_line_under_the_cursor() {
+        let (font, pad_x, pad_y) = (12.0, 8.0, 4.0);
+        let line_h = font * winbosk_render::EDIT_LINE_H_MULT;
+        let rect = RectF {
+            x: 100.0,
+            y: 50.0,
+            w: 80.0,
+            h: 70.0,
+        };
+        let text = "一二三四五六七八九十"; // 10 个全角字
+        let visual = winbosk_core::text::wrap_visual_lines(text, 48.0, font); // 每行 4 字 → 3 行
+        assert_eq!(visual.len(), 3);
+        // 点击 x 必须按**视觉行内**偏移算（文本左缘 = rect.x + pad_x，每行都从该处起排）
+        let x_in = |vi: usize, off: usize| {
+            let prefix: String = text.chars().skip(visual[vi].start).take(off).collect();
+            rect.x + pad_x + crate::scene::label_width(&prefix, font)
+        };
+        let y_of = |row: f32| rect.y + pad_y + row * line_h;
+        // 第 0 行：点第 2 个字的前半格 → 第 1 列
+        assert_eq!(
+            click_column_wrapped(
+                x_in(0, 1),
+                y_of(0.5),
+                rect,
+                text,
+                &visual,
+                0,
+                0,
+                font,
+                pad_x,
+                pad_y,
+                line_h
+            ),
+            1
+        );
+        // 第 1 行行内第 1 格 → 4 + 1 = 5：**不是**按整串宽度算出来的别处
+        assert_eq!(
+            click_column_wrapped(
+                x_in(1, 1),
+                y_of(1.5),
+                rect,
+                text,
+                &visual,
+                0,
+                0,
+                font,
+                pad_x,
+                pad_y,
+                line_h
+            ),
+            5
+        );
+        // 第 2 行（末行只有 2 个字）：点在整行右端之外 → 贴到 10
+        assert_eq!(
+            click_column_wrapped(
+                x_in(2, 2) + 100.0,
+                y_of(2.5),
+                rect,
+                text,
+                &visual,
+                0,
+                0,
+                font,
+                pad_x,
+                pad_y,
+                line_h
+            ),
+            10
+        );
+        // y 落在框下方（越界）→ 末行；y 在框上方 → 第 0 行
+        assert_eq!(
+            click_column_wrapped(
+                x_in(2, 2),
+                y_of(99.0),
+                rect,
+                text,
+                &visual,
+                0,
+                0,
+                font,
+                pad_x,
+                pad_y,
+                line_h
+            ),
+            10
+        );
+        assert_eq!(
+            click_column_wrapped(
+                x_in(0, 0),
+                y_of(-5.0),
+                rect,
+                text,
+                &visual,
+                0,
+                0,
+                font,
+                pad_x,
+                pad_y,
+                line_h
+            ),
+            0
+        );
+        // 合成串「甲乙」插在第 2 列（逻辑列 2）：显示串 = 一二甲乙三四五六七八九十
+        let composed = "一二甲乙三四五六七八九十";
+        let visual_c = winbosk_core::text::wrap_visual_lines(composed, 48.0, font);
+        assert_eq!(visual_c.len(), 3);
+        // 点击 x 仍按**该视觉行内**偏移算（每行都从 rect.x + pad_x 起排）
+        let x_seg = |vi: usize, off: usize| {
+            let prefix: String = composed
+                .chars()
+                .skip(visual_c[vi].start)
+                .take(off)
+                .collect();
+            rect.x + pad_x + crate::scene::label_width(&prefix, font)
+        };
+        // 点在合成串之后：显示串下标 = 4（第 1 行起点）+ 1 = 5 → 逻辑列 5 − 2 = 3
+        assert_eq!(
+            click_column_wrapped(
+                x_seg(1, 1),
+                y_of(1.5),
+                rect,
+                composed,
+                &visual_c,
+                2,
+                2,
+                font,
+                pad_x,
+                pad_y,
+                line_h
+            ),
+            3,
+            "显示串下标 5 − 合成串 2 = 逻辑列 3"
+        );
+        // 点进合成串内部（显示串下标 3）→ 回落到合成起点（模型没有「合成内光标」状态）
+        assert_eq!(
+            click_column_wrapped(
+                x_seg(0, 3),
+                y_of(0.5),
+                rect,
+                composed,
+                &visual_c,
+                2,
+                2,
+                font,
+                pad_x,
+                pad_y,
+                line_h
+            ),
+            2
+        );
+    }
+
+    /// 绘制文本口径：IME 合成串必须插在光标处，且与 `draw_inline_edit` 的拼接一致。
+    #[test]
+    fn display_text_inserts_composition_at_caret() {
+        let mut e = InlineEdit {
+            target: EditTarget::FenceTitle { fence: 0 },
+            rect: rect(0.0, 80.0),
+            lines: vec!["abc".into()],
+            line: 0,
+            col: 1,
+            placeholder: String::new(),
+            single_line: true,
+            wrap_w: None,
+            focused: true,
+            composing: true,
+            comp: "XY".into(),
+            committing: false,
+        };
+        assert_eq!(e.display_text(), "aXYbc");
+        e.comp.clear();
+        assert_eq!(e.display_text(), "abc");
+        e.col = 99; // 越界光标（异常路径）不得 panic，且等价于行尾
+        assert_eq!(e.display_text(), "abc");
     }
 }

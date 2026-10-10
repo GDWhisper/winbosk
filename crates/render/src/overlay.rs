@@ -410,9 +410,11 @@ pub enum OverlayEvent {
     /// 就地重命名提交后由 App 注入：仅用于触发一次完整重绘 + 命中模型重建
     /// （场景数据已在注入前改好）。
     EditCommitted,
-    /// 鼠标点在编辑框内：`x` 为虚拟屏幕物理坐标，App 据此把光标定位到对应字符。
+    /// 鼠标点在编辑框内：`x`/`y` 为虚拟屏幕物理坐标，App 据此把光标定位到对应字符。
+    /// `y` 必需——重命名框会在宽度有界时折成多行（见 `editing.rs::rename_edit_rect`），
+    /// 只给 `x` 无法判断点在第几行。
     /// 点击编辑框不再穿透到下面的栅栏/图标（避免误触发「点击别处提交」）。
-    EditCaret { x: f32 },
+    EditCaret { x: f32, y: f32 },
     /// 右键按下：`icon` 为 Some 表示点在图标的图标上，None 表示点在栅栏空白/标题上。
     /// `pos` 为虚拟屏幕坐标（App 层据此弹上下文菜单）。
     ContextMenu {
@@ -2041,7 +2043,7 @@ fn on_button_down(hwnd: HWND, state: &mut WindowState, mx: f32, my: f32) {
     if let Some(er) = state.model.edit_rect {
         if er.contains(mx, my) {
             tracing::info!("按下：命中内联编辑区");
-            emit_event(hwnd, state, OverlayEvent::EditCaret { x: mx });
+            emit_event(hwnd, state, OverlayEvent::EditCaret { x: mx, y: my });
             return;
         }
     }

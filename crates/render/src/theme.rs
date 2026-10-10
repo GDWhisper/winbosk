@@ -186,6 +186,13 @@ pub struct Theme {
 /// 常量，保证二者一致不重叠。
 pub const GRID_CAPTION_H_MULT: f32 = 2.6;
 
+/// 内联编辑（就地重命名 / 便签）**每行**占用的高度倍数：`font_size × 本值`。
+///
+/// 折行绘制（`draw.rs::draw_inline_edit` 逐视觉行排布）与「框高随视觉行数增长」
+/// （`crates/app/src/editing.rs::rename_box_geometry`）必须共用它——各写一个 1.5
+/// 会让多行文本溢出框底。App 与 Render 都从本常量取值。
+pub const EDIT_LINE_H_MULT: f32 = 1.5;
+
 impl Default for Theme {
     fn default() -> Self {
         // 现代深色半透明栅栏；具体数值在 M4 视觉打磨阶段调整。

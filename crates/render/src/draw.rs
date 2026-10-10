@@ -3318,6 +3318,26 @@ fn measure_caret_x(
     }
 }
 
+/// 内联编辑的视觉行划分：`wrap_w = Some(budget)` 时按估算宽度折行（就地重命名框宽度
+/// 有界，长名字换行显示而不是把框撑出栅栏），`None` 时整行一段（规则输入框 / 便签）。
+///
+/// **必须**与 App 层（`editing.rs` 的光标定位、点击命中、IME 定位）用同一个
+/// `winbosk_core::text::wrap_visual_lines` 与同一字号，否则会出现「光标/点击落在
+/// 与所见不同的字符上」。
+fn edit_visual_lines(
+    e: &SceneEdit,
+    text: &str,
+    font_size: f32,
+) -> Vec<winbosk_core::text::VisualLine> {
+    match e.wrap_w {
+        Some(budget) => winbosk_core::text::wrap_visual_lines(text, budget, font_size),
+        None => vec![winbosk_core::text::VisualLine {
+            start: 0,
+            end: text.chars().count(),
+        }],
+    }
+}
+
 /// 内联文本编辑渲染：输入行底 + 文本（含 IME 合成串）+ 光标 + 聚焦描边。
 /// 与卡片/面板同表面绘制，文字与圆角矩形天然对齐。
 fn draw_inline_edit(
@@ -3329,7 +3349,8 @@ fn draw_inline_edit(
     let s = theme.scale;
     let pad_x = theme.controls.input_pad_x;
     let font = theme.label.size;
-    let line_h = font * 1.5;
+    // 多行/折行的行距与 App 层「框高随行数增长」共用同一倍数（见 theme::EDIT_LINE_H_MULT）
+    let line_h = font * crate::theme::EDIT_LINE_H_MULT;
     let rr = D2D1_ROUNDED_RECT {
         rect: D2D_RECT_F {
             left: e.rect.x,
@@ -3375,11 +3396,14 @@ fn draw_inline_edit(
             let pb = unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.45]), None)? };
             draw_text(target, &e.placeholder, &formats.edit, lr, &pb);
         } else {
-            let top0 = if e.single_line {
-                e.rect.y
-            } else {
-                e.rect.y + theme.controls.input_pad_y
-            };
+            // 单视觉行沿用旧的「整框垂直居中」——短名字在框内的位置不变（App 层
+            // `edit_caret_point` 的 IME 定位走同一分支）；折成多行（或本就是多行便签）
+            // 时逐视觉行自上而下排布。
+            let top0 = e.rect.y + theme.controls.input_pad_y;
+            let caret_index = e.col + e.comp.chars().count();
+            // 全局视觉行序号：多逻辑行（便签）与折行同时成立时也必须逐行累加，
+            // 否则所有逻辑行会叠在第 0 行上（App 的 `caret_row` 用同一口径）。
+            let mut row = 0usize;
             for (li, line) in e.lines.iter().enumerate() {
                 let is_caret = li == e.line;
                 let text = if is_caret {
@@ -3389,59 +3413,81 @@ fn draw_inline_edit(
                 } else {
                     line.clone()
                 };
-                let lr = if e.single_line {
-                    D2D_RECT_F {
-                        left: e.rect.x + pad_x,
-                        top: e.rect.y,
-                        right: e.rect.x + e.rect.w - pad_x,
-                        bottom: e.rect.y + e.rect.h,
+                // 视觉折行口径与 App 层共用 `winbosk_core::text`：两处必须完全一致，
+                // 否则「点到的字符」与「看到的字符」会错位。
+                let visual = edit_visual_lines(e, &text, font);
+                let stacked = !e.single_line || visual.len() > 1;
+                let caret_vline = winbosk_core::text::visual_line_of(&visual, caret_index);
+                for (vi, vl) in visual.iter().enumerate() {
+                    let y_row = row + vi;
+                    let seg: String = text
+                        .chars()
+                        .skip(vl.start)
+                        .take(vl.end - vl.start)
+                        .collect();
+                    // `stacked=false` 时 visual 恒为单行（`edit_visual_lines` 保证）
+                    let lr = if !stacked {
+                        D2D_RECT_F {
+                            left: e.rect.x + pad_x,
+                            top: e.rect.y,
+                            right: e.rect.x + e.rect.w - pad_x,
+                            bottom: e.rect.y + e.rect.h,
+                        }
+                    } else {
+                        D2D_RECT_F {
+                            left: e.rect.x + pad_x,
+                            top: top0 + y_row as f32 * line_h,
+                            right: e.rect.x + e.rect.w - pad_x,
+                            bottom: top0 + y_row as f32 * line_h + font * 1.6,
+                        }
+                    };
+                    let tb = unsafe {
+                        target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.95]), None)?
+                    };
+                    draw_wide(target, &seg, &formats.edit, lr, &tb);
+                    if !(e.focused && is_caret && vi == caret_vline) {
+                        continue;
                     }
-                } else {
-                    D2D_RECT_F {
-                        left: e.rect.x + pad_x,
-                        top: top0 + li as f32 * line_h,
-                        right: e.rect.x + e.rect.w - pad_x,
-                        bottom: top0 + li as f32 * line_h + font * 1.6,
-                    }
-                };
-                let tb =
-                    unsafe { target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.95]), None)? };
-                draw_wide(target, &text, &formats.edit, lr, &tb);
-                if e.focused && is_caret {
                     let blink_on = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() / 500 % 2 == 0)
                         .unwrap_or(true);
-                    if blink_on {
-                        let before: String = line.chars().take(e.col).collect();
-                        let prefix = format!("{}{}", before, e.comp);
-                        let text_utf16: Vec<u16> = text.encode_utf16().collect();
-                        let caret_pos = prefix.encode_utf16().count() as u32;
-                        let caret_offset_x =
-                            measure_caret_x(&formats.dwrite, &formats.edit, &text_utf16, caret_pos);
-                        let caret_x = e.rect.x + pad_x + caret_offset_x;
-                        let (caret_y1, caret_y2) = if e.single_line {
-                            let cy = e.rect.y + e.rect.h / 2.0;
-                            let half = (font * 0.65).min(e.rect.h / 2.0 - 2.0 * s);
-                            (cy - half, cy + half)
-                        } else {
-                            let y = top0 + li as f32 * line_h;
-                            (y, y + font * 1.4)
-                        };
-                        let cb = unsafe {
-                            target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.95]), None)?
-                        };
-                        let p1 = windows_numerics::Vector2 {
-                            X: caret_x,
-                            Y: caret_y1,
-                        };
-                        let p2 = windows_numerics::Vector2 {
-                            X: caret_x,
-                            Y: caret_y2,
-                        };
-                        unsafe { target.DrawLine(p1, p2, &cb, 1.4, None) };
+                    if !blink_on {
+                        continue;
                     }
+                    // 光标在本视觉行内的偏移 = 显示串光标下标 − 本行起点
+                    let seg_utf16: Vec<u16> = seg.encode_utf16().collect();
+                    let caret_in_seg = caret_index.saturating_sub(vl.start);
+                    let prefix: String = seg.chars().take(caret_in_seg).collect();
+                    let caret_offset_x = measure_caret_x(
+                        &formats.dwrite,
+                        &formats.edit,
+                        &seg_utf16,
+                        prefix.encode_utf16().count() as u32,
+                    );
+                    let caret_x = lr.left + caret_offset_x;
+                    let (caret_y1, caret_y2) = if !stacked {
+                        let cy = e.rect.y + e.rect.h / 2.0;
+                        let half = (font * 0.65).min(e.rect.h / 2.0 - 2.0 * s);
+                        (cy - half, cy + half)
+                    } else {
+                        let y = top0 + y_row as f32 * line_h;
+                        (y, y + font * 1.4)
+                    };
+                    let cb = unsafe {
+                        target.CreateSolidColorBrush(&color([1.0, 1.0, 1.0, 0.95]), None)?
+                    };
+                    let p1 = windows_numerics::Vector2 {
+                        X: caret_x,
+                        Y: caret_y1,
+                    };
+                    let p2 = windows_numerics::Vector2 {
+                        X: caret_x,
+                        Y: caret_y2,
+                    };
+                    unsafe { target.DrawLine(p1, p2, &cb, 1.4, None) };
                 }
+                row += visual.len();
             }
         }
         Ok(())
@@ -4568,6 +4614,7 @@ mod tests {
             comp: "IME".into(),
             composing: true,
             single_line: true,
+            wrap_w: Some(140.0),
             placeholder: "".into(),
             focused: true,
         });
@@ -4576,13 +4623,34 @@ mod tests {
         unsafe { target.BeginDraw() };
         let drawn = draw_scene(target, &theme, &scene, &IconStore::new(), &formats);
         let ended = unsafe { target.EndDraw(None, None) };
+        ended.expect("EndDraw 应成功");
+        drawn.expect("含内联编辑框的场景必须绘制成功");
+
+        // 第二帧：**折成多行**的重命名框（覆盖逐视觉行排布 + 光标落在非首行）。
+        // 这是 plan 16 新增的绘制路径：单行路径不会暴露「框高/行距/光标行」的错误。
+        if let Some(e) = scene.edit.as_mut() {
+            e.rect = RectF {
+                x: 40.0,
+                y: 40.0,
+                w: 120.0,
+                h: 62.0,
+            };
+            e.lines = vec!["一个很长很长的文件名示例文档2026最终版.docx".into()];
+            e.col = 24; // 末行
+            e.comp = String::new();
+            e.composing = false;
+            e.wrap_w = Some(80.0);
+        }
+        unsafe { target.BeginDraw() };
+        let drawn = draw_scene(target, &theme, &scene, &IconStore::new(), &formats);
+        let ended = unsafe { target.EndDraw(None, None) };
+        ended.expect("EndDraw 应成功（多行折行帧）");
+        drawn.expect("折行重命名框必须绘制成功（逐视觉行 + 多行光标）");
 
         unsafe {
             let _ = SelectObject(mem_dc, old);
             let _ = DeleteObject(HGDIOBJ(dib.0));
             let _ = DeleteDC(mem_dc);
         }
-        ended.expect("EndDraw 应成功");
-        drawn.expect("含内联编辑框的场景必须绘制成功");
     }
 }

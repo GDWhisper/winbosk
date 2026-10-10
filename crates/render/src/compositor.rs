@@ -210,6 +210,24 @@ impl Compositor {
         })
     }
 
+    /// 主题变化（DPI 缩放）：重建文本格式并替换本层持有的主题副本。
+    ///
+    /// **为什么必须显式同步**：App 与 Render 各持一份 `Theme`——App 用 `rt.theme` 算框宽、
+    /// 折行行数、光标/点击行号，本层用 `self.theme`/`self.formats` 画字。显示器缩放变化
+    /// （`OverlayEvent::DpiChanged`）只更新了 App 那份；不同步的后果是「App 按新字号定宽折行、
+    /// 本层按旧字号画字」——字形溢出框被裁、折行行号与光标全错。
+    pub fn set_theme(&mut self, theme: Theme) -> Result<()> {
+        let formats = TextFormats::new(&self.device.dwrite, &theme)?;
+        self.theme = theme;
+        self.formats = formats;
+        tracing::info!(
+            scale = self.theme.scale,
+            label = self.theme.label.size,
+            "compositor: 主题已同步（文本格式重建）"
+        );
+        Ok(())
+    }
+
     /// 呈现一帧：先按内容包围盒确认表面尺寸，再上传新图标位图、绘制整个场景、
     /// 同步模糊视觉、提交。
     ///

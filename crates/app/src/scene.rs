@@ -41,13 +41,12 @@ pub(crate) fn list_auto_width(rt: &Runtime, fence: usize) -> f32 {
     (base + fixed).max(420.0 * s)
 }
 
-/// 粗略估算标签文本宽度（CJK 按字号宽，ASCII 按 0.62 倍宽）。
+/// 粗略估算标签文本宽度（委托 `winbosk_core::text::estimate_width`，全工程唯一平均口径）。
+///
+/// 容器尺寸（重命名框、工具提示）**不要**用它——全大写 / `W M @` 类名字会被低估，
+/// 见 [`winbosk_core::text::upper_width`]（上界口径）。
 pub(crate) fn label_width(text: &str, font_size: f32) -> f32 {
-    let units: f32 = text
-        .chars()
-        .map(|c| if c.is_ascii() { 0.62 } else { 1.0 })
-        .sum();
-    units * font_size
+    winbosk_core::text::estimate_width(text, font_size)
 }
 
 /// 用 Shell API 获取用户桌面文件夹的真实路径。
@@ -267,6 +266,10 @@ pub(crate) fn build_scene(rt: &mut Runtime, now: Instant) -> Scene {
         }
         scene.console = Some(console);
     }
+    // 就地重命名：编辑框宽度跟随当前文本生长（Windows 行为，长文件名不截断）。
+    // 必须早于 `scene.edit` 与命中模型（`hit_model_from` 在 `build_scene` 之后跑）：
+    // 绘制、窗口区域、点击热区三者共用本帧最终矩形。
+    refresh_rename_rect(rt);
     // 内联编辑（最后绘制，浮于所有内容之上）
     scene.edit = rt.edit.as_ref().map(|e| SceneEdit {
         rect: e.rect,
@@ -275,6 +278,8 @@ pub(crate) fn build_scene(rt: &mut Runtime, now: Instant) -> Scene {
         col: e.col,
         placeholder: e.placeholder.clone(),
         single_line: e.single_line,
+        // 折行预算随矩形一起进场景：绘制层必须与 App 层用同一个预算折行
+        wrap_w: e.wrap_w,
         focused: e.focused,
         composing: e.composing,
         comp: e.comp.clone(),
@@ -2502,6 +2507,15 @@ pub(crate) fn estimate_text_width(text: &str, font_size: f32) -> f32 {
     winbosk_core::text::estimate_width(text, font_size)
 }
 
+/// 「按**上界**宽度求容器宽度」时的统一安全余量（吸收 DPI 取整、抗锯齿与字体差异）。
+///
+/// 上界口径见 [`winbosk_core::text::upper_width`]：容器尺寸**不许**用平均口径
+/// `estimate_width`——全大写或 `W/M/@` 类名字的真实字宽可达 0.9 em 以上，
+/// 用 0.62 em 的估算算出来的容器会让 DirectWrite 画出的字形溢出被裁。
+/// 当前消费者：侧边栏悬停工具提示（`sidebar_tooltip_rect`）与就地重命名框
+/// （[`crate::editing::rename_edit_rect`]）——两处同源，不许各写一个字面量。
+pub(crate) const TEXT_WIDTH_SLACK: f32 = 1.2;
+
 /// 侧边栏工具提示所需的屏幕/主题几何（虚拟屏尺寸、字号、缩放、停靠边），
 /// 供 `sidebar_tooltip_rect` 归组传参，避免长参数列表。
 #[derive(Debug, Clone, Copy)]
@@ -2516,11 +2530,12 @@ pub(crate) struct SidebarGeom {
 /// 侧边栏悬停工具提示矩形：完整名称放在图标旁侧，钳制到虚拟屏幕内。
 ///
 /// 纵向 dock（左/右）放图标右侧/左侧、垂直居中对齐；横向 dock（上）放图标下方、
-/// 水平居中对齐。宽度按文本估算 + 20% 安全余量，保证绘制层按同一口径判断时
-/// 不会截断文字。
+/// 水平居中对齐。宽度按文本**上界**宽 + [`TEXT_WIDTH_SLACK`] 安全余量，保证绘制层
+/// 按同一口径判断时不会截断文字（平均口径对全大写名会低估，见 `upper_width`）。
 pub(crate) fn sidebar_tooltip_rect(geom: &SidebarGeom, icon: &SceneIcon, label: &str) -> RectF {
     let pad = 7.0 * geom.scale;
-    let w = (estimate_text_width(label, geom.font_size) * 1.2 + pad * 2.0).max(geom.font_size);
+    let w = (winbosk_core::text::upper_width(label, geom.font_size) * TEXT_WIDTH_SLACK + pad * 2.0)
+        .max(geom.font_size);
     let h = geom.font_size * 1.6 + pad * 2.0;
     let gap = 10.0 * geom.scale;
     let (mut x, mut y) = match geom.pos {

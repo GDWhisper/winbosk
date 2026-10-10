@@ -387,6 +387,10 @@ pub struct SceneEdit {
     pub col: usize,
     pub placeholder: String,
     pub single_line: bool,
+    /// 视觉折行的估算宽度预算（`font_size` 同口径）：`Some` = 宽度有界、超出换行显示
+    /// （就地重命名框，见 `crates/app/src/editing.rs::rename_edit_rect`）；
+    /// `None` = 不折行（规则输入框 / 便签按逻辑行绘制）。
+    pub wrap_w: Option<f32>,
     pub focused: bool,
     pub composing: bool,
     pub comp: String,
@@ -471,6 +475,17 @@ impl Scene {
                 max_y = max_y.max(r.y + r.h);
                 any = true;
             }
+        }
+        // 内联编辑框（就地重命名 / 规则输入）：重命名框宽度随文本生长，可**远伸出**所属
+        // 栅栏之外。它与 overlay 的窗口区域（`build_region`）是两个独立的裁剪口，缺一不可：
+        // 只并进窗口区域而漏了这里，超出表面的那一段就是不画（症状 = 输入框被切掉一截，
+        // 长文件名依旧看不全），与占位框/拖动幽灵漏并的症状完全一样。
+        if let Some(e) = &self.edit {
+            min_x = min_x.min(e.rect.x);
+            min_y = min_y.min(e.rect.y);
+            max_x = max_x.max(e.rect.x + e.rect.w);
+            max_y = max_y.max(e.rect.y + e.rect.h);
+            any = true;
         }
         if !any {
             return None;
@@ -615,5 +630,43 @@ mod tests {
         assert_eq!(r.x, 10.0);
         assert_eq!(r.y, 20.0);
         assert_eq!(r.h, 300.0);
+    }
+
+    #[test]
+    fn content_rect_covers_inline_edit() {
+        // 就地重命名框随文本变宽，可远伸出所属栅栏 → 必须并入包围盒，否则合成表面
+        // 把长出来的部分裁掉（长文件名依旧看不全）。
+        let mut s = Scene::new(3072.0, 1920.0);
+        s.fences = vec![test_fence()]; // (10,20,100,80)
+        let edit_rect = RectF {
+            x: -300.0,
+            y: 60.0,
+            w: 900.0,
+            h: 30.0,
+        };
+        s.edit = Some(SceneEdit {
+            rect: edit_rect,
+            lines: vec!["一个很长很长的文件名示例.docx".into()],
+            line: 0,
+            col: 0,
+            placeholder: String::new(),
+            single_line: true,
+            wrap_w: Some(180.0),
+            focused: true,
+            composing: false,
+            comp: String::new(),
+        });
+        let r = s.content_rect().expect("有内容应返回包围盒");
+        assert_eq!(r.x, edit_rect.x);
+        assert_eq!(r.w, edit_rect.w); // -300 .. 600 完全罩住栅栏
+        assert_eq!(r.y, 20.0); // 纵向仍由栅栏（20..100）撑开：编辑框 60..90 落在其中
+        assert_eq!(r.h, 80.0);
+        // 只有编辑框、没有任何栅栏时也必须返回包围盒（否则表面不建 → 输入框根本不可见）
+        let mut only_edit = Scene::new(3072.0, 1920.0);
+        only_edit.edit = s.edit.clone();
+        let r2 = only_edit.content_rect().expect("仅编辑框也要有包围盒");
+        assert_eq!(r2.x, edit_rect.x);
+        assert_eq!(r2.w, edit_rect.w);
+        assert_eq!(r2.h, edit_rect.h);
     }
 }

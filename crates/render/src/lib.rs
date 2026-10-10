@@ -46,4 +46,4 @@ pub use scene::{
     SceneHotkeyRow, SceneIcon, SceneRuleEditor, SceneSettingsPage,
 };
 pub use surface::{CompositionSurface, Frame};
-pub use theme::{ControlMetrics, Theme, GRID_CAPTION_H_MULT};
+pub use theme::{ControlMetrics, Theme, EDIT_LINE_H_MULT, GRID_CAPTION_H_MULT};
