@@ -50,6 +50,13 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 $env:WINBOSK_AUTOSTOP_MS="2000"; .\target\debug\winbosk.exe
 ```
 
+> **发版不要在本机构建 release 产物**：Windows 会锁住正在运行的可执行映像，链接阶段直接
+> `LNK1104`；而干净退出实例本身也有代价（硬杀会跳过 `Drop`，`IconGuard` 不恢复桌面图标）。
+> 发版一律走 GitHub Actions——推 `v*` 标签或 `workflow_dispatch`，由 CI 在干净的
+> `windows-latest` runner 上出产物。流程、产物清单与发版前检查清单见
+> [`docs/release-guide.md`](file:///g:/Codes/sylva/docs/release-guide.md)。
+> 上面的本地命令只用于开发期预检，跑之前同样要先退出运行实例。
+
 （另：**不要把两条 `cargo` 命令并行跑**——同一个 `target/` 目录会互相踩增量构建，偶发 `拒绝访问 (os error 5)` 甚至 rustc ICE。）
 
 **构建环境硬约束（2026-09-23 实测补齐）**：
@@ -245,4 +252,5 @@ $env:WINBOSK_AUTOSTOP_MS="2000"; .\target\debug\winbosk.exe
 - 软件工程实施计划编写规范与自查六律：见 [`docs/engineering-plan-guidelines.md`](file:///g:/Codes/winbosk/docs/engineering-plan-guidelines.md)
 - 架构设计演进历史与废弃技术方案（如 egui 移除记录）：见 [`docs/design/2026-08-14-desktop-fence-organizer-design.md`](file:///g:/Codes/winbosk/docs/design/2026-08-14-desktop-fence-organizer-design.md)
 - 完整 CI 自动化流水线配置：见 [`.github/workflows/ci.yml`](file:///g:/Codes/winbosk/.github/workflows/ci.yml)
+- 发布流程、产物清单与发版前检查清单：见 [`docs/release-guide.md`](file:///g:/Codes/sylva/docs/release-guide.md)（**发版走 GitHub Actions，不在本机构建 release 产物**）
 - 安装器实现细节与打包细节：见 [`scripts/installer/`](file:///g:/Codes/winbosk/scripts/installer/) 与 [`scripts/package-msix.ps1`](file:///g:/Codes/winbosk/scripts/package-msix.ps1)
