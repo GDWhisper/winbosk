@@ -116,6 +116,12 @@ pub const WM_TRAY: u32 = 0x8000 + 3;
 /// 模态丢弃语义（见 `set_event_handler` 注释）。
 pub const WM_APP_ANIM_TICK: u32 = 0x8000 + 4;
 
+/// 第二实例唤醒消息（WM_APP + 5）。单实例互斥体被占时，新启动的进程把本消息
+/// 投递给已有实例的 overlay 窗口——与 Ctrl+Alt+T / 托盘左键同语义，切换控制
+/// 中心开合。让「双击没反应」变成「双击唤出控制中心」（release 无控制台，
+/// 静默退出曾只能靠文件日志定位）。
+pub const WM_WINBOSK_WAKE: u32 = 0x8000 + 5;
+
 /// 托盘图标 ID（进程内唯一）。
 const TRAY_ID: u32 = 1;
 
@@ -1939,6 +1945,15 @@ unsafe extern "system" fn wnd_proc(
         // 外部信号：干净退出消息循环（wnd_proc 跑在主线程，PostQuitMessage 投递到主队列）
         WM_APP_QUIT => {
             unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        // 第二实例唤醒：与控制中心热键 / 托盘左键同语义（切换面板开合）
+        WM_WINBOSK_WAKE => {
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ptr.is_null() {
+                let state = unsafe { &mut *ptr };
+                emit_event(hwnd, state, OverlayEvent::ConsoleToggle);
+            }
             LRESULT(0)
         }
         // 外部关闭请求（用户点关闭按钮 / Alt+F4 / 任务管理器「结束任务」发 WM_CLOSE）：

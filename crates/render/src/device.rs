@@ -7,7 +7,7 @@
 //! （探针实测：缺 DispatcherQueue 时 `Compositor::new()` 返回 E_ACCESSDENIED）。
 //! DispatcherQueue 控制器必须存活到合成器销毁，这里一并持有。
 
-use windows::core::{Interface, Result};
+use windows::core::{Error, Interface, Result};
 use windows::System::DispatcherQueueController;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct2D::{
@@ -23,7 +23,10 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_ISOLATED,
 };
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Dxgi::{
+    IDXGIDevice, DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+    DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+};
 use windows::Win32::System::WinRT::Composition::ICompositorInterop;
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_STA, DQTYPE_THREAD_CURRENT,
@@ -68,49 +71,7 @@ impl RenderDevice {
         };
 
         // D3D11 设备需带 BGRA 支持才能被 D2D 使用。
-        // 硬件驱动失败（远程桌面 / 虚拟机 / 驱动异常）时降级 WARP 软件光栅化——
-        // 糊但能启动，不再「启动即退出」。这是无 GPU 环境兼容性的核心兜底。
-        const HW_FLS: [D3D_FEATURE_LEVEL; 4] = [
-            D3D_FEATURE_LEVEL_11_1,
-            D3D_FEATURE_LEVEL_11_0,
-            D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_10_0,
-        ];
-        const WARP_FLS: [D3D_FEATURE_LEVEL; 3] = [
-            D3D_FEATURE_LEVEL_11_0,
-            D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_10_0,
-        ];
-        let mut d3d: Option<ID3D11Device> = None;
-        let mut last_err: Option<windows::core::Error> = None;
-        for (driver, fls) in [
-            (D3D_DRIVER_TYPE_HARDWARE, &HW_FLS[..]),
-            (D3D_DRIVER_TYPE_WARP, &WARP_FLS[..]),
-        ] {
-            let mut dev: Option<ID3D11Device> = None;
-            let r = unsafe {
-                D3D11CreateDevice(
-                    None, // 默认适配器
-                    driver,
-                    HMODULE::default(),
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    Some(fls),
-                    D3D11_SDK_VERSION,
-                    Some(&mut dev),
-                    None,
-                    None,
-                )
-            };
-            match r {
-                Ok(()) => {
-                    d3d = dev;
-                    break;
-                }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        let d3d =
-            d3d.ok_or_else(|| last_err.expect("至少尝试过一次 D3D11CreateDevice，必有错误可上报"))?;
+        let d3d = create_d3d_device()?;
 
         let dxgi: IDXGIDevice = d3d.cast()?;
         let d2d: ID2D1Factory =
@@ -136,6 +97,95 @@ impl RenderDevice {
             _dq: dq,
         })
     }
+
+    /// GPU 设备丢失后的重建：只换绑依赖 D3D11 设备的部分（D3D11 → DXGI → D2D
+    /// 设备 → 合成图形设备）。D2D / DWrite 工厂与 WinRT 合成器不绑定具体 D3D
+    /// 设备，连同 DispatcherQueue 一并保留。
+    ///
+    /// 驱动重载（显卡驱动更新 / TDR / GPU 重置）后旧设备永久失效，
+    /// `DXGI_ERROR_DEVICE_REMOVED` 不会自愈。不换绑的后果是进程「活着但画不出
+    /// 任何东西」：热键与托盘照响、事件回路照跑，画面全停。
+    pub fn rebind_graphics_device(&mut self) -> Result<()> {
+        let d3d = create_d3d_device()?;
+        let dxgi: IDXGIDevice = d3d.cast()?;
+        let d2d1: ID2D1Factory1 = self.d2d.clone().cast()?;
+        let d2d_device: ID2D1Device = unsafe { d2d1.CreateDevice(&dxgi)? };
+        // 图形设备从**既有**合成器重新创建：合成器与 DispatcherQueue 不随设备
+        // 丢失失效，重建合成器反而要重新挂 DesktopWindowTarget（会闪烁）。
+        let c_interop: ICompositorInterop = self.compositor.cast()?;
+        let gfx_device = unsafe { c_interop.CreateGraphicsDevice(&d2d_device)? };
+        self._d3d = d3d;
+        self._dxgi = dxgi;
+        self._d2d_device = d2d_device;
+        self.gfx_device = gfx_device;
+        tracing::info!("渲染设备已换绑新图形设备");
+        Ok(())
+    }
+
+    /// 设备移除原因（`GetDeviceRemovedReason`）。设备健康时返回 `Ok(())`；
+    /// 丢失时返回带 HRESULT 的 `Err`（TDR / 驱动更新 / 硬件问题的区别在这里）。
+    pub fn device_removed_reason(&self) -> Result<()> {
+        unsafe { self._d3d.GetDeviceRemovedReason() }
+    }
+}
+
+/// 创建 D3D11 设备：优先硬件加速；硬件驱动失败（远程桌面 / 虚拟机 / 驱动异常）
+/// 降级 WARP 软件光栅化——糊但能启动，不再「启动即退出」。设备丢失后重建也走这里。
+fn create_d3d_device() -> Result<ID3D11Device> {
+    const HW_FLS: [D3D_FEATURE_LEVEL; 4] = [
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    ];
+    const WARP_FLS: [D3D_FEATURE_LEVEL; 3] = [
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    ];
+    let mut d3d: Option<ID3D11Device> = None;
+    let mut last_err: Option<Error> = None;
+    for (driver, fls) in [
+        (D3D_DRIVER_TYPE_HARDWARE, &HW_FLS[..]),
+        (D3D_DRIVER_TYPE_WARP, &WARP_FLS[..]),
+    ] {
+        let mut dev: Option<ID3D11Device> = None;
+        let r = unsafe {
+            D3D11CreateDevice(
+                None, // 默认适配器
+                driver,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(fls),
+                D3D11_SDK_VERSION,
+                Some(&mut dev),
+                None,
+                None,
+            )
+        };
+        match r {
+            Ok(()) => {
+                d3d = dev;
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    d3d.ok_or_else(|| last_err.expect("至少尝试过一次 D3D11CreateDevice，必有错误可上报"))
+}
+
+/// 该错误是否表示 D3D11 设备已丢失（继续绘制前必须换绑设备）。
+///
+/// 驱动重载（显卡驱动更新 / TDR / GPU 重置）后进程内设备被永久移除，此后每次
+/// 绘制都返回这几个 HRESULT；它们不会自愈，只能重建（见
+/// [`RenderDevice::rebind_graphics_device`]）。其余错误（参数错误等）与此无关，
+/// 走原告警路径，不触发重建。
+pub fn is_device_lost(err: &Error) -> bool {
+    let code = err.code();
+    code == DXGI_ERROR_DEVICE_REMOVED
+        || code == DXGI_ERROR_DEVICE_RESET
+        || code == DXGI_ERROR_DEVICE_HUNG
+        || code == DXGI_ERROR_DRIVER_INTERNAL_ERROR
 }
 
 #[cfg(test)]
@@ -156,6 +206,57 @@ mod tests {
             }
             Err(e) => eprintln!("无 GPU 上下文，跳过（CI/远程环境预期行为）: {e:?}"),
         }
+    }
+
+    /// 设备丢失错误码分类：DXGI 设备移除族必须识别为「需重建」，
+    /// 其余错误（参数错误等）不得触发重建路径。
+    #[test]
+    fn device_lost_codes_are_classified() {
+        use windows::Win32::Foundation::E_INVALIDARG;
+        use windows::Win32::Graphics::Dxgi::{
+            DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+            DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+        };
+        for code in [
+            DXGI_ERROR_DEVICE_REMOVED,
+            DXGI_ERROR_DEVICE_RESET,
+            DXGI_ERROR_DEVICE_HUNG,
+            DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+        ] {
+            assert!(
+                is_device_lost(&Error::from(code)),
+                "{code:?} 应判为设备丢失"
+            );
+        }
+        assert!(!is_device_lost(&Error::from(E_INVALIDARG)));
+    }
+
+    /// 设备丢失恢复的地基：同一 STA 线程反复换绑图形设备必须成功（合成器 /
+    /// DispatcherQueue 保留，只重建 D3D11 → D2D → 合成图形设备），且换绑后
+    /// 仍能创建绘制表面。无 GPU 环境（CI headless）允许跳过。
+    #[test]
+    fn render_device_rebinds_graphics_on_same_thread() {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        // 应用真实环境：STA COM（RenderDevice::new 内部还需 DispatcherQueue）。
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
+        }
+        let Ok(mut dev) = RenderDevice::new() else {
+            eprintln!("无 GPU 上下文，跳过（CI/远程环境预期行为）");
+            return;
+        };
+        // 健康设备问原因应返回 Ok（设备没被移除）
+        assert!(dev.device_removed_reason().is_ok());
+        // 连续两次换绑：恢复路径可能被重复触发（重建失败后重试）
+        assert!(dev.rebind_graphics_device().is_ok(), "首次换绑失败");
+        assert!(dev.rebind_graphics_device().is_ok(), "二次换绑失败");
+        // 换绑后绘制表面必须还能创建（否则恢复后照样一帧都画不出）
+        let surface = crate::surface::CompositionSurface::new(&dev.gfx_device, 8, 8);
+        assert!(
+            surface.is_ok(),
+            "换绑后无法创建绘制表面: {:?}",
+            surface.err()
+        );
     }
 
     #[test]

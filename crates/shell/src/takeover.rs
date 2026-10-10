@@ -95,7 +95,16 @@ const CLASS_OVERLAY: &str = "WinBoskOverlay";
 /// 结果仅作提示：上次退出若卡在 `DestroyWindow` 之前，overlay 仍在，会误报 alive；
 /// 定案证据以收尾阶段埋点为准。
 pub fn overlay_window_alive() -> bool {
-    find_class_window(CLASS_OVERLAY).is_some()
+    overlay_window().is_some()
+}
+
+/// overlay 窗口句柄（按类名只读查找）。存活判定与第二实例唤醒共用。
+///
+/// 查找方式与 [`overlay_window_alive`] 同款：顶层 `FindWindowW`（overlay 是
+/// WS_POPUP 顶层窗口，WorkerW 只是 owner），禁止复用 [`probe`]（会发
+/// `WM_SPAWN_WORKERW`，在被拒的第二实例里多余且可能拖住本进程）。
+pub fn overlay_window() -> Option<HWND> {
+    find_class_window(CLASS_OVERLAY)
 }
 
 /// 探测桌面窗口层级。

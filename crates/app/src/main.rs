@@ -21,6 +21,7 @@ mod file_ops;
 mod hotkeys;
 mod logging;
 mod memory;
+mod recover;
 mod scene;
 mod shell_menu;
 mod watchdog;
@@ -95,10 +96,11 @@ pub(crate) use winbosk_core::model::{
     Vec2,
 };
 pub(crate) use winbosk_render::{
-    run_message_loop, Compositor, ConsoleHit, ConsoleZone, FenceHit, HitModel, IconHit,
-    ListColumns, OverlayEvent, OverlayWindow, RectF, RenderDevice, ResizeZone, Scene, SceneConsole,
-    SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow, SceneIcon, SceneRuleEditor, Theme,
-    GRID_CAPTION_H_MULT, GRIP_SIZE, WM_APP_QUIT, WM_WINBOSK_INJECT,
+    is_device_lost, run_message_loop, Compositor, ConsoleHit, ConsoleZone, FenceHit, HitModel,
+    IconHit, ListColumns, OverlayEvent, OverlayWindow, RectF, RenderDevice, ResizeZone, Scene,
+    SceneConsole, SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow, SceneIcon,
+    SceneRuleEditor, Theme, GRID_CAPTION_H_MULT, GRIP_SIZE, WM_APP_QUIT, WM_WINBOSK_INJECT,
+    WM_WINBOSK_WAKE,
 };
 pub(crate) use winbosk_shell::icons::IconData;
 pub(crate) use winbosk_shell::items::DesktopItem;
@@ -514,6 +516,10 @@ pub(crate) struct Runtime {
     /// 普通窗口之上看一眼」的会话位，重启后一律回到桌面带（与控制的提权不持久化同理）。
     /// 是否为真的唯一出口是 `set_fences_front`，Z 序推送统一走 `sync_front_band`。
     pub(crate) fences_front: bool,
+    /// 最近一次 GPU 设备重建尝试时间（失败限频用；成功时清零）。
+    /// 驱动重载后设备永久失效，`recover::try_recover` 靠它把重建尝试限制为
+    /// 每 2 秒一次，避免补间动画把每帧都变成一次全量重建。
+    pub(crate) device_recover_at: Option<std::time::Instant>,
 }
 
 impl Runtime {
@@ -591,7 +597,19 @@ fn main() {
         // best-effort 提示：仅做只读窗口检索、不发任何消息，不作判据（僵尸若卡在
         // DestroyWindow 之前 overlay 仍在，会误报 alive；定案证据以收尾阶段埋点为准）。
         let overlay_alive = winbosk_shell::takeover::overlay_window_alive();
-        tracing::warn!(overlay_alive, "WinBosk 已在运行，本次启动退出（单实例）");
+        // 唤醒已有实例的控制中心（与 Ctrl+Alt+T / 托盘左键同语义）：用户再次双击
+        // exe 的意图就是「把面板叫出来」。收不到窗口（僵尸 / 跨桌面）时只留日志，
+        // 行为与从前一致——静默退出。
+        let woken = winbosk_shell::takeover::overlay_window()
+            .map(|hw| unsafe {
+                PostMessageW(Some(hw), WM_WINBOSK_WAKE, WPARAM(0), LPARAM(0)).is_ok()
+            })
+            .unwrap_or(false);
+        tracing::warn!(
+            overlay_alive,
+            woken,
+            "WinBosk 已在运行，本次启动退出（单实例）"
+        );
         if !overlay_alive {
             tracing::warn!(
                 "未检测到 WinBosk overlay 窗口：可能是上次退出遗留的进程，请在任务管理器结束 winbosk.exe 后重试"
@@ -840,7 +858,16 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
         recording_hotkey: None,
         hotkey_conflicts: HashMap::new(),
         fences_front: false,
+        device_recover_at: None,
     };
+    // 上次退出时控制中心仍开着：此刻必须补一次提权。`console_open` 是持久化的，而
+    // `sync_front_band` 只挂在开合/开关两条交互路径上——启动路径不调它，overlay 就留在
+    // 桌面带，面板画得出来却压在普通窗口（浏览器、全屏应用）之下，用户看到「控制中心
+    // 不见了」。两个来源全假时 overlay 本就构造在桌面带，无需回落，故只在开着时提权。
+    if rt.desk.console_open {
+        sync_front_band(&mut rt);
+        tracing::info!("启动即提权：上次退出时控制中心处于展开状态");
+    }
     hotkeys::apply_all_hotkeys(&mut rt);
     // 双向同步：启动时清一次——内部库被外部删除的文件、链接文件夹与栅栏的差集，
     // 都同步进栅栏（链接文件夹的预置文件启动即出现）。
@@ -871,9 +898,17 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
     let mut upload_refs: Vec<(u64, &winbosk_shell::icons::IconData)> =
         uploads.iter().map(|(id, d)| (*id, d)).collect();
     upload_refs.extend(rt.pending_uploads.iter().map(|(id, d)| (*id, d)));
-    rt.compositor
-        .present(&scene, &upload_refs)
-        .map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
+    // 首帧呈现：设备已被外部移除（驱动重载/TDR）时不能当致命错误退出——那正是
+    // 「重启也呼不出控制中心」的现场（进程起来了，却一帧都画不出）。这里与事件回路
+    // 同一口径：识别设备丢失 → 走恢复 → 用同一场景再呈一次。
+    match rt.compositor.present(&scene, &upload_refs) {
+        Ok(()) => {}
+        Err(e) if is_device_lost(&e) => {
+            tracing::warn!("首帧呈现遭遇设备丢失，立即恢复: {e}");
+            recover::try_recover(&mut rt, &scene);
+        }
+        Err(e) => return Err(winbosk_core::CoreError::Render(e.to_string())),
+    }
     let model = hit_model_from(&rt.theme, &scene, &rt.desk);
     memory::report("首帧呈现后");
     // Shell 右键菜单预热：后台加载栅栏里文件类型的 Shell 扩展（百度网盘等扩展首次
@@ -2395,10 +2430,11 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
         OverlayEvent::Char { ch } => {
             edit_char(rt, ch);
         }
-        OverlayEvent::EditCaret { x } => {
+        OverlayEvent::EditCaret { x, y } => {
             // 鼠标点编辑框内文本：光标跳到对应字符（不触发「点击别处提交」，
-            // 该事件由 overlay 命中模型把框内点击单独路由而来）
-            edit_click(rt, x);
+            // 该事件由 overlay 命中模型把框内点击单独路由而来）。
+            // `y` 用于折行框判行（宽度有界时的多行重命名，见 editing.rs::rename_edit_rect）。
+            edit_click(rt, x, y);
         }
         OverlayEvent::ImeStart => {
             if let Some(e) = rt.edit.as_mut() {
@@ -2537,6 +2573,11 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 let mut t = Theme::default();
                 apply_theme_scale(&mut t, scale);
                 rt.theme = t;
+                // 渲染层持有主题与文本格式的副本：必须同帧同步重建，否则 App 按新字号
+                // 定宽/折行/定位光标，渲染层仍按旧字号画字——字形溢出框被裁、折行行号错位。
+                if let Err(e) = rt.compositor.set_theme(rt.theme.clone()) {
+                    tracing::warn!("DPI 变化：重建文本格式失败（沿用旧字号）: {e}");
+                }
                 if reanchor_fences(rt) {
                     let _ = rt.store.save(&rt.desk);
                 }
@@ -2628,7 +2669,14 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
     let ups = std::mem::take(&mut rt.pending_uploads);
     let upload_refs: Vec<(u64, &IconData)> = ups.iter().map(|(id, d)| (*id, d)).collect();
     if let Err(e) = rt.compositor.present(&scene, &upload_refs) {
-        tracing::warn!("重绘失败: {e}");
+        // 驱动重载 / TDR：D3D11 设备被移除后不会自愈。不重建 = 进程活着但画不出
+        // （热键照响、画面全停，控制中心永远呼不出来）。重建成功时本帧已在
+        // `try_recover` 内用新设备重绘，失败时有自己的分级日志与限频。
+        if is_device_lost(&e) {
+            recover::try_recover(rt, &scene);
+        } else {
+            tracing::warn!("重绘失败: {e}");
+        }
     }
     Some(hit_model_from(&rt.theme, &scene, &rt.desk))
 }

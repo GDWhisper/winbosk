@@ -34,12 +34,13 @@ pub mod surface;
 pub mod theme;
 
 pub use compositor::Compositor;
-pub use device::RenderDevice;
+pub use device::{is_device_lost, RenderDevice};
 pub use draw::{draw_scene, IconStore, TextFormats};
 pub use overlay::{
     run_message_loop, ConsoleHit, ConsoleZone, FenceHit, HitModel, IconHit, OverlayEvent,
     OverlayWindow, RectF, ResizeZone, GRIP_SIZE, HOTKEY_AUTO_ORGANIZE, HOTKEY_CONSOLE,
     HOTKEY_DESKTOP, HOTKEY_FENCES_FRONT, HOTKEY_QUIT, WM_APP_QUIT, WM_WINBOSK_INJECT,
+    WM_WINBOSK_WAKE,
 };
 pub use scene::{
     ListColumns, Scene, SceneConsole, SceneEdit, SceneFence, SceneFenceDetail, SceneFenceRow,

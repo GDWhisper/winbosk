@@ -228,6 +228,41 @@ impl Compositor {
         Ok(())
     }
 
+    /// GPU 设备丢失后的恢复：换绑新图形设备、按当前覆盖矩形重建绘制表面、清空位图缓存。
+    ///
+    /// 只重建**绑定到 D3D 设备**的资源（绘制表面 + 图标位图）。WinRT 合成器、桌面窗口
+    /// 目标、视觉树（根 / 内容 / 模糊视觉）与 DWrite 文本格式都不依赖本进程的 D3D 设备
+    /// ——重新挂 `DesktopWindowTarget` 会闪烁，且同线程二次创建合成器有 DispatcherQueue
+    /// 前置条件的风险，故一律保留。
+    ///
+    /// 位图清空后调用方必须重新上传全部图标（`Compositor` 不持有 `DesktopItem`），
+    /// 否则场景里的 `bitmap_id` 全部落空、图标不显示。
+    pub fn recover_from_device_loss(&mut self) -> Result<()> {
+        self.device.rebind_graphics_device()?;
+        // 旧表面随设备失效，必须在这里就换掉：`present` 的 `ensure_covering` 在
+        // 「当前表面仍盖住内容」时判定沿用，那会把帧画进已死的表面。
+        let (sw, sh) = (
+            self.surface_rect.w.max(1.0).ceil() as u32,
+            self.surface_rect.h.max(1.0).ceil() as u32,
+        );
+        let surface = CompositionSurface::new(&self.device.gfx_device, sw, sh)?;
+        let brush = self
+            .device
+            .compositor
+            .CreateSurfaceBrushWithSurface(surface.raw())?;
+        self.content.SetBrush(&brush)?;
+        self.surface = surface;
+        // 图标位图是设备级资源（D2D 位图随设备销毁），全部失效
+        self.icons = IconStore::new();
+        tracing::info!(sw, sh, "合成器已换绑新图形设备并重建绘制表面");
+        Ok(())
+    }
+
+    /// 设备移除原因（透传 [`RenderDevice::device_removed_reason`]）。
+    pub fn device_removed_reason(&self) -> Result<()> {
+        self.device.device_removed_reason()
+    }
+
     /// 呈现一帧：先按内容包围盒确认表面尺寸，再上传新图标位图、绘制整个场景、
     /// 同步模糊视觉、提交。
     ///
@@ -498,6 +533,88 @@ impl Compositor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 设备丢失恢复端到端：真实窗口 + 合成器上验证「换绑设备 → 重建绘制表面 →
+    /// 仍能 present」。缺 GPU / 建不了窗口 / 无法呈现（CI headless）时任一步
+    /// 失败即跳过，与 `device` 测试同款约定；换绑本身失败则必须炸。
+    #[test]
+    fn recover_from_device_loss_keeps_presenting() {
+        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WNDCLASSW,
+            WS_OVERLAPPEDWINDOW,
+        };
+
+        unsafe extern "system" fn test_wndproc(
+            hwnd: HWND,
+            msg: u32,
+            w: WPARAM,
+            l: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        }
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
+        }
+        let Ok(device) = RenderDevice::new() else {
+            eprintln!("无 GPU 上下文，跳过（CI/远程环境预期行为）");
+            return;
+        };
+        // 离屏测试窗口：DesktopWindowTarget 只需要一个顶层 HWND，不显示、不泵消息
+        let class = wide("WinBoskRecoverTest");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(test_wndproc),
+            lpszClassName: windows::core::PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        if unsafe { RegisterClassW(&wc) } == 0 {
+            eprintln!("注册测试窗口类失败，跳过");
+            return;
+        }
+        let hwnd = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                windows::core::PCWSTR(class.as_ptr()),
+                windows::core::PCWSTR(wide("recover-test").as_ptr()),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let Ok(hwnd) = hwnd else {
+            eprintln!("创建测试窗口失败，跳过");
+            return;
+        };
+        let Ok(mut comp) = Compositor::new(device, hwnd, Theme::default()) else {
+            eprintln!("合成器创建失败（无桌面环境？），跳过");
+            return;
+        };
+        // 空场景：content_rect 为 None，走的是「沿用当前表面」的 present 路径
+        let scene = Scene::new(64.0, 64.0);
+        if let Err(e) = comp.present(&scene, &[]) {
+            eprintln!("健康状态下 present 失败，跳过: {e:?}");
+            return;
+        }
+        // 恢复路径本体：换绑设备 + 重建绘制表面（旧表面已随设备失效）
+        if let Err(e) = comp.recover_from_device_loss() {
+            panic!("设备换绑失败: {e:?}");
+        }
+        if let Err(e) = comp.present(&scene, &[]) {
+            panic!("恢复后 present 失败: {e:?}");
+        }
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
 
     /// 小栅栏（无 Dock）：GROW 撑开后的表面不得被立刻判 oversized 缩回，
     /// 否则拖动中会出现「撑开→缩回→再撑开」的表面反复重建。
