@@ -148,6 +148,11 @@ $env:WINBOSK_AUTOSTOP_MS="2000"; .\target\debug\winbosk.exe
     - **证据**：[`crates/render/src/surface.rs`](file:///g:/Codes/winbosk/crates/render/src/surface.rs)（`impl Drop for Frame`）、[`crates/render/src/draw.rs`](file:///g:/Codes/winbosk/crates/render/src/draw.rs)（`dashed_props` / `DASHES` / `draw_scene_with_reserved_frame_succeeds`）。
     - **原因**：`BeginDraw` 之后绘制表面处于「已获取」状态，只有 `EndDraw` 会把它还回去。`present` 里任何一次 `?` 提前返回都会跳过 `EndDraw`，表面便漏在已获取态，此后**每一帧都失败且无法自愈**（线上实测：一次虚线参数错误 → 每帧 `E_INVALIDARG` 刷屏 → 约 700 帧后转为不可恢复的 `0x80131509`，界面彻底冻死只能重启进程）。故失败路径由 `Drop` 兜底归还；`finish` 先置位再 `EndDraw`，保证恰好调用一次。另一半教训是 D2D 的**参数错误编译期完全看不出来**：`dashes` 非空时 `dashStyle` 必须是 `D2D1_DASH_STYLE_CUSTOM`，否则 `CreateStrokeStyle` 返回 `E_INVALIDARG`。新增绘制代码后，必须靠「内存 DIB + DC 渲染目标真跑一遍 `draw_scene`」的测试（无需 GPU/窗口，CI 可跑）兜住这一类。
 
+15. **Explorer 重启不是「本进程退出」：托盘、桌面接管、退出兜底必须一起自愈；显示拓扑瞬变不得落盘**
+    - **证据**：[`crates/render/src/overlay.rs`](file:///g:/Codes/sylva/crates/render/src/overlay.rs)（`TaskbarCreated` / `add_tray_icon` / `reown`）、[`crates/app/src/main.rs`](file:///g:/Codes/sylva/crates/app/src/main.rs)（`takeover_stale` / `ensure_desktop_takeover` / `TopologySnapshot`）。
+    - **原因**：托盘图标归 Explorer 的任务栏所有，`NIM_ADD` 只在 `create` 里做一次就会在 Explorer 重启后**永久消失**（2026-10-29 现场：WPS 的 Shell 扩展把 explorer 弄崩，用户看到「程序好像退出了」）。overlay 是 `WS_POPUP` 顶层窗口，owner 被内核强杀后**不会**连带销毁——实测 `GetWindow(GW_OWNER)=0` 且窗口仍可点，所以必须重新探测层级、隐藏新的图标层、换 owner，并替换 `IconGuard` 与 `Runtime` 共享的句柄（退出兜底恢复的必须是当前那份）。判据只用 `IsWindow`/`IsWindowVisible` 事实，挂在既有 4s 心跳上；`desktop_mode`（原始桌面）为真时不得把「图标层可见」判为失效。
+    - **另一半**：`WM_DISPLAYCHANGE` 的夹屏**不得立即写盘**。睡眠唤醒/显示器重新协商会先报一个瞬时小尺寸（实测 1024×768 持续 77 秒），写盘会把布局永久改写（6 个栅栏被挤进左上角，两个完全重叠）。夹屏只进内存并由 `TopologySnapshot` 记录前值，拓扑恢复原配置且用户未改布局时回滚；只有 `FenceDragEnd` 这类用户显式布局才写盘。
+
 ---
 
 ## 边界与禁区

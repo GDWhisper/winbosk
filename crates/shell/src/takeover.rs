@@ -12,12 +12,20 @@
 use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, FindWindowExW, FindWindowW, GetClassNameW, GetParent, SendMessageW,
-    ShowWindow, ShowWindowAsync, SW_HIDE, SW_SHOW,
+    EnumChildWindows, FindWindowExW, FindWindowW, GetClassNameW, GetParent, SendMessageTimeoutW,
+    ShowWindow, ShowWindowAsync, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOW,
 };
 
 /// 触发桌面 WorkerW 生成的私有消息（广泛使用的 Progman 技巧）。
 const WM_SPAWN_WORKERW: u32 = 0x052C;
+
+/// 触发 WorkerW 生成的跨进程消息超时（毫秒）。
+///
+/// **必须带超时**：`probe()` 由运行期自愈在 UI 线程周期性调用，explorer 繁忙
+///（重启中 / Shell 扩展卡死）时无超时的 `SendMessageW` 会把本进程主线程一起钉死——
+/// 本仓库 2026-09-28 已有同类停摆现场。超时后照常继续探测（拿不到就由调用方的
+/// 完整性判据重试）。
+const SPAWN_WORKERW_TIMEOUT_MS: u32 = 500;
 
 const CLASS_PROGMAN: &str = "Progman";
 const CLASS_DEFVIEW: &str = "SHELLDLL_DefView";
@@ -116,13 +124,17 @@ pub fn overlay_window() -> Option<HWND> {
 /// 4. 从 DefView 定位 `SysListView32` 与父 WorkerW。
 pub fn probe() -> Option<DesktopHierarchy> {
     let progman = find_class_window(CLASS_PROGMAN)?;
-    // 触发 WorkerW / DefView 生成（幂等）
-    unsafe {
-        SendMessageW(
+    // 触发 WorkerW / DefView 生成（幂等）。带超时 + `SMTO_ABORTIFHUNG`：超时/目标无响应
+    // 都只放弃这次「触发」，继续探测——绝不能把调用方（主线程）钉在跨进程同步等待上。
+    let _ = unsafe {
+        SendMessageTimeoutW(
             progman,
             WM_SPAWN_WORKERW,
             Default::default(),
             Default::default(),
+            SMTO_ABORTIFHUNG,
+            SPAWN_WORKERW_TIMEOUT_MS,
+            None,
         )
     };
 

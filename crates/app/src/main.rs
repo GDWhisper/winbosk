@@ -34,7 +34,7 @@ pub enum ConsolePage {
     Settings,
 }
 
-pub(crate) use std::cell::RefCell;
+pub(crate) use std::cell::{Cell, RefCell};
 pub(crate) use std::collections::HashMap;
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::rc::Rc;
@@ -79,12 +79,13 @@ pub(crate) use windows::Win32::UI::Shell::{
     FOS_PICKFOLDERS, HDROP, SIGDN_FILESYSPATH,
 };
 pub(crate) use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
-    MessageBoxW, PostMessageW, SetForegroundWindow, SetProcessDPIAware, ShowWindowAsync,
-    SystemParametersInfoW, TrackPopupMenu, HMENU, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_OK,
-    MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_SEPARATOR, MF_STRING, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY, TPM_RETURNCMD, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, GetParent,
+    GetSystemMetrics, IsWindow, IsWindowVisible, MessageBoxW, PostMessageW, SetForegroundWindow,
+    SetProcessDPIAware, ShowWindowAsync, SystemParametersInfoW, TrackPopupMenu, HMENU, IDYES,
+    MB_DEFBUTTON2, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE,
+    MF_SEPARATOR, MF_STRING, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY,
+    TPM_RETURNCMD, WM_NULL,
 };
 
 pub(crate) use winbosk_core::config::ConfigStore;
@@ -185,15 +186,23 @@ pub(crate) const TINT_PRESETS: &[(&str, [f32; 3])] = &[
     ("灰", [0.56, 0.58, 0.62]),
 ];
 
+/// 桌面接管句柄的共享单元：`IconGuard`（进程退出兜底恢复）与 `Runtime`（运行期自愈）
+/// 持有**同一份**。Explorer 重启后自愈路径会整体替换它——退出时恢复的必须是
+/// 「当前被隐藏的」那份，而不是启动时那份已随旧 explorer 销毁的句柄。
+///
+/// 用 `Cell` 而不是 `RefCell`：读侧永远只取一份 `Copy` 值，不存在跨借用嵌套，
+/// 运行期自愈与退出守卫不会撞上 `BorrowMutError`。
+pub(crate) type SharedHierarchy = Rc<Cell<DesktopHierarchy>>;
+
 /// RAII：隐藏的真实图标在退出（含错误路径）时无条件恢复。
 /// 反冲突约束的兜底——任何退出路径都不能让桌面图标永久消失。
 struct IconGuard {
-    hierarchy: DesktopHierarchy,
+    hierarchy: SharedHierarchy,
 }
 
 impl IconGuard {
-    fn new(hierarchy: DesktopHierarchy) -> Self {
-        hierarchy.hide_icons();
+    fn new(hierarchy: SharedHierarchy) -> Self {
+        hierarchy.get().hide_icons();
         Self { hierarchy }
     }
 }
@@ -202,7 +211,7 @@ impl Drop for IconGuard {
     fn drop(&mut self) {
         // 异步投递：退出路径绝不等待 explorer 处理（同步版在 explorer 繁忙时会把
         // 本进程的退出钉死）；投递后即使本进程立即结束，explorer 仍会处理该请求。
-        self.hierarchy.restore_icons_async();
+        self.hierarchy.get().restore_icons_async();
     }
 }
 
@@ -328,10 +337,12 @@ fn wait_exit_signal(raw: u64) -> bool {
 
 /// 登记待恢复的真实桌面图标句柄（启动期一次；兜底线程只在置位事件后才读它，
 /// 提前登记无副作用）。
+///
+/// Explorer 重启自愈后会再次调用：必须**整体替换**（含 `None` → 0）——旧句柄已随
+/// 旧 explorer 销毁，退出兜底若还拿着它，恢复请求就落到一个不存在的窗口上。
 fn set_exit_listview(list_view: Option<HWND>) {
-    if let Some(h) = list_view {
-        EXIT_LISTVIEW.store(h.0 as usize as u64, Ordering::Release);
-    }
+    let raw = list_view.map_or(0, |h| h.0 as usize as u64);
+    EXIT_LISTVIEW.store(raw, Ordering::Release);
 }
 
 /// 置位收尾信号——两条兜底线程自此刻起倒计时。手动复位事件保持信号态，可重复调用。
@@ -414,6 +425,28 @@ pub(crate) struct IconDragState {
     pub(crate) cursor: (f32, f32),
 }
 
+/// 显示拓扑瞬变期间的「临时夹屏」快照（瞬态，不持久化）。
+///
+/// `WM_DISPLAYCHANGE` 引起的夹屏只在本快照里记录前值、**不写盘**：睡眠唤醒 / 显示器
+/// 重新协商会先报一个瞬时小尺寸再恢复（2026-10-29 现场：唤醒瞬间报 1024×768，持续
+/// 77 秒；夹屏一旦落盘，6 个栅栏被永久挤进左上角，其中两个完全重叠）。拓扑回到快照
+/// 记录的原配置且用户没动过布局时整体回滚。
+pub(crate) struct TopologySnapshot {
+    /// 变化前的虚拟屏原点与尺寸（三者必须同时匹配才算「恢复」——只比尺寸会把
+    /// 「副屏换边」误判成恢复，原点变了所有栅栏坐标的语义也随之改变）。
+    pub(crate) origin: (f32, f32),
+    pub(crate) vw: f32,
+    pub(crate) vh: f32,
+    /// 夹屏前的栅栏位置，按 **fence id** 记录（期间可能增删栅栏，下标不稳定）。
+    pub(crate) bounds: Vec<(u64, Rect)>,
+}
+
+impl TopologySnapshot {
+    fn matches(&self, origin: (f32, f32), vw: f32, vh: f32) -> bool {
+        self.origin == origin && self.vw == vw && self.vh == vh
+    }
+}
+
 /// 调整栅栏尺寸期间的状态（瞬态，不持久化）。
 ///
 /// 记录拖拽开始时各栅栏的初始状态，确保在单次拖拽中来回拉伸平滑可逆且不发生漂移。
@@ -476,8 +509,8 @@ pub(crate) struct Runtime {
     pub(crate) fence_tweens: Vec<FenceTween>,
     /// 图标悬停放大补间（一次只有一个悬停图标）。
     pub(crate) icon_hover: Option<IconHoverAnim>,
-    /// 桌面层级（保留句柄副本；「切换桌面」时反复隐藏/恢复真实图标）。
-    pub(crate) hierarchy: DesktopHierarchy,
+    /// 桌面层级（与 `IconGuard` 共享同一份；「切换桌面」与 Explorer 重启自愈都走它）。
+    pub(crate) hierarchy: SharedHierarchy,
     /// overlay 窗口原始指针（动画定时器的启停需要访问它；与进程存活期一致）。
     pub(crate) overlay_ptr: *mut OverlayWindow,
     /// 内部库文件夹（软件目录下）：粘贴/拖入的文件先物理复制进来，栅栏索引库内副本。
@@ -520,6 +553,15 @@ pub(crate) struct Runtime {
     /// 驱动重载后设备永久失效，`recover::try_recover` 靠它把重建尝试限制为
     /// 每 2 秒一次，避免补间动画把每帧都变成一次全量重建。
     pub(crate) device_recover_at: Option<std::time::Instant>,
+    /// 未决的拓扑瞬变快照（None = 没有待回滚的临时夹屏，见 [`TopologySnapshot`]）。
+    pub(crate) topology_snapshot: Option<TopologySnapshot>,
+    /// 桌面接管自愈的下一次尝试时刻（None = 当前没有未决失败，见 [`takeover_retry_delay`]）。
+    pub(crate) takeover_retry_at: Option<std::time::Instant>,
+    /// 连续自愈失败次数（决定 `takeover_retry_at` 的退避阶梯；成功即清零）。
+    pub(crate) takeover_failures: u32,
+    /// 托盘图标是否处于「已知丢失」态：启动登记或 `TaskbarCreated` 重登失败时置位，
+    /// 由 4s 心跳补登（`NIM_ADD` 可能早于通知区就绪而失败）。
+    pub(crate) tray_icon_lost: bool,
 }
 
 impl Runtime {
@@ -688,17 +730,20 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
 
     // 1) 壳层接管：探测层级并隐藏真实图标（反冲突约束：不重挂/不销毁他人窗口）。
     //    守卫确保后续任何失败都会恢复图标。
-    let hierarchy = winbosk_shell::takeover::probe()
-        .ok_or_else(|| winbosk_core::CoreError::Shell("未找到桌面根窗口 Progman".into()))?;
-    let _guard = IconGuard::new(hierarchy);
+    //    共享句柄：`IconGuard`（退出兜底）与 `Runtime`（运行期自愈）持有同一份，
+    //    Explorer 重启后自愈替换的是同一个 `Cell`，退出时恢复的永远是当前那份。
+    let hierarchy = Rc::new(Cell::new(winbosk_shell::takeover::probe().ok_or_else(
+        || winbosk_core::CoreError::Shell("未找到桌面根窗口 Progman".into()),
+    )?));
+    let _guard = IconGuard::new(hierarchy.clone());
 
     // 2) GPU 上下文 + overlay + 合成器
     let device = RenderDevice::new().map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
-    let overlay = OverlayWindow::create(hierarchy.overlay_parent())
+    let overlay = OverlayWindow::create(hierarchy.get().overlay_parent())
         .map_err(|e| winbosk_core::CoreError::Render(e.to_string()))?;
     // 收尾兜底就绪：登记待恢复句柄 + 哨兵。放在 overlay 之后 ⇒ 此后任何 `?` 失败
     // 的析构都会先经过哨兵（T1/T2 覆盖「启动失败 → 收尾滞留」，见 `ExitArmGuard`）。
-    set_exit_listview(hierarchy.list_view);
+    set_exit_listview(hierarchy.get().list_view);
     let _exit_arm = ExitArmGuard;
     let (vw, vh) = (overlay.width, overlay.height);
     tracing::info!(vw, vh, "overlay 覆盖虚拟屏幕");
@@ -813,7 +858,7 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
     // 上次退出时若处于「原始桌面」模式：恢复真实图标（IconGuard 刚隐藏过），
     // 栅栏保持隐藏（fence_alpha 取 0，不播放动画）。
     if desk.desktop_mode {
-        hierarchy.restore_icons();
+        hierarchy.get().restore_icons();
     }
     // 真实高度缓冲：与栅栏一一对应，`build_scene` 每帧回写（移动 desk 前取长度）。
     let last_layout_h = vec![0.0; desk.fences.len()];
@@ -859,6 +904,10 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
         hotkey_conflicts: HashMap::new(),
         fences_front: false,
         device_recover_at: None,
+        topology_snapshot: None,
+        takeover_retry_at: None,
+        takeover_failures: 0,
+        tray_icon_lost: !overlay.tray_icon_ok(),
     };
     // 上次退出时控制中心仍开着：此刻必须补一次提权。`console_open` 是持久化的，而
     // `sync_front_band` 只挂在开合/开关两条交互路径上——启动路径不调它，overlay 就留在
@@ -874,14 +923,14 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
     if reconcile_fences(&mut rt) {
         // 链接文件夹同步后图标数变了，侧边栏 bounds 需要重新计算（reanchor 时是空的）
         reanchor_fences(&mut rt);
-        let _ = rt.store.save(&rt.desk);
+        let _ = persist(&rt);
     }
     // 虚拟壳项（回收站）一次性同步：必须在首帧布局之前，否则虚拟项入场会让侧边栏
     // 宽度突变、闪一下。绝不挂进 SyncLibrary(4s)/reconcile_fences（H1/H2）。
     let vsnap = winbosk_shell::virtual_items::mirrorable_virtual_snapshot();
     if !vsnap.is_empty() && sync_virtual_items(&mut rt, &vsnap) {
         reanchor_fences(&mut rt);
-        let _ = rt.store.save(&rt.desk);
+        let _ = persist(&rt);
     }
     // 高度策略：`bounds.h == 0` 表示未手动缩放，按内容自适应（增删应用自动长高）。
     // 不在此冻结高度——用户拖边缘/角缩放后才落为具体值。
@@ -891,7 +940,7 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
     // 重叠」即由此而来）→ 推离并持久化，随后重排一帧供首帧呈现使用。
     if resolve_overlaps(&mut rt) {
         tracing::info!("启动重叠消解：存在重叠栅栏，已推离并保存");
-        let _ = rt.store.save(&rt.desk);
+        let _ = persist(&rt);
         scene = build_scene(&mut rt, Instant::now());
     }
     // 首帧上传：图标位图（新增项的位图在 build_scene 内推入 pending_uploads）
@@ -977,8 +1026,7 @@ fn run(data_dir: &std::path::Path) -> winbosk_core::Result<()> {
     }
 
     // 8) 主线程看门狗：进消息循环前武装（停摆自证，见 `watchdog` 模块）。刻意放在
-    //    启动重活之后——启动期不计入停摆判定，否则冷启动的慢初始化会误报，
-    //    并把一次性的看门狗白白耗掉。
+    //    启动重活之后——启动期不计入停摆判定，否则冷启动的慢初始化会误报。
     watchdog::spawn();
 
     // 收尾限时兜底的两个线程必须**启动期**创建（收尾期新建线程会卡死在加载器锁
@@ -1121,7 +1169,7 @@ pub(crate) fn execute_auto_organize(rt: &mut Runtime) {
             "一键全自动分类整理已完成"
         );
         rt.last_layout_h.resize(rt.desk.fences.len(), 0.0);
-        let _ = rt.store.save(&rt.desk);
+        let _ = persist(rt);
     }
 }
 
@@ -1387,7 +1435,7 @@ pub(crate) fn execute_apply_fence_rule(rt: &mut Runtime, fence_idx: usize) {
     }
     if count > 0 {
         tracing::info!(count, fence = fence_idx, "针对指定栅栏规则整理完成");
-        let _ = rt.store.save(&rt.desk);
+        let _ = persist(rt);
         inject_rebuild(rt);
     }
 }
@@ -1462,7 +1510,7 @@ pub(crate) fn set_console_open(rt: &mut Runtime, open: bool) {
     // （overlay 侧只补了 `WM_MOUSEMOVE` 与 `WM_MOUSELEAVE` 两条通路，覆盖不到"面板凭空出现"。）
     rt.console_hover = None;
     rt.desk.console_open = open;
-    if let Err(e) = rt.store.save(&rt.desk) {
+    if let Err(e) = persist(rt) {
         tracing::warn!("控制台状态持久化失败: {e}");
     }
     // Z 序与会话位同一事务推送：控制中心期间光标离开表面不回落（见 overlay 的
@@ -1564,7 +1612,7 @@ fn apply_icon_drop(rt: &mut Runtime, id: &str, to_fence: Option<usize>, to_index
             rt.selected.push((fi, ii));
         }
     }
-    if let Err(e) = rt.store.save(&rt.desk) {
+    if let Err(e) = persist(rt) {
         tracing::warn!("图标拖放持久化失败: {e}");
     }
     tracing::info!(
@@ -1964,10 +2012,16 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             }
             arm_anim_timer(rt);
         }
-        OverlayEvent::FenceDragEnd { .. } => {
+        OverlayEvent::FenceDragEnd { fence, .. } => {
             rt.resize_session = None;
+            // 用户在当前拓扑下显式摆了**这一个**栅栏：只把它从「拓扑瞬变回滚」快照里
+            // 摘掉（位置以本次为准），其余栅栏继续保持待回滚——整张丢弃会让它们的夹屏
+            // 位置随本次保存永久写盘。
+            if let Some(id) = rt.desk.fences.get(fence).map(|f| f.id) {
+                drop_from_snapshot(&mut rt.topology_snapshot, id);
+            }
             // 拖动结束：持久化当前布局
-            if let Err(e) = rt.store.save(&rt.desk) {
+            if let Err(e) = persist(rt) {
                 tracing::warn!("布局持久化失败: {e}");
             }
         }
@@ -1976,7 +2030,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             if let Some(f) = rt.desk.fences.get_mut(fence) {
                 if f.appearance.layout != FenceLayout::Sidebar {
                     f.collapsed = !f.collapsed;
-                    if let Err(e) = rt.store.save(&rt.desk) {
+                    if let Err(e) = persist(rt) {
                         tracing::warn!("折叠状态持久化失败: {e}");
                     }
                 }
@@ -2011,12 +2065,12 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 }
                 rt.desk.settings.hotkeys.set_action(action, None);
                 hotkeys::apply_all_hotkeys(rt);
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             ConsoleZone::HotkeyResetDefault => {
                 rt.desk.settings.hotkeys = winbosk_core::config::HotkeyConfig::default();
                 hotkeys::apply_all_hotkeys(rt);
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             ConsoleZone::QuitApp => {
                 let _ = unsafe { PostMessageW(Some(rt.hwnd), WM_APP_QUIT, WPARAM(0), LPARAM(0)) };
@@ -2028,7 +2082,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                         tracing::error!("切换开机自启状态失败: {e}");
                     } else {
                         rt.desk.settings.autostart = next;
-                        if let Err(e) = rt.store.save(&rt.desk) {
+                        if let Err(e) = persist(rt) {
                             tracing::warn!("开机自启配置保存失败: {e}");
                         }
                     }
@@ -2063,7 +2117,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 } else if let Some(f) = rt.desk.fences.get_mut(i) {
                     f.appearance.layout = l;
                 }
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             ConsoleZone::FenceIconSize(sz) => {
                 let i = rt
@@ -2072,7 +2126,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 if let Some(f) = rt.desk.fences.get_mut(i) {
                     f.appearance.icon_size = sz;
                 }
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             ConsoleZone::FenceStyle(style) => {
                 let i = rt
@@ -2081,7 +2135,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 if let Some(f) = rt.desk.fences.get_mut(i) {
                     f.appearance.bg_style = style;
                 }
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             ConsoleZone::FenceTint(tint) => {
                 let i = rt
@@ -2090,7 +2144,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 if let Some(f) = rt.desk.fences.get_mut(i) {
                     f.appearance.tint = tint;
                 }
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             ConsoleZone::FenceSidebarPos(pos) => {
                 let i = rt
@@ -2106,7 +2160,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                         f.bounds = clamp_sidebar_work_rect(b, wa, f.appearance.sidebar_pos);
                     }
                 }
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             ConsoleZone::FenceRulePreset(preset) => {
                 let i = rt
@@ -2119,7 +2173,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     rule.preset = preset;
                     f.rule = Some(rule);
                 }
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             ConsoleZone::RuleEnterCustom => {
                 let i = rt
@@ -2134,7 +2188,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     }
                     f.rule = Some(rule);
                 }
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             ConsoleZone::AutoOrganize => {
                 execute_auto_organize(rt);
@@ -2186,7 +2240,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 });
                 rt.last_layout_h.push(0.0);
                 rt.selected_fence = rt.desk.fences.len() - 1;
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
                 tracing::info!(id, "已快速创建空白收纳栅栏");
             }
             ConsoleZone::RemoveFence => {
@@ -2257,7 +2311,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             }
             ConsoleZone::ToggleAdvancedMode => {
                 rt.desk.console_advanced = !rt.desk.console_advanced;
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             ConsoleZone::RuleToggleEnabled => {
                 let i = rt
@@ -2267,7 +2321,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     let mut rule = f.rule.clone().unwrap_or_default();
                     rule.enabled = !rule.enabled;
                     f.rule = Some(rule);
-                    let _ = rt.store.save(&rt.desk);
+                    let _ = persist(rt);
                 }
             }
             ConsoleZone::RuleToggleAutoCapture => {
@@ -2278,7 +2332,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     let mut rule = f.rule.clone().unwrap_or_default();
                     rule.auto_capture = !rule.auto_capture;
                     f.rule = Some(rule);
-                    let _ = rt.store.save(&rt.desk);
+                    let _ = persist(rt);
                 }
             }
             ConsoleZone::RuleDeleteExtension(idx) => {
@@ -2289,7 +2343,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     if let Some(r) = f.rule.as_mut() {
                         if idx < r.custom_extensions.len() {
                             r.custom_extensions.remove(idx);
-                            let _ = rt.store.save(&rt.desk);
+                            let _ = persist(rt);
                         }
                     }
                 }
@@ -2302,7 +2356,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     if let Some(r) = f.rule.as_mut() {
                         if idx < r.exclude_extensions.len() {
                             r.exclude_extensions.remove(idx);
-                            let _ = rt.store.save(&rt.desk);
+                            let _ = persist(rt);
                         }
                     }
                 }
@@ -2315,7 +2369,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     if let Some(r) = f.rule.as_mut() {
                         if idx < r.name_patterns.len() {
                             r.name_patterns.remove(idx);
-                            let _ = rt.store.save(&rt.desk);
+                            let _ = persist(rt);
                         }
                     }
                 }
@@ -2386,7 +2440,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     let action = rt.recording_hotkey.take().unwrap();
                     rt.desk.settings.hotkeys.set_action(action, None);
                     hotkeys::apply_all_hotkeys(rt);
-                    let _ = rt.store.save(&rt.desk);
+                    let _ = persist(rt);
                 } else if vk == 0x11
                     || vk == 0x10
                     || vk == 0x12
@@ -2420,7 +2474,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                             .hotkeys
                             .set_action(action, Some(binding.to_string()));
                         hotkeys::apply_all_hotkeys(rt);
-                        let _ = rt.store.save(&rt.desk);
+                        let _ = persist(rt);
                     }
                 }
             } else {
@@ -2478,7 +2532,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
         }
         OverlayEvent::ConsoleDragEnd => {
             // 拖动结束：持久化面板位置
-            if let Err(e) = rt.store.save(&rt.desk) {
+            if let Err(e) = persist(rt) {
                 tracing::warn!("控制台位置持久化失败: {e}");
             }
         }
@@ -2502,7 +2556,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
         }
         OverlayEvent::ConsoleResizeEnd => {
             // 缩放结束：持久化面板尺寸
-            if let Err(e) = rt.store.save(&rt.desk) {
+            if let Err(e) = persist(rt) {
                 tracing::warn!("控制台尺寸持久化失败: {e}");
             }
         }
@@ -2542,11 +2596,18 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
             }
         }
         OverlayEvent::SyncLibrary => {
+            // 桌面接管自愈：Explorer 崩溃/重启后旧 WorkerW/SysListView32 全部失效。
+            // 判据挂在既有的 4s 心跳上（不新增周期源），命中才重探层级。
+            let healed = ensure_desktop_takeover(rt);
+            // 托盘图标补登：`NIM_ADD` 可能早于通知区就绪而失败，失败才重试（常态零开销）。
+            if rt.tray_icon_lost {
+                rt.tray_icon_lost = !unsafe { (*rt.overlay_ptr).add_tray_icon() };
+            }
             // 双向同步：内部库被外部删除 → 栅栏项移除；链接文件夹增删改名 → 栅栏镜像
             // （文件夹是事实来源，栅栏即文件夹；有变化才持久化）
             let changed = reconcile_fences(rt);
             if changed {
-                let _ = rt.store.save(&rt.desk);
+                let _ = persist(rt);
             }
             // 空闲修剪工作集：启动后用户长时间不操作时，把不再活跃的内存页换出 RAM，
             // 保持低常驻（任务管理器「内存」列）。用户交互换入后再空闲同样触发；限频避免频繁调用。
@@ -2559,7 +2620,16 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 memory::trim();
             }
             // 无变化不重绘（消除 4s 心跳脉冲）
-            redraw = changed;
+            redraw = changed || healed;
+        }
+        OverlayEvent::ExplorerRestarted { tray_ok } => {
+            // 托盘图标已在 overlay 侧重登；失败则记下，由 4s 心跳补登。
+            rt.tray_icon_lost = !tray_ok;
+            // `TaskbarCreated` 是「explorer 已就绪」的强信号——清掉退避，立即重做接管
+            //（事件由本进程投递的 `WM_APP_SHELL_RESTART` 触发，已脱离 explorer 的广播派发）。
+            rt.takeover_retry_at = None;
+            rt.takeover_failures = 0;
+            redraw = ensure_desktop_takeover(rt);
         }
         OverlayEvent::DpiChanged { dpi } => {
             // 所在显示器 DPI 变化（Per-Monitor v2）：重算主题缩放（覆盖旧的缩放
@@ -2579,7 +2649,7 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                     tracing::warn!("DPI 变化：重建文本格式失败（沿用旧字号）: {e}");
                 }
                 if reanchor_fences(rt) {
-                    let _ = rt.store.save(&rt.desk);
+                    let _ = persist(rt);
                 }
                 tracing::info!(dpi, scale, "DPI 变化：主题已重缩放并重排栅栏");
             }
@@ -2587,6 +2657,11 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
         OverlayEvent::DisplayChange => {
             // 显示拓扑/分辨率变化：重查虚拟屏，重设 overlay 窗口（移动 + 缩放），
             // 再把超屏栅栏夹回屏内——修复「拔掉显示器/改分辨率后栅栏找不到」。
+            //
+            // **夹屏不写盘**：睡眠唤醒 / 显示器重新协商会先报一个瞬时小尺寸再恢复
+            //（2026-10-29 现场：唤醒瞬间报 1024×768 并持续 77 秒），写盘会把布局永久
+            // 改写。拓扑回到快照记录的原配置、且用户没动过布局时整体回滚；真正换屏后
+            // 「找回超屏栅栏」的语义仍由本帧的夹屏保证（见 `TopologySnapshot`）。
             let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
             let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
             let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) } as u32;
@@ -2596,14 +2671,52 @@ fn handle_event(rt: &mut Runtime, ev: OverlayEvent) -> Option<HitModel> {
                 || vx as f32 != rt.origin.0
                 || vy as f32 != rt.origin.1;
             if changed {
+                let origin = (vx as f32, vy as f32);
+                // 变化前的配置：只在没有未决快照时采集（多段瞬变保留最初的原始布局）。
+                let pre = rt.topology_snapshot.is_none().then(|| {
+                    (
+                        rt.origin,
+                        rt.vw,
+                        rt.vh,
+                        capture_fence_bounds(&rt.desk.fences),
+                    )
+                });
+                // 拓扑回到快照记录的原配置：撤销上次夹屏。
+                let mut restore: Option<Vec<(u64, Rect)>> = None;
+                if rt
+                    .topology_snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.matches(origin, vw as f32, vh as f32))
+                {
+                    restore = rt.topology_snapshot.take().map(|s| s.bounds);
+                }
+
                 unsafe { (*rt.overlay_ptr).resize(vx, vy, vw, vh) };
+                rt.origin = origin;
                 rt.vw = vw as f32;
                 rt.vh = vh as f32;
-                rt.origin = (vx as f32, vy as f32);
-                if reanchor_fences(rt) {
-                    let _ = rt.store.save(&rt.desk);
+                if let Some(bounds) = &restore {
+                    restore_fence_bounds(&mut rt.desk.fences, bounds);
                 }
-                tracing::info!(vx, vy, vw, vh, "显示拓扑变化：overlay 已重设并夹回栅栏");
+                let moved = reanchor_fences(rt);
+                if moved {
+                    if let Some((p_origin, p_vw, p_vh, bounds)) = pre {
+                        rt.topology_snapshot = Some(TopologySnapshot {
+                            origin: p_origin,
+                            vw: p_vw,
+                            vh: p_vh,
+                            bounds,
+                        });
+                    }
+                }
+                tracing::info!(
+                    vx,
+                    vy,
+                    vw,
+                    vh,
+                    restored = restore.is_some(),
+                    "显示拓扑变化：overlay 已重设（夹屏不落盘，拓扑恢复后回滚）"
+                );
             }
         }
         OverlayEvent::IconDragMove {
@@ -2769,6 +2882,34 @@ fn reanchor_fences(rt: &mut Runtime) -> bool {
     changed
 }
 
+/// 采集全部栅栏的 `(id, bounds)`，供拓扑瞬变回滚。
+///
+/// 按 **fence id** 记录而不是下标：瞬变期间用户可能增删栅栏（控制中心），
+/// 下标一旦漂移，回滚就会把位置套到错误的栅栏上。
+fn capture_fence_bounds(fences: &[Fence]) -> Vec<(u64, Rect)> {
+    fences.iter().map(|f| (f.id, f.bounds)).collect()
+}
+
+/// 按 id 还原栅栏位置。返回是否有变化；找不到 id（栅栏已删除/新增）即跳过。
+///
+/// 侧边栏不还原：它的 bounds 由 `reanchor_fences` 按当前工作区重新停靠，
+/// 旧位置在新拓扑下没有意义。
+fn restore_fence_bounds(fences: &mut [Fence], saved: &[(u64, Rect)]) -> bool {
+    let mut changed = false;
+    for f in fences.iter_mut() {
+        if f.appearance.layout == FenceLayout::Sidebar {
+            continue;
+        }
+        if let Some((_, b)) = saved.iter().find(|(id, _)| *id == f.id) {
+            if f.bounds != *b {
+                f.bounds = *b;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// 把 overlay 窗口设为前台并聚焦（内联编辑接收键盘/IME 的前提）。
 fn focus_overlay(rt: &Runtime) {
     // IME 关联只属于内联编辑会话，且必须在给焦点**之前**完成（反过来 IME 会按旧
@@ -2819,7 +2960,7 @@ fn remove_fence_icon(rt: &mut Runtime, fence: usize, icon: usize) {
     if let Some(id) = id {
         remove_fence_icon_by_id(rt, &id);
     }
-    let _ = rt.store.save(&rt.desk);
+    let _ = persist(rt);
 }
 
 /// 「移出栅栏」的意图裁决（**纯判定**，只读 `Desk`，便于单测）。
@@ -2922,7 +3063,7 @@ fn remove_selected(rt: &mut Runtime) {
     for id in &ids {
         remove_fence_icon_by_id(rt, id);
     }
-    let _ = rt.store.save(&rt.desk);
+    let _ = persist(rt);
 }
 
 /// 删除选中项：管理区（内部库/链接文件夹）内的文件连同磁盘文件一并删除（文件夹删 →
@@ -2938,7 +3079,7 @@ fn delete_selected(rt: &mut Runtime) {
             rt.desk.move_icon(id, None);
         }
     }
-    let _ = rt.store.save(&rt.desk);
+    let _ = persist(rt);
 }
 
 /// 在桌面上寻找用于受纳回流图标的目标「桌面」栅栏
@@ -3039,7 +3180,7 @@ pub(crate) fn delete_fence_and_reclaim_icons(rt: &mut Runtime, fence_idx: usize)
     rt.select_band = None;
 
     // 6. 立即持久化
-    if let Err(e) = rt.store.save(&rt.desk) {
+    if let Err(e) = persist(rt) {
         tracing::warn!("删除栅栏持久化失败: {e}");
     }
 }
@@ -3054,6 +3195,170 @@ fn fence_scroll_max(rt: &Runtime) -> f32 {
     (n - CONSOLE_FENCE_MAX_ROWS) as f32 * CONSOLE_FENCE_ROW_H * rt.theme.scale
 }
 
+/// 桌面接管是否已失效（Explorer 崩溃/重启的第一事实）。
+///
+/// 判据只用**事实**，不缓存状态位：Explorer 重启没有保证送达的通知（`TaskbarCreated`
+/// 可能早于任务栏就绪，explorer 也可能被强制结束），死句柄是唯一无可辩驳的证据。
+///
+/// 1. 接管时记录的任一窗口句柄已不存在（`Progman`/`WorkerW`/`DefView`/`ListView`）；
+/// 2. 非「原始桌面」模式下，本该隐藏的 `SysListView32` 又变成可见（新 explorer 的默认
+///    状态）。`desktop_mode` 为真时跳过——那里图标层本就该可见，否则自愈会与「切换
+///    桌面」每 4s 互相翻转。
+fn takeover_stale(rt: &Runtime) -> bool {
+    let h = rt.hierarchy.get();
+    let alive = |w: Option<HWND>| w.is_none_or(|w| unsafe { IsWindow(Some(w)) }.as_bool());
+    if !alive(Some(h.progman)) || !alive(h.worker) || !alive(h.def_view) || !alive(h.list_view) {
+        return true;
+    }
+    // DefView 被第三方（Wallpaper Engine 等）重挂到新的 WorkerW：所有句柄都还活着，
+    // 但 overlay 仍锚在旧 worker 上，会沉到壁纸之后。`probe()` 里 `worker` 就是
+    // DefView 的父窗口，两者失配即说明接管锚点已过期。
+    if let (Some(dv), Some(w)) = (h.def_view, h.worker) {
+        if unsafe { GetParent(dv) }.ok() != Some(w) {
+            return true;
+        }
+    }
+    if !rt.desk.desktop_mode {
+        if let Some(lv) = h.list_view {
+            if unsafe { IsWindowVisible(lv) }.as_bool() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 自愈失败后的退避阶梯（10s、20s、40s……封顶 300s）。
+///
+/// Explorer 尚未就绪时避免每 4s 心跳都做一次 `probe`；退避而不是直接放弃，是为了
+/// 「DefView 稍后才建好」的环境仍能自愈。`TaskbarCreated` 是「explorer 已就绪」的强
+/// 信号，会清掉退避立即重试（见 `ExplorerRestarted` 分支）。
+fn takeover_retry_delay(failures: u32) -> std::time::Duration {
+    let secs = 10u64 << failures.saturating_sub(1).min(5);
+    std::time::Duration::from_secs(secs.min(300))
+}
+
+/// 记一次自愈失败：递增计数、按阶梯安排下一次尝试。日志只在第一次失败时 `warn`
+/// （降级为 `debug`），永久性环境故障不该刷屏。
+fn postpone_takeover(rt: &mut Runtime, reason: &'static str) {
+    rt.takeover_failures = rt.takeover_failures.saturating_add(1);
+    let delay = takeover_retry_delay(rt.takeover_failures);
+    rt.takeover_retry_at = Some(std::time::Instant::now() + delay);
+    if rt.takeover_failures == 1 {
+        tracing::warn!(?delay, reason, "桌面接管自愈失败，退避后重试");
+    } else {
+        tracing::debug!(
+            ?delay,
+            failures = rt.takeover_failures,
+            reason,
+            "桌面接管自愈仍失败"
+        );
+    }
+}
+
+/// 重做桌面接管（Explorer 重启自愈）。返回是否真的切换了接管。
+///
+/// 覆盖三类同源故障：真实图标层重新可见（与栅栏画出「双份桌面」）、overlay 失去
+/// owner（Z 序锚点失效）、托盘图标随旧任务栏消失。`probe()` 失败或探测到「还没有图标层」
+/// 的半成品层级（explorer 尚未把桌面建好）时保持现状、不写入半接管状态，按退避阶梯重试。
+fn ensure_desktop_takeover(rt: &mut Runtime) -> bool {
+    if !takeover_stale(rt) {
+        rt.takeover_retry_at = None;
+        rt.takeover_failures = 0;
+        return false;
+    }
+    if rt
+        .takeover_retry_at
+        .is_some_and(|t| std::time::Instant::now() < t)
+    {
+        return false;
+    }
+    let old_list_view = rt.hierarchy.get().list_view.is_some();
+    let Some(h) = winbosk_shell::takeover::probe() else {
+        postpone_takeover(rt, "未探测到 Progman");
+        return false;
+    };
+    // 我们原本管着一层图标视图：新层级也必须给出它的对应物，否则说明 explorer 还没把
+    // 桌面建好（只有 Progman、没有 DefView/SysListView32）。此时切换会把「图标层没被
+    // 隐藏」的中间态当成接管成功，真实图标就永久留在屏幕上。
+    //
+    // **这条判据不能按 `desktop_mode` 跳过**：原始桌面模式同样要维护完整的层级句柄，
+    // 否则切回栅栏模式时没有可隐藏的图标层（`takeover_stale` 对 `None` 永不判失效）。
+    if old_list_view && h.list_view.is_none() {
+        postpone_takeover(rt, "新层级尚无图标视图");
+        return false;
+    }
+    // 先登记新句柄再隐藏：万一本进程在这两步之间硬崩，退出兜底线程恢复的已经是新句柄。
+    rt.hierarchy.set(h);
+    set_exit_listview(h.list_view);
+    if !rt.desk.desktop_mode {
+        h.hide_icons();
+    }
+    unsafe {
+        (*rt.overlay_ptr).reown(h.overlay_parent());
+        rt.tray_icon_lost = !(*rt.overlay_ptr).add_tray_icon();
+    }
+    // Z 序与会话位同一事务推送：控制中心开着 / 栅栏前置为真时留在普通带，
+    // 否则落回新桌面带（旧 owner 已销毁，不换锚点会一直悬在普通带）。
+    sync_front_band(rt);
+    tracing::info!(
+        parent = ?h.overlay_parent(),
+        hide_icons = !rt.desk.desktop_mode,
+        "桌面接管已失效（Explorer 重启），已重新接管"
+    );
+    // 复核：图标层若仍在可见态（跨进程隐藏失败），按退避重试而不是每 4s 重做一遍接管
+    //（换 owner/重登托盘都是跨进程调用，不能变成心跳上的常驻动作）。
+    if takeover_stale(rt) {
+        postpone_takeover(rt, "接管后仍判定失效");
+    } else {
+        rt.takeover_retry_at = None;
+        rt.takeover_failures = 0;
+    }
+    true
+}
+
+/// 布局持久化的**唯一入口**（所有 `desk.json` 写入都走这里）。
+///
+/// 拓扑瞬变未回滚时，必须写「快照里的原始位置」而不是内存里的夹屏结果：夹屏只改了
+/// 内存中的 `bounds`，而 4s 心跳的 `reconcile_fences`、控制中心开关、折叠状态等任意
+/// 一次保存都会把瞬态位置带上盘，让「瞬变不落盘」形同虚设（2026-10-29 现场：77 秒的
+/// 1024×768 期间只要桌面文件变动一次，布局就被永久改写）。
+///
+/// 用户显式拖动/缩放过的栅栏会先被移出快照（见 `FenceDragEnd` 分支），因此这里只会
+/// 覆盖仍属于瞬态的那部分；侧边栏由 `reanchor_fences` 重新停靠，同样不覆盖。
+fn persist(rt: &Runtime) -> winbosk_core::Result<()> {
+    match rt.topology_snapshot.as_ref() {
+        None => rt.store.save(&rt.desk),
+        Some(snap) => rt.store.save(&desk_for_persist(&rt.desk, snap)),
+    }
+}
+
+/// 把某个栅栏移出「待回滚」快照（用户已显式摆过它）；摘空即丢弃整张快照。
+fn drop_from_snapshot(snap: &mut Option<TopologySnapshot>, fence_id: u64) {
+    let Some(s) = snap.as_mut() else {
+        return;
+    };
+    s.bounds.retain(|(id, _)| *id != fence_id);
+    if s.bounds.is_empty() {
+        *snap = None;
+    }
+}
+
+/// 生成待写盘的 `Desk` 副本：用快照里的原始位置覆盖被夹屏的栅栏。
+/// 侧边栏不覆盖——它由 `reanchor_fences` 按当前工作区重新停靠。
+fn desk_for_persist(desk: &Desk, snap: &TopologySnapshot) -> Desk {
+    let mut out = desk.clone();
+    for f in out.fences.iter_mut() {
+        if f.appearance.layout == FenceLayout::Sidebar {
+            continue;
+        }
+        if let Some((_, b)) = snap.bounds.iter().find(|(id, _)| *id == f.id) {
+            f.bounds = *b;
+        }
+    }
+    out
+}
+
 /// 一键切换桌面模式：栅栏 ⇄ 原始桌面。
 ///
 /// 切到原始桌面：立即恢复真实图标，栅栏 0.22s 淡出（淡完不再接收命中）；
@@ -3061,7 +3366,7 @@ fn fence_scroll_max(rt: &Runtime) -> f32 {
 fn toggle_desktop(rt: &mut Runtime) {
     rt.desk.desktop_mode = !rt.desk.desktop_mode;
     if rt.desk.desktop_mode {
-        rt.hierarchy.restore_icons();
+        rt.hierarchy.get().restore_icons();
         // 桌面淡出：缓动固定为 ease_out_cubic（`fence_alpha` 内取值），此处仅对齐字段语义。
         rt.desktop_fade = Some(PanelTween {
             t0: Instant::now(),
@@ -3071,7 +3376,7 @@ fn toggle_desktop(rt: &mut Runtime) {
             ease: PanelEase::CubicOut,
         });
     } else {
-        rt.hierarchy.hide_icons();
+        rt.hierarchy.get().hide_icons();
         rt.desktop_fade = Some(PanelTween {
             t0: Instant::now(),
             dur: 0.22,
@@ -3081,7 +3386,7 @@ fn toggle_desktop(rt: &mut Runtime) {
         });
     }
     arm_anim_timer(rt);
-    if let Err(e) = rt.store.save(&rt.desk) {
+    if let Err(e) = persist(rt) {
         tracing::warn!("桌面模式持久化失败: {e}");
     }
 }
@@ -3412,5 +3717,143 @@ mod tests {
         assert_eq!(conflict.fence_title, "常用应用");
         assert_eq!(conflict.icon_ids, vec!["apps_bat".to_string()]);
         assert_eq!(conflict.icon_names, vec!["run.bat".to_string()]);
+    }
+
+    /// 测试用栅栏：只关心 id / 布局 / bounds，其余取默认值。
+    fn test_fence(id: u64, layout: FenceLayout, x: f32, y: f32) -> Fence {
+        Fence {
+            id,
+            title: None,
+            monitor_id: 0,
+            bounds: Rect::new(x, y, 100.0, 100.0),
+            state: FenceState::default(),
+            icon_ids: Vec::new(),
+            appearance: FenceAppearance {
+                layout,
+                ..FenceAppearance::default()
+            },
+            scroll: 0.0,
+            storage_path: None,
+            sidebar_collapsed: false,
+            rule: None,
+            collapsed: false,
+        }
+    }
+
+    /// 拓扑「恢复」必须连原点一起匹配：只比尺寸会把「副屏换边」误判成恢复，
+    /// 而原点变了所有栅栏坐标的语义也随之改变。
+    #[test]
+    fn topology_snapshot_matches_exact_geometry() {
+        let snap = TopologySnapshot {
+            origin: (0.0, 0.0),
+            vw: 3840.0,
+            vh: 2160.0,
+            bounds: Vec::new(),
+        };
+        assert!(snap.matches((0.0, 0.0), 3840.0, 2160.0));
+        assert!(!snap.matches((0.0, 0.0), 1024.0, 768.0));
+        assert!(!snap.matches((-1920.0, 0.0), 3840.0, 2160.0));
+    }
+
+    /// 回滚按 fence id 对齐：已删除的 id 跳过、侧边栏交给 reanchor、其余栅栏保持原样；
+    /// 同一份快照连跑两次，第二次必须零变化（幂等）。
+    #[test]
+    fn restore_fence_bounds_aligns_by_id_and_is_idempotent() {
+        let mut fences = vec![
+            test_fence(7, FenceLayout::Grid, 640.0, 480.0),
+            test_fence(9, FenceLayout::Grid, 10.0, 10.0),
+            test_fence(11, FenceLayout::Sidebar, 0.0, 0.0),
+        ];
+        let saved = vec![
+            (7, Rect::new(10.0, 20.0, 100.0, 100.0)),
+            (11, Rect::new(1.0, 2.0, 3.0, 4.0)),
+            (99, Rect::new(0.0, 0.0, 1.0, 1.0)),
+        ];
+
+        assert!(restore_fence_bounds(&mut fences, &saved));
+        assert_eq!(fences[0].bounds, Rect::new(10.0, 20.0, 100.0, 100.0));
+        // 快照里没有 id=9：保持原位。
+        assert_eq!(fences[1].bounds, Rect::new(10.0, 10.0, 100.0, 100.0));
+        // 侧边栏不还原（由 `reanchor_fences` 按当前工作区重新停靠）。
+        assert_eq!(fences[2].bounds, Rect::new(0.0, 0.0, 100.0, 100.0));
+        assert!(!restore_fence_bounds(&mut fences, &saved));
+    }
+
+    /// Explorer 重启事件默认落入「清理拖动状态」的安全侧（与其它非拖动事件一致）。
+    #[test]
+    fn explorer_restart_clears_drag_state() {
+        assert!(!keeps_drag_hint(&OverlayEvent::ExplorerRestarted {
+            tray_ok: true
+        }));
+        assert!(!carries_icon_drag_state(&OverlayEvent::ExplorerRestarted {
+            tray_ok: true
+        }));
+    }
+
+    /// 瞬变期间写盘必须用快照里的原始位置：否则 4s 心跳的任意一次保存都会把夹屏写死。
+    #[test]
+    fn persist_view_uses_snapshot_bounds_for_clamped_fences() {
+        let mut desk = Desk::new(winbosk_core::config::AppSettings::default());
+        desk.fences
+            .push(test_fence(1, FenceLayout::Grid, 10.0, 10.0));
+        desk.fences
+            .push(test_fence(2, FenceLayout::Grid, 20.0, 20.0));
+        desk.fences
+            .push(test_fence(3, FenceLayout::Sidebar, 30.0, 30.0));
+        let snap = TopologySnapshot {
+            origin: (0.0, 0.0),
+            vw: 3840.0,
+            vh: 2160.0,
+            bounds: vec![
+                (1, Rect::new(100.0, 200.0, 100.0, 100.0)),
+                (3, Rect::new(7.0, 8.0, 9.0, 10.0)),
+            ],
+        };
+
+        let out = desk_for_persist(&desk, &snap);
+        assert_eq!(out.fences[0].bounds, Rect::new(100.0, 200.0, 100.0, 100.0));
+        // 快照里没有 id=2：保持当前位置。
+        assert_eq!(out.fences[1].bounds, Rect::new(20.0, 20.0, 100.0, 100.0));
+        // 侧边栏不覆盖（由 reanchor 重新停靠）。
+        assert_eq!(out.fences[2].bounds, Rect::new(30.0, 30.0, 100.0, 100.0));
+        // 原模型不被修改。
+        assert_eq!(desk.fences[0].bounds, Rect::new(10.0, 10.0, 100.0, 100.0));
+    }
+
+    /// 用户拖动某个栅栏时只把它移出待回滚快照：其余栅栏必须继续待回滚，否则它们的
+    /// 夹屏位置会被本次保存永久写盘；摘空后快照整体丢弃，未知 id 不产生任何变化。
+    #[test]
+    fn snapshot_forgets_only_the_dragged_fence() {
+        let mut snap = Some(TopologySnapshot {
+            origin: (0.0, 0.0),
+            vw: 3840.0,
+            vh: 2160.0,
+            bounds: vec![
+                (1, Rect::new(0.0, 0.0, 1.0, 1.0)),
+                (2, Rect::new(0.0, 0.0, 1.0, 1.0)),
+            ],
+        });
+        drop_from_snapshot(&mut snap, 1);
+        assert_eq!(snap.as_ref().map(|s| s.bounds.len()), Some(1));
+        assert_eq!(snap.as_ref().map(|s| s.bounds[0].0), Some(2));
+        // 未知 id：快照不变。
+        drop_from_snapshot(&mut snap, 99);
+        assert_eq!(snap.as_ref().map(|s| s.bounds.len()), Some(1));
+        // 摘空即丢弃。
+        drop_from_snapshot(&mut snap, 2);
+        assert!(snap.is_none());
+    }
+
+    /// 自愈退避阶梯：10s 起步、逐次翻倍、封顶 300s（避免 Explorer 长期未就绪时
+    /// 每 4s 心跳都做一次跨进程探测）。
+    #[test]
+    fn takeover_retry_delay_backs_off_and_caps() {
+        use std::time::Duration;
+        assert_eq!(takeover_retry_delay(0), Duration::from_secs(10));
+        assert_eq!(takeover_retry_delay(1), Duration::from_secs(10));
+        assert_eq!(takeover_retry_delay(2), Duration::from_secs(20));
+        assert_eq!(takeover_retry_delay(3), Duration::from_secs(40));
+        assert_eq!(takeover_retry_delay(6), Duration::from_secs(300));
+        assert_eq!(takeover_retry_delay(50), Duration::from_secs(300));
     }
 }

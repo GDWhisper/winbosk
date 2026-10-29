@@ -19,12 +19,12 @@ use std::sync::OnceLock;
 
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, TRUE, WAIT_FAILED,
-    WAIT_OBJECT_0, WPARAM,
+    CloseHandle, GetLastError, SetLastError, COLORREF, ERROR_SUCCESS, HANDLE, HINSTANCE, HWND,
+    LPARAM, LRESULT, POINT, TRUE, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, EqualRgn, SetBkColor, SetTextColor,
@@ -55,20 +55,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor, GetCursorPos,
     GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
     GetWindowLongW, GetWindowThreadProcessId, KillTimer, LoadCursorW, LoadIconW, PeekMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetCursor, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CS_DBLCLKS, GA_ROOT,
-    GWLP_USERDATA, GWL_EXSTYLE, GW_HWNDPREV, HCURSOR, HICON, HTCLIENT, HTTRANSPARENT, HWND_TOP,
-    ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
-    IDC_SIZEWE, MSG, MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, PM_REMOVE, QS_ALLINPUT,
-    SET_WINDOW_POS_FLAGS, SM_CXDOUBLECLK, SM_CXVIRTUALSCREEN, SM_CYDOUBLECLK, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNA, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED,
-    WM_CHAR, WM_CLOSE, WM_CTLCOLOREDIT, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES,
-    WM_ERASEBKGND, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETICON, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageW, SetCursor,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    CS_DBLCLKS, GA_ROOT, GWLP_HWNDPARENT, GWLP_USERDATA, GWL_EXSTYLE, GW_HWNDPREV, HCURSOR, HICON,
+    HTCLIENT, HTTRANSPARENT, HWND_TOP, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX_FLAGS, PM_REMOVE,
+    QS_ALLINPUT, SET_WINDOW_POS_FLAGS, SM_CXDOUBLECLK, SM_CXVIRTUALSCREEN, SM_CYDOUBLECLK,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOREDRAW, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNA, SW_SHOWNOACTIVATE,
+    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_CTLCOLOREDIT, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_DROPFILES, WM_ERASEBKGND, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETICON, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW,
+    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use winbosk_core::hotkey::HotkeyAction;
@@ -79,6 +79,13 @@ use winbosk_core::model::{CategoryPreset, FenceLayout, FenceStyle, SidebarPositi
 /// 双击托盘会派发两次 `WM_LBUTTONUP`（序列：UP → DBLCLK → UP），不去重就变成
 /// 「打开又立刻关上」白闪一次。以系统双击时限做间隔闸门，双击只算一次点击。
 static LAST_TRAY_CLICK_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `TaskbarCreated` 注册消息（`RegisterWindowMessageW("TaskbarCreated")`；0 = 注册失败）。
+///
+/// 托盘图标属于 Explorer 的通知区：Explorer 重启会重建任务栏并丢掉所有 `NIM_ADD` 过的
+/// 图标。没有这条广播驱动的重新登记，图标就永久消失（2026-10-29 现场：explorer 因第三方
+/// Shell 扩展崩溃重启后，用户看到的就是「程序好像退出了」）。
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 /// 当前时刻（Unix 纪元毫秒）；时钟异常（早于纪元）时退回 0。
 fn now_ms() -> u64 {
@@ -124,6 +131,13 @@ pub const WM_WINBOSK_WAKE: u32 = 0x8000 + 5;
 
 /// 托盘图标 ID（进程内唯一）。
 const TRAY_ID: u32 = 1;
+
+/// `TaskbarCreated` 广播之后的「本进程自处理」消息（WM_APP + 6）。
+///
+/// **不能在广播派发期间做重登/接管**：广播时 explorer 正等待所有顶层窗口返回，
+/// 此刻任何跨进程调用（`NIM_ADD` / `probe` / `ShowWindow`）都可能与它互等。广播分支
+/// 只投递这条消息，回到本进程队列后再做真正的工作。
+const WM_APP_SHELL_RESTART: u32 = 0x8000 + 6;
 
 /// 系统热键 ID 常量。
 pub const HOTKEY_QUIT: i32 = 1;
@@ -506,6 +520,10 @@ pub enum OverlayEvent {
     /// 显示拓扑/分辨率变化（`WM_DISPLAYCHANGE`）：虚拟屏宽高可能已变。
     /// App 据此重算虚拟屏尺寸并重新夹屏 + 重绘（找回超屏栅栏）。
     DisplayChange,
+    /// Explorer 重启（收到 `TaskbarCreated` 广播）：新任务栏丢掉了托盘图标，旧桌面窗口
+    /// （WorkerW / SysListView32）也随旧 explorer 销毁。App 据此重做桌面接管。
+    /// `tray_ok` = 本次托盘图标重登是否成功（失败由 4s 心跳继续补登）。
+    ExplorerRestarted { tray_ok: bool },
     /// 图标拖动中（同栅栏换位 / 跨栅栏迁移）：`icon` 是被拖图标在源栅栏 `icon_ids`
     /// 中的**按下时下标**（渲染层只认下标，稳定身份由 App 在拖动起点解析一次），
     /// `(mx, my)` 为当前光标位置（虚拟屏幕物理像素）。
@@ -629,9 +647,9 @@ struct WindowState {
     handler: Option<Box<dyn FnMut(OverlayEvent) -> Option<HitModel>>>,
     /// 编辑框（重命名/待办输入）背景画刷：`WM_CTLCOLOREDIT` 返回它让 EDIT 用深色底。
     edit_brush: HBRUSH,
-    /// create 时的父/owner 窗口（与 `OverlayWindow.owner` 同源、不可变）：wnd_proc 处理
+    /// 当前的父/owner 窗口（与 `OverlayWindow.owner` 同源）：wnd_proc 处理
     /// `WM_MOUSELEAVE` 回落桌面带时需要它计算「owner 正上方」锚点，而 wnd_proc 拿不到
-    /// OverlayWindow 本体。
+    /// OverlayWindow 本体。Explorer 重启后由 `OverlayWindow::reown` 同步更新。
     owner: HWND,
     /// 「前置会话」是否激活（业务位，由 app 的单一出口推送，见 `OverlayWindow::set_keep_front`）。
     ///
@@ -653,9 +671,12 @@ pub struct OverlayWindow {
     /// 覆盖的虚拟屏幕尺寸（物理像素）。
     pub width: u32,
     pub height: u32,
-    /// create 时的父/owner 窗口（持有 DefView 的 WorkerW，无 DefView 时为 Progman）。
-    /// 仅用于收起控制中心时把窗口插回 owner 之后、落回桌面带；overlay 与 owner 的
-    /// 生命周期被所有权机制绑定（owner 销毁则 owned overlay 一并销毁），句柄不会悬空。
+    /// 当前的父/owner 窗口（持有 DefView 的 WorkerW，无 DefView 时为 Progman）。
+    /// 仅用于收起控制中心时把窗口插回 owner 之后、落回桌面带。
+    ///
+    /// **不要假设「owner 死了窗口就死」**：owner 主动 `DestroyWindow` 时会连带销毁
+    /// owned 窗口，但内核强杀进程（explorer 崩溃）**不会**——实测 owner 归 0、overlay
+    /// 仍存活，因此运行期必须由 [`Self::reown`] 换挂（2026-10-29 现场）。
     owner: HWND,
     /// 内联编辑期要回填的 IME 上下文：`create` 时捕获系统默认上下文，系统未提供时
     /// 首次关联现建。[`Self::ime_detach`] **不销毁**它——编辑期可能正在组合，且句柄
@@ -664,6 +685,8 @@ pub struct OverlayWindow {
     /// 当前是否已关联 IME 上下文（幂等位）。常态 false：窗口不带上下文，系统不会向
     /// 本窗口派发 `WM_IME_*`，普通点击/拖动进不了 imm32→MSCTF 的同步路径。
     ime_attached: Cell<bool>,
+    /// 托盘图标当前是否已登记成功（失败时由 App 在 4s 心跳上补登）。
+    tray_icon_ok: Cell<bool>,
     state: *mut WindowState,
 }
 
@@ -756,8 +779,9 @@ fn raise_hwnd_to_normal_top_on_press(hwnd: HWND) {
 /// 与壁纸/图标/其它 WorkerW 的相对次序无关。owner 可能是子窗口（`SHELLDLL_DefView`），
 /// 先 `GA_ROOT` 归一到顶层域再取其上一窗；owner 之上若无窗口（理论边界），跳过恢复
 /// 保持现状（留在普通带优于误落到壁纸之后）。已在桌面带时锚点即窗口自身，无害空操作。
-/// owner 若已销毁，所有权机制会连带销毁 owned 窗口，不存在悬空句柄的运行态；
-/// `SetWindowPos` 失败仅忽略（容错口径与 `resize` 一致）。
+/// owner 若已销毁（内核强杀 explorer，所有权不会连带销毁本窗口）时锚点查询会失败，
+/// 此时跳过恢复、由 App 的接管自愈换挂新 owner 后再落带；`SetWindowPos` 失败仅忽略
+/// （容错口径与 `resize` 一致）。
 fn restore_hwnd_desktop_band(hwnd: HWND, owner: HWND) {
     unsafe {
         let root = GetAncestor(owner, GA_ROOT);
@@ -862,6 +886,53 @@ impl OverlayWindow {
     /// `restore_hwnd_desktop_band` 注释。
     pub fn restore_desktop_band(&self) {
         restore_hwnd_desktop_band(self.hwnd, self.owner);
+    }
+
+    /// Explorer 重启后把 overlay 换挂到新的 owner（新的 WorkerW / Progman）。
+    ///
+    /// 旧 owner 随旧 explorer 进程销毁。实测（2026-10-29）：内核强杀 explorer **不会**
+    /// 连带销毁其它进程的 owned 窗口——`GetWindow(hwnd, GW_OWNER)` 变成 0，窗口本身
+    /// 还活着。所以必须换挂，否则后续「提权 → 落回桌面带」的 Z 序锚点全部失效
+    /// （`restore_hwnd_desktop_band` 拿不到 owner 正上方的窗口，就再也落不回桌面带）。
+    ///
+    /// `SetWindowLongPtrW(GWLP_HWNDPARENT)` 只记录返回值、不据此判定成功：它成功且没有
+    /// 旧 owner 时同样返回 0。Z 序锚点用的是 `self.owner` 这个句柄，不依赖所有权机制
+    /// 真的生效；实测本次换挂后 `GetWindow(hwnd, GW_OWNER)` 已指向新 Progman。
+    pub fn reown(&mut self, new_owner: HWND) {
+        if self.owner == new_owner {
+            return;
+        }
+        self.owner = new_owner;
+        unsafe {
+            // `WindowState.owner` 是 wnd_proc 侧读的副本（`WM_MOUSELEAVE` 回落桌面带）。
+            (*self.state).owner = new_owner;
+            // 成功且没有旧 owner 时同样返回 0——必须清错误码后用 `GetLastError` 区分失败。
+            SetLastError(ERROR_SUCCESS);
+            let prev = SetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT, new_owner.0 as isize);
+            let err = GetLastError();
+            if prev == 0 && err != ERROR_SUCCESS {
+                tracing::warn!(
+                    ?new_owner,
+                    ?err,
+                    "桌面接管：换挂 owner 失败（Z 序仍用新句柄做锚点）"
+                );
+            } else {
+                tracing::info!(?new_owner, prev, "桌面接管：overlay 已换挂到新的桌面 owner");
+            }
+        }
+    }
+
+    /// 重新登记托盘图标。`TaskbarCreated` 广播与 App 的接管自愈、心跳补登都走这里。
+    /// 返回是否成功（失败由 App 在 4s 心跳上重试）。
+    pub fn add_tray_icon(&self) -> bool {
+        let ok = add_tray_icon(self.hwnd);
+        self.tray_icon_ok.set(ok);
+        ok
+    }
+
+    /// 当前托盘图标是否已登记成功（启动时的登记结果也在这里）。
+    pub fn tray_icon_ok(&self) -> bool {
+        self.tray_icon_ok.get()
     }
 
     /// 推送「前置会话」位（业务状态，由 app 的 `sync_front_band` 单出口调用）。
@@ -1007,18 +1078,12 @@ impl OverlayWindow {
 
         // 托盘图标（通知区，默认折叠在「隐藏的图标」里）：右键 = 控制中心菜单，
         // 左键单击 = 切换控制中心开合。日常入口不再占任务栏按钮。
-        let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
-        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = hwnd;
-        nid.uID = TRAY_ID;
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-        nid.uCallbackMessage = WM_TRAY;
-        nid.hIcon = hicon;
-        let tip = wide("WinBosk 桌面栅栏");
-        for (i, c) in tip.iter().take(127).enumerate() {
-            nid.szTip[i] = *c;
-        }
-        let _ = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
+        let tray_ok = add_tray_icon(hwnd);
+        // Explorer 重启后由新任务栏广播的 TaskbarCreated：注册一次，WndProc 据此重登图标
+        // 并通知 App 重做桌面接管（旧 WorkerW/SysListView32 已随旧 explorer 销毁）。
+        let taskbar_created =
+            unsafe { RegisterWindowMessageW(PCWSTR(wide("TaskbarCreated").as_ptr())) };
+        TASKBAR_CREATED.store(taskbar_created, Ordering::Relaxed);
 
         // 立即用一个空区域：首个栅栏命中模型到来之前，整个窗口对鼠标不可见，
         // 不会出现「全屏死区」。首个模型到达后区域会被替换为栅栏并集。
@@ -1079,6 +1144,7 @@ impl OverlayWindow {
             owner: parent,
             ime_ctx: Cell::new((!ime_default.is_invalid()).then_some(ime_default)),
             ime_attached: Cell::new(false),
+            tray_icon_ok: Cell::new(tray_ok),
             state: state_ptr,
         })
     }
@@ -1222,6 +1288,41 @@ fn virtual_screen() -> (i32, i32, i32, i32) {
             GetSystemMetrics(SM_CYVIRTUALSCREEN),
         )
     }
+}
+
+/// 把托盘图标登记进当前通知区。返回是否登记成功。
+///
+/// 除启动登记外，还必须由 `TaskbarCreated` 广播驱动重新登记——Explorer 重启会重建
+/// 任务栏并丢掉所有图标，不重登就永久消失（2026-10-29 现场）。
+///
+/// 同一 `(hWnd, uID)` 已存在时 `NIM_ADD` 会**失败**（不是替换语义），而广播可能早于
+/// 通知区就绪、留下「旧的还在/新的加不进」的中间态：失败时先 `NIM_DELETE` 再补一次。
+/// 仍失败由调用方记下、下一次心跳继续补登。
+fn add_tray_icon(hwnd: HWND) -> bool {
+    let hicon = match unsafe { GetModuleHandleW(None) } {
+        Ok(hmodule) => app_icon(HINSTANCE(hmodule.0)),
+        Err(_) => HICON::default(),
+    };
+    let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ID;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY;
+    nid.hIcon = hicon;
+    let tip = wide("WinBosk 桌面栅栏");
+    for (i, c) in tip.iter().take(127).enumerate() {
+        nid.szTip[i] = *c;
+    }
+    let mut ok = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool();
+    if !ok {
+        let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
+        ok = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool();
+    }
+    if !ok {
+        tracing::warn!("托盘图标登记失败（将由后续心跳补登）");
+    }
+    ok
 }
 
 /// 加载 exe 内嵌主图标（资源 ID 1 = winbosk.ico）。`LoadIconW` 返回系统共享图标句柄，
@@ -1741,6 +1842,26 @@ unsafe extern "system" fn wnd_proc(
             if !ptr.is_null() {
                 let state = unsafe { &mut *ptr };
                 emit_event(hwnd, state, OverlayEvent::AutoOrganize);
+            }
+            LRESULT(0)
+        }
+        // Explorer 重启（新任务栏创建）。**广播派发期间只投递、不做跨进程调用**：此时
+        // explorer 正等待所有顶层窗口返回，重登/重探/隐藏都发回给它，可能互等。
+        msg if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) => {
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_SHELL_RESTART, WPARAM(0), LPARAM(0)) };
+            LRESULT(0)
+        }
+        // 回到本进程队列后再真正处理 Explorer 重启：重登托盘图标 + 通知 App 重做接管。
+        WM_APP_SHELL_RESTART => {
+            let tray_ok = add_tray_icon(hwnd);
+            tracing::info!(
+                tray_ok,
+                "Explorer 重启（TaskbarCreated）：托盘图标已重新登记"
+            );
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !ptr.is_null() {
+                let state = unsafe { &mut *ptr };
+                emit_event(hwnd, state, OverlayEvent::ExplorerRestarted { tray_ok });
             }
             LRESULT(0)
         }
