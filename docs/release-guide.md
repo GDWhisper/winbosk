@@ -37,7 +37,7 @@ CI runner（`windows-latest`）是全新 checkout + 空 `target/`，上面四条
 | 5 | `cargo build --release` | 主程序，输出 `target\release\winbosk.exe` |
 | 6 | `cargo build --release --manifest-path scripts/installer/Cargo.toml` | 安装器**不在根 workspace**，必须单独编 |
 | 7 | `scripts\package-release.ps1 -Tag <tag>` | 打包便携版 ZIP / 单文件 exe / 安装包 + `SHA256SUMS.txt` |
-| 8 | `actions/upload-artifact@v4` | 上传 `dist/*` |
+| 8 | `actions/upload-artifact@v4` | 上传 `dist/*`；`retention-days: 7`（Actions 存储按账号累计计费，发布包以第 9 步的 Release 资产为准，运行期暂存 7 天即过期） |
 | 9 | `softprops/action-gh-release@v2` | 仅 tag 事件：建 Release、附全部产物、`generate_release_notes: true` |
 
 **产物清单**（`dist/`，四个文件）：

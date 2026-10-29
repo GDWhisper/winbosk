@@ -70,6 +70,10 @@ jobs:
         with:
           name: release-assets-${{ steps.vars.outputs.tag }}
           path: dist/*
+          # Actions 存储按账号累计计费（免费额度 0.5 GB）。发布包已由下一步传成 Release
+          # 资产（不计入 Actions 存储），这里只是运行期暂存，固定 7 天过期，避免仓库设置
+          # 被改回 90 天后又长期占额度。
+          retention-days: 7
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
